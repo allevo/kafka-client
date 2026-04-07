@@ -32,7 +32,7 @@ async fn test_standalone_api_versions() {
 }
 
 #[tokio::test]
-async fn test_standalone_list_topics() {
+async fn test_standalone_fetch_metadata() {
     let kafka = Kafka::default().start().await.unwrap();
 
     let host = kafka.get_host().await.unwrap().to_string();
@@ -44,8 +44,8 @@ async fn test_standalone_list_topics() {
             .await
             .unwrap();
 
-    let client = kafka_client::Client::new(conn);
-    let response = client.list_topics().await.unwrap();
+    let client = kafka_client::BrokerClient::new(conn);
+    let response = client.fetch_metadata().await.unwrap();
 
     // Should have at least one broker
     assert!(!response.brokers.is_empty());

@@ -19,13 +19,13 @@ struct Request {
 type InFlight = Arc<Mutex<HashMap<i32, oneshot::Sender<Result<Vec<u8>>>>>>;
 
 #[derive(Clone)]
-pub struct Client {
+pub struct BrokerClient {
     request_tx: mpsc::Sender<Request>,
     next_correlation_id: Arc<AtomicI32>,
     api_versions: Arc<[ApiVersion]>,
 }
 
-impl Client {
+impl BrokerClient {
     pub fn new(connection: Connection) -> Self {
         let (stream, api_versions, last_correlation_id) = connection.into_parts();
         let (request_tx, request_rx) = mpsc::channel::<Request>(32);
@@ -33,7 +33,7 @@ impl Client {
         tracing::info!("spawning connection task");
         tokio::spawn(connection_task(stream, request_rx));
 
-        Client {
+        BrokerClient {
             request_tx,
             next_correlation_id: Arc::new(AtomicI32::new(last_correlation_id + 1)),
             api_versions: api_versions.into(),
@@ -88,7 +88,7 @@ impl Client {
         result
     }
 
-    pub async fn list_topics(&self) -> Result<MetadataResponse> {
+    pub async fn fetch_metadata(&self) -> Result<MetadataResponse> {
         let response_data = self
             .send_raw(|correlation_id| {
                 metadata::encode_request_v1(correlation_id, "kafka-client", None)

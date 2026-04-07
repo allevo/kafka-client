@@ -5,7 +5,7 @@ pub mod error;
 pub mod protocol;
 pub mod secret;
 
-pub use client::Client;
+pub use client::BrokerClient;
 pub use config::Config;
 pub use connection::{Auth, Connection, Security};
 pub use error::Error;
