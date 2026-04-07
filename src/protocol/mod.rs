@@ -1,4 +1,5 @@
 pub mod api_versions;
+pub mod metadata;
 pub mod sasl_authenticate;
 pub mod sasl_handshake;
 

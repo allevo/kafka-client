@@ -8,6 +8,7 @@ use tokio::sync::{mpsc, oneshot};
 use crate::connection::Connection;
 use crate::error::{Error, Result};
 use crate::protocol::ApiVersion;
+use crate::protocol::metadata::{self, MetadataResponse};
 
 struct Request {
     correlation_id: i32,
@@ -85,6 +86,15 @@ impl Client {
         }
 
         result
+    }
+
+    pub async fn list_topics(&self) -> Result<MetadataResponse> {
+        let response_data = self
+            .send_raw(|correlation_id| {
+                metadata::encode_request_v1(correlation_id, "kafka-client", None)
+            })
+            .await?;
+        metadata::decode_response_v1(&response_data)
     }
 
     pub fn api_versions(&self) -> &[ApiVersion] {

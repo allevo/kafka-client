@@ -9,4 +9,5 @@ pub use client::Client;
 pub use config::Config;
 pub use connection::{Auth, Connection, Security};
 pub use error::Error;
+pub use protocol::metadata::{MetadataBroker, MetadataPartition, MetadataResponse, MetadataTopic};
 pub use secret::SecretString;

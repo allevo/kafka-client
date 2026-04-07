@@ -30,3 +30,29 @@ async fn test_standalone_api_versions() {
     assert!(!versions.is_empty());
     assert!(versions.iter().any(|v| v.api_key == 18));
 }
+
+#[tokio::test]
+async fn test_standalone_list_topics() {
+    let kafka = Kafka::default().start().await.unwrap();
+
+    let host = kafka.get_host().await.unwrap().to_string();
+    let port = kafka.get_host_port_ipv4(KAFKA_PORT).await.unwrap();
+
+    let config = kafka_client::Config::new(&host, port);
+    let conn =
+        kafka_client::Connection::connect(&config, kafka_client::Security::Plaintext, kafka_client::Auth::None)
+            .await
+            .unwrap();
+
+    let client = kafka_client::Client::new(conn);
+    let response = client.list_topics().await.unwrap();
+
+    // Should have at least one broker
+    assert!(!response.brokers.is_empty());
+    let broker = &response.brokers[0];
+    assert!(broker.port > 0);
+    assert!(!broker.host.is_empty());
+
+    // Controller should be a valid node ID
+    assert!(response.controller_id >= 0);
+}
