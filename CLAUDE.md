@@ -59,6 +59,12 @@ tests/
 
 When implementing a protocol feature, cross-reference the Java source in `kafka/` for correctness and `librdkafka/` for client-side design patterns.
 
+## Protocol versioning design
+
+Each API key (Produce, Fetch, etc.) has multiple protocol versions. Newer versions append fields — they never insert fields between existing ones. The client negotiates the version to use by intersecting its supported range with the broker's (via ApiVersionsResponse) and picking the maximum.
+
+Each protocol version gets its own flat struct (e.g. `FetchRequestV0`, `FetchRequestV4`). Fields are duplicated across version structs rather than using `Option` fields or nesting. This keeps each struct self-contained with straightforward serialization — no version-conditional branches, no optional fields. An enum per API key (e.g. `enum FetchRequest { V0(...), V4(...) }`) dispatches to the right variant after version negotiation.
+
 ## Important notes
 
 - The Kafka wire protocol uses big-endian encoding. All protocol serialization must use network byte order.
