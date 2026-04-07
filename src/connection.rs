@@ -24,7 +24,7 @@ pub enum Auth {
     Plain { username: String, password: SecretString },
 }
 
-enum Stream {
+pub(crate) enum Stream {
     Plain(TcpStream),
     Tls(tokio_rustls::client::TlsStream<TcpStream>),
 }
@@ -199,5 +199,9 @@ impl Connection {
 
     pub fn api_versions(&self) -> &[ApiVersion] {
         &self.api_versions
+    }
+
+    pub(crate) fn into_parts(self) -> (Stream, Vec<ApiVersion>, i32) {
+        (self.stream, self.api_versions, 4)
     }
 }
