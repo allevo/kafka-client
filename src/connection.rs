@@ -12,6 +12,7 @@ use crate::protocol::ApiVersion;
 use crate::protocol::api_versions;
 use crate::protocol::sasl_authenticate;
 use crate::protocol::sasl_handshake;
+use crate::secret::SecretString;
 
 pub enum Security {
     Plaintext,
@@ -20,7 +21,7 @@ pub enum Security {
 
 pub enum Auth {
     None,
-    Plain { username: String, password: String },
+    Plain { username: String, password: SecretString },
 }
 
 enum Stream {
@@ -159,7 +160,10 @@ impl Connection {
 
             // SaslAuthenticate
             let correlation_id = 3;
-            let mut token = Vec::with_capacity(1 + username.len() + 1 + password.len());
+            let password = password.expose_secret();
+            let mut token = zeroize::Zeroizing::new(
+                Vec::with_capacity(1 + username.len() + 1 + password.len()),
+            );
             token.push(0u8);
             token.extend_from_slice(username.as_bytes());
             token.push(0u8);

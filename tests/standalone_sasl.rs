@@ -18,7 +18,7 @@ async fn test_standalone_sasl_plaintext_api_versions() {
     let config = kafka_client::Config::new(&host, port);
     let auth = kafka_client::Auth::Plain {
         username: "admin".into(),
-        password: "admin-secret".into(),
+        password: kafka_client::SecretString::new("admin-secret".into()),
     };
     let conn =
         kafka_client::Connection::connect(&config, kafka_client::Security::Plaintext, auth)
@@ -47,7 +47,7 @@ async fn test_standalone_sasl_plaintext_bad_credentials() {
     let config = kafka_client::Config::new(&host, port);
     let auth = kafka_client::Auth::Plain {
         username: "admin".into(),
-        password: "wrong-password".into(),
+        password: kafka_client::SecretString::new("wrong-password".into()),
     };
     let result =
         kafka_client::Connection::connect(&config, kafka_client::Security::Plaintext, auth).await;

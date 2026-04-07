@@ -974,6 +974,7 @@ dependencies = [
  "testcontainers-modules",
  "tokio",
  "tokio-rustls",
+ "zeroize",
 ]
 
 [[package]]

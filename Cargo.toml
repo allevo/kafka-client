@@ -7,6 +7,7 @@ edition = "2024"
 tokio = { version = "1", features = ["net", "io-util", "rt", "macros"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "logging"] }
 tokio-rustls = "0.26"
+zeroize = "1"
 
 [dev-dependencies]
 testcontainers = "0.27"

@@ -1,11 +1,11 @@
 use crate::error::{Error, Result};
 
-pub fn encode_request_v0(correlation_id: i32, client_id: &str, auth_bytes: &[u8]) -> Vec<u8> {
+pub fn encode_request_v0(correlation_id: i32, client_id: &str, auth_bytes: &[u8]) -> zeroize::Zeroizing<Vec<u8>> {
     let client_id_bytes = client_id.as_bytes();
     let message_size: i32 =
         (2 + 2 + 4 + 2 + client_id_bytes.len() + 4 + auth_bytes.len()) as i32;
 
-    let mut buf = Vec::with_capacity((4 + message_size) as usize);
+    let mut buf = zeroize::Zeroizing::new(Vec::with_capacity((4 + message_size) as usize));
     buf.extend_from_slice(&message_size.to_be_bytes());
     buf.extend_from_slice(&36_i16.to_be_bytes()); // api_key
     buf.extend_from_slice(&0_i16.to_be_bytes()); // api_version
