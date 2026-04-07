@@ -6,6 +6,7 @@ use zeroize::Zeroizing;
 /// overwritten with zeros when the value is dropped. The secret can
 /// only be accessed via [`SecretString::expose_secret`], making
 /// accidental logging or display unlikely.
+#[derive(Clone)]
 pub struct SecretString {
     inner: Zeroizing<String>,
 }

@@ -56,6 +56,7 @@ pub fn kraft_broker_plaintext(
 ) -> ContainerRequest<GenericImage> {
     let name = format!("{prefix}-kafka-{node_id}");
     GenericImage::new(IMAGE, TAG)
+        .with_wait_for(WaitFor::message_on_stdout("Kafka Server started"))
         .with_exposed_port(KAFKA_PORT.tcp())
         .with_container_name(&name)
         .with_env_var("KAFKA_NODE_ID", node_id.to_string())

@@ -56,3 +56,35 @@ async fn test_standalone_fetch_metadata() {
     // Controller should be a valid node ID
     assert!(response.controller_id >= 0);
 }
+
+#[tokio::test]
+async fn test_standalone_cluster_client() {
+    let kafka = Kafka::default().start().await.unwrap();
+
+    let host = kafka.get_host().await.unwrap().to_string();
+    let port = kafka.get_host_port_ipv4(KAFKA_PORT).await.unwrap();
+
+    let bootstrap = [kafka_client::Config::new(&host, port)];
+    let mut client = kafka_client::Client::connect(
+        &bootstrap,
+        kafka_client::Security::Plaintext,
+        kafka_client::Auth::None,
+    )
+    .await
+    .unwrap();
+
+    // Controller should be discovered
+    assert!(client.controller_id() >= 0);
+
+    // Should be able to get the controller broker and use it
+    let controller = client.controller().await.unwrap();
+    let metadata = controller.fetch_metadata().await.unwrap();
+    
+    println!("{}", metadata.brokers.len());
+    assert!(!metadata.brokers.is_empty());
+
+    // refresh_metadata should work
+    let refreshed = client.refresh_metadata().await.unwrap();
+    assert!(!refreshed.brokers.is_empty());
+    assert!(refreshed.controller_id >= 0);
+}

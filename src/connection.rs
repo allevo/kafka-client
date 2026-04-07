@@ -14,11 +14,13 @@ use crate::protocol::sasl_authenticate;
 use crate::protocol::sasl_handshake;
 use crate::secret::SecretString;
 
+#[derive(Clone)]
 pub enum Security {
     Plaintext,
     Ssl(Arc<rustls::ClientConfig>),
 }
 
+#[derive(Clone)]
 pub enum Auth {
     None,
     Plain { username: String, password: SecretString },
