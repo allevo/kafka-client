@@ -4,8 +4,12 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+tokio = { version = "1", features = ["net", "io-util", "rt", "macros"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "logging"] }
+tokio-rustls = "0.26"
 
 [dev-dependencies]
 testcontainers = "0.27"
 testcontainers-modules = { version = "0.15", features = ["kafka"] }
 tokio = { version = "1", features = ["full"] }
+rustls-pemfile = "2"

@@ -5,17 +5,18 @@ use testcontainers::ImageExt;
 
 #[tokio::test]
 async fn test_cluster_plaintext() {
-    let network = "kafka-plaintext-test";
-    let quorum_voters = "1@kafka-1:9093,2@kafka-2:9093,3@kafka-3:9093";
+    let prefix = "pt";
+    let network = &format!("{prefix}-network");
+    let quorum_voters = common::quorum_voters_plaintext(prefix);
 
     let (n1, n2, n3) = tokio::try_join!(
-        common::kraft_broker_plaintext(1, quorum_voters)
+        common::kraft_broker_plaintext(prefix, 1, &quorum_voters)
             .with_network(network)
             .start(),
-        common::kraft_broker_plaintext(2, quorum_voters)
+        common::kraft_broker_plaintext(prefix, 2, &quorum_voters)
             .with_network(network)
             .start(),
-        common::kraft_broker_plaintext(3, quorum_voters)
+        common::kraft_broker_plaintext(prefix, 3, &quorum_voters)
             .with_network(network)
             .start(),
     )

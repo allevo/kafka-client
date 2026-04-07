@@ -2,6 +2,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use testcontainers::core::IntoContainerPort;
+use testcontainers::core::WaitFor;
 use testcontainers::{ContainerRequest, GenericImage, ImageExt};
 
 pub const IMAGE: &str = "apache/kafka";
@@ -39,11 +40,20 @@ fn with_ssl_files(req: ContainerRequest<GenericImage>) -> ContainerRequest<Gener
     req
 }
 
+pub fn quorum_voters_plaintext(prefix: &str) -> String {
+    format!("1@{prefix}-kafka-1:9093,2@{prefix}-kafka-2:9093,3@{prefix}-kafka-3:9093")
+}
+
+pub fn quorum_voters_tls(prefix: &str) -> String {
+    format!("1@{prefix}-kafka-1:29092,2@{prefix}-kafka-2:29092,3@{prefix}-kafka-3:29092")
+}
+
 pub fn kraft_broker_plaintext(
+    prefix: &str,
     node_id: u8,
     quorum_voters: &str,
 ) -> ContainerRequest<GenericImage> {
-    let name = format!("kafka-{node_id}");
+    let name = format!("{prefix}-kafka-{node_id}");
     GenericImage::new(IMAGE, TAG)
         .with_exposed_port(KAFKA_PORT.tcp())
         .with_container_name(&name)
@@ -74,10 +84,11 @@ pub fn kraft_broker_plaintext(
 }
 
 pub fn kraft_broker_tls(
+    prefix: &str,
     node_id: u8,
     quorum_voters: &str,
 ) -> ContainerRequest<GenericImage> {
-    let name = format!("kafka-{node_id}");
+    let name = format!("{prefix}-kafka-{node_id}");
     let req = GenericImage::new(IMAGE, TAG)
         .with_exposed_port(SSL_PORT.tcp())
         .with_container_name(&name)
@@ -119,6 +130,7 @@ pub fn kraft_broker_tls(
 
 pub fn standalone_tls_broker() -> ContainerRequest<GenericImage> {
     let req = GenericImage::new(IMAGE, TAG)
+        .with_wait_for(WaitFor::message_on_stdout("Kafka Server started"))
         .with_exposed_port(SSL_PORT.tcp())
         .with_env_var("KAFKA_NODE_ID", "1")
         .with_env_var("KAFKA_PROCESS_ROLES", "broker,controller")
