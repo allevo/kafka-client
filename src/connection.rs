@@ -10,10 +10,17 @@ use crate::config::Config;
 use crate::error::{Error, Result};
 use crate::protocol::ApiVersion;
 use crate::protocol::api_versions;
+use crate::protocol::sasl_authenticate;
+use crate::protocol::sasl_handshake;
 
 pub enum Security {
     Plaintext,
     Ssl(Arc<rustls::ClientConfig>),
+}
+
+pub enum Auth {
+    None,
+    Plain { username: String, password: String },
 }
 
 enum Stream {
@@ -67,7 +74,7 @@ pub struct Connection {
 }
 
 impl Connection {
-    pub async fn connect(config: &Config, security: Security) -> Result<Self> {
+    pub async fn connect(config: &Config, security: Security, auth: Auth) -> Result<Self> {
         let addr = format!("{}:{}", config.host, config.port);
         let tcp = TcpStream::connect(&addr).await?;
 
@@ -111,6 +118,73 @@ impl Connection {
             return Err(Error::ProtocolError(format!(
                 "correlation id mismatch: expected 1, got {response_correlation_id}"
             )));
+        }
+
+        if let Auth::Plain {
+            username, password, ..
+        } = &auth
+        {
+            let has_sasl_handshake = versions.iter().any(|v| v.api_key == 17);
+            let has_sasl_authenticate = versions.iter().any(|v| v.api_key == 36);
+            if !has_sasl_handshake || !has_sasl_authenticate {
+                return Err(Error::AuthenticationError(
+                    "broker does not support SASL authentication (missing API key 17 or 36)"
+                        .into(),
+                ));
+            }
+
+            // SaslHandshake
+            let correlation_id = 2;
+            let request =
+                sasl_handshake::encode_request_v1(correlation_id, "kafka-client", "PLAIN");
+            stream.write_all(&request).await?;
+
+            let mut size_buf = [0u8; 4];
+            stream.read_exact(&mut size_buf).await?;
+            let response_size = i32::from_be_bytes(size_buf);
+            if response_size <= 0 || response_size > 1024 * 1024 {
+                return Err(Error::ProtocolError(format!(
+                    "invalid response size: {response_size}"
+                )));
+            }
+            let mut response_buf = vec![0u8; response_size as usize];
+            stream.read_exact(&mut response_buf).await?;
+            let (resp_corr_id, _mechanisms) =
+                sasl_handshake::decode_response_v1(&response_buf)?;
+            if resp_corr_id != correlation_id {
+                return Err(Error::ProtocolError(format!(
+                    "correlation id mismatch: expected {correlation_id}, got {resp_corr_id}"
+                )));
+            }
+
+            // SaslAuthenticate
+            let correlation_id = 3;
+            let mut token = Vec::with_capacity(1 + username.len() + 1 + password.len());
+            token.push(0u8);
+            token.extend_from_slice(username.as_bytes());
+            token.push(0u8);
+            token.extend_from_slice(password.as_bytes());
+
+            let request =
+                sasl_authenticate::encode_request_v0(correlation_id, "kafka-client", &token);
+            stream.write_all(&request).await?;
+
+            let mut size_buf = [0u8; 4];
+            stream.read_exact(&mut size_buf).await?;
+            let response_size = i32::from_be_bytes(size_buf);
+            if response_size <= 0 || response_size > 1024 * 1024 {
+                return Err(Error::ProtocolError(format!(
+                    "invalid response size: {response_size}"
+                )));
+            }
+            let mut response_buf = vec![0u8; response_size as usize];
+            stream.read_exact(&mut response_buf).await?;
+            let resp_corr_id = sasl_authenticate::decode_response_v0(&response_buf)?;
+            if resp_corr_id != correlation_id {
+                return Err(Error::ProtocolError(format!(
+                    "correlation id mismatch: expected {correlation_id}, got {resp_corr_id}"
+                )));
+            }
         }
 
         Ok(Connection {

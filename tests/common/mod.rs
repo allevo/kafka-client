@@ -10,6 +10,7 @@ pub const TAG: &str = "3.7.0";
 pub const CLUSTER_ID: &str = "4L6g3nShT-eMCtK--X86sw";
 pub const KAFKA_PORT: u16 = 9092;
 pub const SSL_PORT: u16 = 9093;
+pub const SASL_PLAINTEXT_PORT: u16 = 9094;
 
 fn fixtures_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -165,6 +166,55 @@ pub fn standalone_tls_broker() -> ContainerRequest<GenericImage> {
         .with_startup_timeout(Duration::from_secs(120));
 
     with_ssl_files(req)
+}
+
+pub fn standalone_sasl_plaintext_broker() -> ContainerRequest<GenericImage> {
+    let jaas_config = b"KafkaServer {\n\
+        org.apache.kafka.common.security.plain.PlainLoginModule required\n\
+        username=\"admin\"\n\
+        password=\"admin-secret\"\n\
+        user_admin=\"admin-secret\"\n\
+        user_alice=\"alice-secret\";\n\
+    };\n";
+
+    GenericImage::new(IMAGE, TAG)
+        .with_wait_for(WaitFor::message_on_stdout("Kafka Server started"))
+        .with_exposed_port(SASL_PLAINTEXT_PORT.tcp())
+        .with_copy_to(
+            "/etc/kafka/secrets/jaas.conf",
+            jaas_config.to_vec(),
+        )
+        .with_env_var("KAFKA_NODE_ID", "1")
+        .with_env_var("KAFKA_PROCESS_ROLES", "broker,controller")
+        .with_env_var(
+            "KAFKA_LISTENER_SECURITY_PROTOCOL_MAP",
+            "CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,SASL_PLAINTEXT:SASL_PLAINTEXT",
+        )
+        .with_env_var("KAFKA_CONTROLLER_QUORUM_VOTERS", "1@localhost:29093")
+        .with_env_var(
+            "KAFKA_LISTENERS",
+            format!(
+                "PLAINTEXT://:19092,SASL_PLAINTEXT://:{SASL_PLAINTEXT_PORT},CONTROLLER://:29093"
+            ),
+        )
+        .with_env_var("KAFKA_INTER_BROKER_LISTENER_NAME", "PLAINTEXT")
+        .with_env_var(
+            "KAFKA_ADVERTISED_LISTENERS",
+            format!("PLAINTEXT://localhost:19092,SASL_PLAINTEXT://localhost:{SASL_PLAINTEXT_PORT}"),
+        )
+        .with_env_var("KAFKA_CONTROLLER_LISTENER_NAMES", "CONTROLLER")
+        .with_env_var("CLUSTER_ID", CLUSTER_ID)
+        .with_env_var("KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR", "1")
+        .with_env_var("KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS", "0")
+        .with_env_var("KAFKA_TRANSACTION_STATE_LOG_MIN_ISR", "1")
+        .with_env_var("KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR", "1")
+        .with_env_var("KAFKA_LOG_DIRS", "/tmp/kraft-combined-logs")
+        .with_env_var("KAFKA_SASL_ENABLED_MECHANISMS", "PLAIN")
+        .with_env_var(
+            "KAFKA_OPTS",
+            "-Djava.security.auth.login.config=/etc/kafka/secrets/jaas.conf",
+        )
+        .with_startup_timeout(Duration::from_secs(120))
 }
 
 pub async fn assert_tcp_reachable(host: &str, port: u16) {

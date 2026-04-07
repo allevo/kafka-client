@@ -60,9 +60,13 @@ async fn test_standalone_tls_api_versions() {
 
     let tls_config = build_tls_config();
     let config = kafka_client::Config::new(&host, port);
-    let conn = kafka_client::Connection::connect(&config, kafka_client::Security::Ssl(tls_config))
-        .await
-        .unwrap();
+    let conn = kafka_client::Connection::connect(
+        &config,
+        kafka_client::Security::Ssl(tls_config),
+        kafka_client::Auth::None,
+    )
+    .await
+    .unwrap();
 
     let versions = conn.api_versions();
     assert!(!versions.is_empty());

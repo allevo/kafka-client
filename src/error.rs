@@ -4,6 +4,7 @@ use std::fmt;
 pub enum Error {
     Io(std::io::Error),
     ProtocolError(String),
+    AuthenticationError(String),
     ApiError { error_code: i16 },
 }
 
@@ -12,6 +13,7 @@ impl fmt::Display for Error {
         match self {
             Error::Io(e) => write!(f, "I/O error: {e}"),
             Error::ProtocolError(msg) => write!(f, "protocol error: {msg}"),
+            Error::AuthenticationError(msg) => write!(f, "authentication error: {msg}"),
             Error::ApiError { error_code } => write!(f, "broker error code: {error_code}"),
         }
     }

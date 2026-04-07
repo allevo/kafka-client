@@ -4,5 +4,5 @@ pub mod error;
 pub mod protocol;
 
 pub use config::Config;
-pub use connection::{Connection, Security};
+pub use connection::{Auth, Connection, Security};
 pub use error::Error;

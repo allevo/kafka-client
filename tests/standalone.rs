@@ -21,9 +21,10 @@ async fn test_standalone_api_versions() {
     let port = kafka.get_host_port_ipv4(KAFKA_PORT).await.unwrap();
 
     let config = kafka_client::Config::new(&host, port);
-    let conn = kafka_client::Connection::connect(&config, kafka_client::Security::Plaintext)
-        .await
-        .unwrap();
+    let conn =
+        kafka_client::Connection::connect(&config, kafka_client::Security::Plaintext, kafka_client::Auth::None)
+            .await
+            .unwrap();
 
     let versions = conn.api_versions();
     assert!(!versions.is_empty());

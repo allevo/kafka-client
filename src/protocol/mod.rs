@@ -1,4 +1,6 @@
 pub mod api_versions;
+pub mod sasl_authenticate;
+pub mod sasl_handshake;
 
 #[derive(Debug, Clone)]
 pub struct ApiVersion {
