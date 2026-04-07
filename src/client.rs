@@ -26,14 +26,14 @@ pub struct Client {
 
 impl Client {
     pub fn new(connection: Connection) -> Self {
-        let (stream, api_versions, next_id) = connection.into_parts();
+        let (stream, api_versions, last_correlation_id) = connection.into_parts();
         let (request_tx, request_rx) = mpsc::channel::<Request>(32);
 
         tokio::spawn(connection_task(stream, request_rx));
 
         Client {
             request_tx,
-            next_correlation_id: Arc::new(AtomicI32::new(next_id)),
+            next_correlation_id: Arc::new(AtomicI32::new(last_correlation_id + 1)),
             api_versions: api_versions.into(),
         }
     }
@@ -42,6 +42,13 @@ impl Client {
         &self,
         encode: impl FnOnce(i32) -> Vec<u8>,
     ) -> Result<Vec<u8>> {
+        // The Kafka protocol only requires correlation IDs to be unique among
+        // in-flight requests. The server echoes back whatever the client sends.
+        // Sequential generation is a convention (used by both the Java client
+        // and librdkafka), not a protocol requirement.
+        // For this reason, the sending order doesn't guarantee correlation ordering,
+        // i.e. the task can be yielded between this line and the send below.
+        // This is fine.
         let correlation_id = self.next_correlation_id.fetch_add(1, Ordering::Relaxed);
         let data = encode(correlation_id);
 

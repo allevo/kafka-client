@@ -72,6 +72,7 @@ impl AsyncWrite for Stream {
 pub struct Connection {
     stream: Stream,
     api_versions: Vec<ApiVersion>,
+    correlation_id: i32,
 }
 
 impl Connection {
@@ -96,8 +97,9 @@ impl Connection {
             }
         };
 
-        let correlation_id = 1;
+        let mut correlation_id: i32 = 0;
 
+        correlation_id += 1;
         let request = api_versions::encode_request_v0(correlation_id, "kafka-client");
         stream.write_all(&request).await?;
 
@@ -135,7 +137,7 @@ impl Connection {
             }
 
             // SaslHandshake
-            let correlation_id = 2;
+            correlation_id += 1;
             let request =
                 sasl_handshake::encode_request_v1(correlation_id, "kafka-client", "PLAIN");
             stream.write_all(&request).await?;
@@ -159,7 +161,7 @@ impl Connection {
             }
 
             // SaslAuthenticate
-            let correlation_id = 3;
+            correlation_id += 1;
             let password = password.expose_secret();
             let mut token = zeroize::Zeroizing::new(
                 Vec::with_capacity(1 + username.len() + 1 + password.len()),
@@ -194,6 +196,7 @@ impl Connection {
         Ok(Connection {
             stream,
             api_versions: versions,
+            correlation_id,
         })
     }
 
@@ -202,6 +205,6 @@ impl Connection {
     }
 
     pub(crate) fn into_parts(self) -> (Stream, Vec<ApiVersion>, i32) {
-        (self.stream, self.api_versions, 4)
+        (self.stream, self.api_versions, self.correlation_id)
     }
 }
