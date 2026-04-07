@@ -78,11 +78,17 @@ pub struct Connection {
 impl Connection {
     pub async fn connect(config: &Config, security: Security, auth: Auth) -> Result<Self> {
         let addr = format!("{}:{}", config.host, config.port);
+        tracing::info!(addr = %addr, "connecting to broker");
         let tcp = TcpStream::connect(&addr).await?;
+        tracing::debug!(addr = %addr, "TCP connection established");
 
         let mut stream = match security {
-            Security::Plaintext => Stream::Plain(tcp),
+            Security::Plaintext => {
+                tracing::debug!("using plaintext connection");
+                Stream::Plain(tcp)
+            }
             Security::Ssl(tls_config) => {
+                tracing::debug!(host = %config.host, "starting TLS handshake");
                 let server_name = rustls::pki_types::ServerName::try_from(config.host.as_str())
                     .map_err(|_| {
                         Error::ProtocolError(format!(
@@ -93,6 +99,7 @@ impl Connection {
                     .to_owned();
                 let connector = TlsConnector::from(tls_config);
                 let tls_stream = connector.connect(server_name, tcp).await?;
+                tracing::debug!(host = %config.host, "TLS handshake complete");
                 Stream::Tls(tls_stream)
             }
         };
@@ -100,6 +107,7 @@ impl Connection {
         let mut correlation_id: i32 = 0;
 
         correlation_id += 1;
+        tracing::debug!(correlation_id, "sending ApiVersions request");
         let request = api_versions::encode_request_v0(correlation_id, "kafka-client");
         stream.write_all(&request).await?;
 
@@ -122,11 +130,14 @@ impl Connection {
                 "correlation id mismatch: expected 1, got {response_correlation_id}"
             )));
         }
+        tracing::debug!(api_count = versions.len(), "received ApiVersions response");
 
         if let Auth::Plain {
             username, password, ..
         } = &auth
         {
+            tracing::info!(username = %username, "starting SASL/PLAIN authentication");
+
             let has_sasl_handshake = versions.iter().any(|v| v.api_key == 17);
             let has_sasl_authenticate = versions.iter().any(|v| v.api_key == 36);
             if !has_sasl_handshake || !has_sasl_authenticate {
@@ -138,6 +149,7 @@ impl Connection {
 
             // SaslHandshake
             correlation_id += 1;
+            tracing::debug!(correlation_id, "sending SaslHandshake request");
             let request =
                 sasl_handshake::encode_request_v1(correlation_id, "kafka-client", "PLAIN");
             stream.write_all(&request).await?;
@@ -159,9 +171,11 @@ impl Connection {
                     "correlation id mismatch: expected {correlation_id}, got {resp_corr_id}"
                 )));
             }
+            tracing::debug!(correlation_id, "SaslHandshake complete");
 
             // SaslAuthenticate
             correlation_id += 1;
+            tracing::debug!(correlation_id, "sending SaslAuthenticate request");
             let password = password.expose_secret();
             let mut token = zeroize::Zeroizing::new(
                 Vec::with_capacity(1 + username.len() + 1 + password.len()),
@@ -191,8 +205,10 @@ impl Connection {
                     "correlation id mismatch: expected {correlation_id}, got {resp_corr_id}"
                 )));
             }
+            tracing::info!(username = %username, "SASL/PLAIN authentication successful");
         }
 
+        tracing::info!(addr = %addr, "connected to broker");
         Ok(Connection {
             stream,
             api_versions: versions,
