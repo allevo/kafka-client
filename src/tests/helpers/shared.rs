@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::sync::LazyLock;
 
+use kafka_protocol::messages::BrokerId;
 use testcontainers::runners::AsyncRunner;
 use testcontainers::ImageExt;
 use testcontainers_modules::kafka::apache::{Kafka, KAFKA_PORT};
@@ -16,7 +17,7 @@ pub struct SharedBroker {
 }
 
 pub struct SharedCluster {
-    pub addr_map: HashMap<i32, (String, u16)>,
+    pub addr_map: HashMap<BrokerId, (String, u16)>,
     _containers: Vec<Box<dyn std::any::Any + Send + Sync>>,
 }
 
@@ -101,7 +102,7 @@ pub async fn plaintext_cluster() -> &'static SharedCluster {
             .unwrap();
 
             let mut addr_map = HashMap::new();
-            for (node_id, node) in [(1, &n1), (2, &n2), (3, &n3)] {
+            for (node_id, node) in [(BrokerId(1), &n1), (BrokerId(2), &n2), (BrokerId(3), &n3)] {
                 let host = node.get_host().await.unwrap().to_string();
                 let port = node
                     .get_host_port_ipv4(containers::KAFKA_PORT)

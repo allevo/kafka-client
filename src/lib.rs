@@ -12,5 +12,8 @@ pub use connection::{Auth, Connection, Security};
 pub use error::Error;
 pub use secret::SecretString;
 
+pub use kafka_protocol::messages::{BrokerId, TopicName};
+pub use kafka_protocol::protocol::StrBytes;
+
 #[cfg(test)]
 mod tests;

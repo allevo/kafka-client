@@ -41,7 +41,7 @@ async fn test_standalone_fetch_metadata() {
     assert!(broker_info.port > 0);
     assert!(!broker_info.host.is_empty());
 
-    assert!(response.controller_id.0 >= 0);
+    assert!(*response.controller_id >= 0);
 }
 
 #[tokio::test]
@@ -57,7 +57,7 @@ async fn test_standalone_cluster_client() {
     .await
     .unwrap();
 
-    assert!(client.controller_id() >= 0);
+    assert!(*client.controller_id() >= 0);
 
     let controller = client.controller().await.unwrap();
     let metadata = controller.fetch_metadata().await.unwrap();
@@ -65,7 +65,7 @@ async fn test_standalone_cluster_client() {
 
     let refreshed = client.refresh_metadata().await.unwrap();
     assert!(!refreshed.brokers.is_empty());
-    assert!(refreshed.controller_id.0 >= 0);
+    assert!(*refreshed.controller_id >= 0);
 }
 
 #[tokio::test]

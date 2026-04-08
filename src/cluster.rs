@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use kafka_protocol::messages::create_topics_request::CreatableTopic;
-use kafka_protocol::messages::{CreateTopicsResponse, MetadataResponse};
+use kafka_protocol::messages::{BrokerId, CreateTopicsResponse, MetadataResponse};
 
 use crate::client::BrokerClient;
 use crate::config::Config;
@@ -14,7 +14,7 @@ use crate::error::{Error, Result};
 /// Receives `(node_id, advertised_host, advertised_port)` and returns
 /// `(actual_host, actual_port)`. Useful when brokers sit behind NAT,
 /// Docker port mapping, or a proxy.
-type AddressResolver = Arc<dyn Fn(i32, &str, i32) -> (String, u16) + Send + Sync>;
+type AddressResolver = Arc<dyn Fn(BrokerId, &str, i32) -> (String, u16) + Send + Sync>;
 
 struct BrokerInfo {
     host: String,
@@ -24,9 +24,9 @@ struct BrokerInfo {
 pub struct Client {
     security: Security,
     auth: Auth,
-    controller_id: i32,
-    known_brokers: HashMap<i32, BrokerInfo>,
-    connections: HashMap<i32, BrokerClient>,
+    controller_id: BrokerId,
+    known_brokers: HashMap<BrokerId, BrokerInfo>,
+    connections: HashMap<BrokerId, BrokerClient>,
     address_resolver: Option<AddressResolver>,
 }
 
@@ -39,7 +39,7 @@ impl Client {
         bootstrap: &[Config],
         security: Security,
         auth: Auth,
-        resolver: impl Fn(i32, &str, i32) -> (String, u16) + Send + Sync + 'static,
+        resolver: impl Fn(BrokerId, &str, i32) -> (String, u16) + Send + Sync + 'static,
     ) -> Result<Self> {
         Self::connect_inner(bootstrap, security, auth, Some(Arc::new(resolver))).await
     }
@@ -63,7 +63,7 @@ impl Client {
                     for broker in &metadata.brokers {
                         let (host, port) = resolve_address(
                             &address_resolver,
-                            broker.node_id.0,
+                            broker.node_id,
                             broker.host.as_str(),
                             broker.port,
                         );
@@ -71,27 +71,25 @@ impl Client {
                             && host == config.host
                             && port == config.port
                         {
-                            bootstrap_node_id = Some(broker.node_id.0);
+                            bootstrap_node_id = Some(broker.node_id);
                         }
-                        known_brokers.insert(broker.node_id.0, BrokerInfo { host, port });
+                        known_brokers.insert(broker.node_id, BrokerInfo { host, port });
                     }
 
                     let mut connections = HashMap::new();
                     if let Some(node_id) = bootstrap_node_id {
                         connections.insert(node_id, client);
-                    } else {
-                        if let Some(&id) = known_brokers
-                            .keys()
-                            .find(|id| !connections.contains_key(id))
-                        {
-                            connections.insert(id, client);
-                        }
+                    } else if let Some(&id) = known_brokers
+                        .keys()
+                        .find(|&&id| !connections.contains_key(&id))
+                    {
+                        connections.insert(id, client);
                     }
 
                     return Ok(Client {
                         security,
                         auth,
-                        controller_id: metadata.controller_id.0,
+                        controller_id: metadata.controller_id,
                         known_brokers,
                         connections,
                         address_resolver,
@@ -113,10 +111,10 @@ impl Client {
         self.broker(self.controller_id).await
     }
 
-    pub async fn broker(&mut self, node_id: i32) -> Result<&BrokerClient> {
+    pub async fn broker(&mut self, node_id: BrokerId) -> Result<&BrokerClient> {
         if !self.connections.contains_key(&node_id) {
             let info = self.known_brokers.get(&node_id).ok_or_else(|| {
-                Error::ProtocolError(format!("unknown broker node_id: {node_id}"))
+                Error::ProtocolError(format!("unknown broker node_id: {}", node_id.0))
             })?;
 
             let config = Config::new(&info.host, info.port);
@@ -140,16 +138,16 @@ impl Client {
         let broker = self.any_broker()?;
         let metadata = broker.fetch_metadata().await?;
 
-        self.controller_id = metadata.controller_id.0;
+        self.controller_id = metadata.controller_id;
         self.known_brokers.clear();
         for broker in &metadata.brokers {
             let (host, port) = resolve_address(
                 &self.address_resolver,
-                broker.node_id.0,
+                broker.node_id,
                 broker.host.as_str(),
                 broker.port,
             );
-            self.known_brokers.insert(broker.node_id.0, BrokerInfo { host, port });
+            self.known_brokers.insert(broker.node_id, BrokerInfo { host, port });
         }
 
         Ok(metadata)
@@ -164,14 +162,14 @@ impl Client {
         controller.create_topics(topics, timeout_ms).await
     }
 
-    pub fn controller_id(&self) -> i32 {
+    pub fn controller_id(&self) -> BrokerId {
         self.controller_id
     }
 }
 
 fn resolve_address(
     resolver: &Option<AddressResolver>,
-    node_id: i32,
+    node_id: BrokerId,
     host: &str,
     port: i32,
 ) -> (String, u16) {
