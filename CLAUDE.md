@@ -15,49 +15,26 @@ Early stage. Connection management, cluster topology, and basic protocol operati
 ## Build & test
 
 ```bash
-cargo build                # build the library
-cargo test                 # run all tests (requires Docker)
-cargo test --test standalone   # single-broker plaintext test
-cargo test --test cluster      # 3-node plaintext cluster test
-cargo test --test standalone_tls  # single-broker TLS test
-cargo test --test cluster_tls     # 3-node TLS cluster test
+cargo build                          # build the library
+cargo test                           # run all tests
 ```
 
-Tests use `testcontainers` with the `apache/kafka:3.7.0` image. Docker must be running. Broker startup timeout is 120 seconds.
+NB: Tests use `testcontainers` with the `apache/kafka:3.7.0` image. Docker must be running. Broker startup timeout is 120 seconds.
+
+### Conventions
+
+- Tests live in `src/tests/`, one file per scenario. Shared helpers live in `src/tests/helpers/`.
+- Kafka broker instances are shared across tests via `LazyLock<OnceCell<SharedBroker>>` in `helpers/shared.rs`. One container per security mode (plaintext, TLS, SASL) and one 3-node cluster, started lazily on first use.
+- New tests should call `helpers::plaintext_broker().await` (or `tls_broker`, `sasl_broker`, `plaintext_cluster`) instead of starting their own containers.
+- Tests that create state (topics, etc.) should use unique names to avoid conflicts with other tests sharing the same broker.
+- TLS test fixtures (JKS keystores, credential files) live in `tests/fixtures/secrets/` and are copied into containers at runtime.
+- All test functions are `async` and use `#[tokio::test]`.
 
 ## Rust toolchain
 
 - **Edition**: 2024
 - **Minimum rustc**: 1.94+
 - **Async runtime**: tokio (full features in dev-dependencies; will move to main dependencies)
-
-## Project layout
-
-```
-src/
-  lib.rs           # Crate root, public re-exports
-  connection.rs    # TCP/TLS/SASL connection handshake
-  client.rs        # BrokerClient: async request/response pipeline, typed send()
-  cluster.rs       # Client: cluster topology, broker discovery, address resolver
-  config.rs        # Config struct (host, port)
-  error.rs         # Error enum (Io, ProtocolError, AuthenticationError, ApiError)
-  secret.rs        # SecretString (zeroize wrapper)
-tests/
-  common/mod.rs    # Shared test helpers: broker configs (plaintext, TLS, standalone, cluster)
-  standalone.rs    # Single-broker plaintext integration test
-  standalone_tls.rs   # Single-broker TLS integration test
-  standalone_sasl.rs  # Single-broker SASL/PLAIN integration test
-  cluster.rs       # 3-node plaintext cluster integration test
-  cluster_tls.rs   # 3-node TLS cluster integration test
-  fixtures/secrets/   # JKS keystores and truststore credentials for TLS tests
-```
-
-## Conventions
-
-- Integration tests go in `tests/`, one file per scenario. Shared test infrastructure lives in `tests/common/mod.rs`.
-- TLS test fixtures (JKS keystores, credential files) live in `tests/fixtures/secrets/` and are copied into containers at runtime.
-- Cluster tests use a naming prefix (`"pt"` for plaintext, `"tls"` for TLS) and Docker networks to allow inter-broker communication.
-- All test functions are `async` and use `#[tokio::test]`.
 
 ## Reference material
 

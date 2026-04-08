@@ -12,7 +12,7 @@ pub const KAFKA_PORT: u16 = 9092;
 pub const SSL_PORT: u16 = 9093;
 pub const SASL_PLAINTEXT_PORT: u16 = 9094;
 
-fn fixtures_path() -> PathBuf {
+pub fn fixtures_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests")
         .join("fixtures")
@@ -43,10 +43,6 @@ fn with_ssl_files(req: ContainerRequest<GenericImage>) -> ContainerRequest<Gener
 
 pub fn quorum_voters_plaintext(prefix: &str) -> String {
     format!("1@{prefix}-kafka-1:9093,2@{prefix}-kafka-2:9093,3@{prefix}-kafka-3:9093")
-}
-
-pub fn quorum_voters_tls(prefix: &str) -> String {
-    format!("1@{prefix}-kafka-1:29092,2@{prefix}-kafka-2:29092,3@{prefix}-kafka-3:29092")
 }
 
 pub fn kraft_broker_plaintext(
@@ -83,51 +79,6 @@ pub fn kraft_broker_plaintext(
         .with_env_var("KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR", "1")
         .with_env_var("KAFKA_LOG_DIRS", "/tmp/kraft-combined-logs")
         .with_startup_timeout(Duration::from_secs(120))
-}
-
-pub fn kraft_broker_tls(
-    prefix: &str,
-    node_id: u8,
-    quorum_voters: &str,
-) -> ContainerRequest<GenericImage> {
-    let name = format!("{prefix}-kafka-{node_id}");
-    let req = GenericImage::new(IMAGE, TAG)
-        .with_exposed_port(SSL_PORT.tcp())
-        .with_container_name(&name)
-        .with_env_var("KAFKA_NODE_ID", node_id.to_string())
-        .with_env_var("KAFKA_PROCESS_ROLES", "broker,controller")
-        .with_env_var(
-            "KAFKA_LISTENER_SECURITY_PROTOCOL_MAP",
-            "SSL:SSL,CONTROLLER:PLAINTEXT,SSL-INTERNAL:SSL",
-        )
-        .with_env_var("KAFKA_CONTROLLER_QUORUM_VOTERS", quorum_voters)
-        .with_env_var(
-            "KAFKA_LISTENERS",
-            format!("SSL-INTERNAL://:19093,CONTROLLER://{name}:29092,SSL://:{SSL_PORT}"),
-        )
-        .with_env_var("KAFKA_INTER_BROKER_LISTENER_NAME", "SSL-INTERNAL")
-        .with_env_var("KAFKA_SECURITY_PROTOCOL", "SSL")
-        .with_env_var(
-            "KAFKA_ADVERTISED_LISTENERS",
-            format!("SSL-INTERNAL://{name}:19093,SSL://localhost:{SSL_PORT}"),
-        )
-        .with_env_var("KAFKA_CONTROLLER_LISTENER_NAMES", "CONTROLLER")
-        .with_env_var("CLUSTER_ID", CLUSTER_ID)
-        .with_env_var("KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR", "1")
-        .with_env_var("KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS", "0")
-        .with_env_var("KAFKA_TRANSACTION_STATE_LOG_MIN_ISR", "1")
-        .with_env_var("KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR", "1")
-        .with_env_var("KAFKA_LOG_DIRS", "/tmp/kraft-combined-logs")
-        .with_env_var("KAFKA_SSL_KEYSTORE_FILENAME", "kafka01.keystore.jks")
-        .with_env_var("KAFKA_SSL_KEYSTORE_CREDENTIALS", "kafka_keystore_creds")
-        .with_env_var("KAFKA_SSL_KEY_CREDENTIALS", "kafka_ssl_key_creds")
-        .with_env_var("KAFKA_SSL_TRUSTSTORE_FILENAME", "kafka.truststore.jks")
-        .with_env_var("KAFKA_SSL_TRUSTSTORE_CREDENTIALS", "kafka_truststore_creds")
-        .with_env_var("KAFKA_SSL_CLIENT_AUTH", "required")
-        .with_env_var("KAFKA_SSL_ENDPOINT_IDENTIFICATION_ALGORITHM", "")
-        .with_startup_timeout(Duration::from_secs(120));
-
-    with_ssl_files(req)
 }
 
 pub fn standalone_tls_broker() -> ContainerRequest<GenericImage> {

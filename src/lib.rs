@@ -11,3 +11,6 @@ pub use config::Config;
 pub use connection::{Auth, Connection, Security};
 pub use error::Error;
 pub use secret::SecretString;
+
+#[cfg(test)]
+mod tests;
