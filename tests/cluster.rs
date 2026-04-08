@@ -74,8 +74,15 @@ async fn test_cluster_client() {
     .await
     .unwrap();
 
-    // Should discover all 3 brokers via metadata
-    let metadata = client.refresh_metadata().await.unwrap();
+    // Brokers may need time to fully register with each other in KRaft mode
+    let mut metadata = client.refresh_metadata().await.unwrap();
+    for _ in 0..10 {
+        if metadata.brokers.len() == 3 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        metadata = client.refresh_metadata().await.unwrap();
+    }
     assert_eq!(metadata.brokers.len(), 3);
 
     // Controller should be one of the 3 nodes
@@ -86,19 +93,22 @@ async fn test_cluster_client() {
     );
 
     // Verify all 3 node IDs are present and distinct
-    let mut node_ids: Vec<i32> = metadata.brokers.iter().map(|b| b.node_id).collect();
+    let mut node_ids: Vec<i32> = metadata.brokers.iter().map(|b| b.node_id.0).collect();
     node_ids.sort();
     assert_eq!(node_ids, vec![1, 2, 3]);
 
-    // Should be able to connect to the controller
-    let controller = client.controller().await.unwrap();
-    let controller_metadata = controller.fetch_metadata().await.unwrap();
-    assert_eq!(controller_metadata.brokers.len(), 3);
-
     // Should be able to connect to every broker by node_id
-    for id in [1, 2, 3] {
+    // and each broker should eventually see all 3 peers
+    for id in [client.controller_id(), 1, 2, 3] {
         let broker = client.broker(id).await.unwrap();
-        let m = broker.fetch_metadata().await.unwrap();
-        assert_eq!(m.brokers.len(), 3);
+        let mut m = broker.fetch_metadata().await.unwrap();
+        for _ in 0..10 {
+            if m.brokers.len() == 3 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            m = broker.fetch_metadata().await.unwrap();
+        }
+        assert_eq!(m.brokers.len(), 3, "broker {id} sees wrong broker count");
     }
 }

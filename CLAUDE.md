@@ -1,16 +1,16 @@
 # kafka-client
 
-Pure async Rust implementation of the Apache Kafka protocol. No C bindings, no librdkafka — built from scratch on top of tokio.
+Pure async Rust Kafka client built on top of tokio. Uses `kafka-protocol` for wire protocol encoding/decoding.
 
 ## Project status
 
-Early stage. The test infrastructure (testcontainers-based Kafka brokers) is in place. The client library itself is not yet implemented — `src/` currently contains only a placeholder `main.rs` that should be replaced with `lib.rs` once implementation begins.
+Early stage. Connection management, cluster topology, and basic protocol operations (metadata, SASL auth, topic creation) are implemented. Producer and Consumer are not yet implemented.
 
 ## Architecture goals
 
 - **Async-first**: Built on tokio. All I/O is non-blocking.
-- **Pure Rust**: Implements the Kafka wire protocol directly. No FFI, no librdkafka dependency.
-- **Protocol-driven**: Follows the Apache Kafka protocol specification. Each API key (Produce, Fetch, Metadata, etc.) maps to request/response types with versioned serialization.
+- **Pure Rust**: No FFI, no librdkafka dependency. Protocol encoding/decoding via `kafka-protocol` crate.
+- **Protocol-driven**: Follows the Apache Kafka protocol specification. The `kafka-protocol` crate provides auto-generated types for all Kafka API keys with versioned serialization.
 
 ## Build & test
 
@@ -34,14 +34,22 @@ Tests use `testcontainers` with the `apache/kafka:3.7.0` image. Docker must be r
 ## Project layout
 
 ```
-src/              # Library source (not yet implemented)
+src/
+  lib.rs           # Crate root, public re-exports
+  connection.rs    # TCP/TLS/SASL connection handshake
+  client.rs        # BrokerClient: async request/response pipeline, typed send()
+  cluster.rs       # Client: cluster topology, broker discovery, address resolver
+  config.rs        # Config struct (host, port)
+  error.rs         # Error enum (Io, ProtocolError, AuthenticationError, ApiError)
+  secret.rs        # SecretString (zeroize wrapper)
 tests/
-  common/mod.rs   # Shared test helpers: broker configs (plaintext, TLS, standalone, cluster)
-  standalone.rs   # Single-broker plaintext integration test
-  standalone_tls.rs  # Single-broker TLS integration test
-  cluster.rs      # 3-node plaintext cluster integration test
-  cluster_tls.rs  # 3-node TLS cluster integration test
-  fixtures/secrets/  # JKS keystores and truststore credentials for TLS tests
+  common/mod.rs    # Shared test helpers: broker configs (plaintext, TLS, standalone, cluster)
+  standalone.rs    # Single-broker plaintext integration test
+  standalone_tls.rs   # Single-broker TLS integration test
+  standalone_sasl.rs  # Single-broker SASL/PLAIN integration test
+  cluster.rs       # 3-node plaintext cluster integration test
+  cluster_tls.rs   # 3-node TLS cluster integration test
+  fixtures/secrets/   # JKS keystores and truststore credentials for TLS tests
 ```
 
 ## Conventions
@@ -59,13 +67,25 @@ tests/
 
 When implementing a protocol feature, cross-reference the Java source in `kafka/` for correctness and `librdkafka/` for client-side design patterns.
 
-## Protocol versioning design
+## Protocol encoding
 
-Each API key (Produce, Fetch, etc.) has multiple protocol versions. Newer versions append fields — they never insert fields between existing ones. The client negotiates the version to use by intersecting its supported range with the broker's (via ApiVersionsResponse) and picking the maximum.
+All protocol encoding/decoding uses the `kafka-protocol` crate (auto-generated from Kafka's JSON schema). Key patterns:
 
-Each protocol version gets its own flat struct (e.g. `FetchRequestV0`, `FetchRequestV4`). Fields are duplicated across version structs rather than using `Option` fields or nesting. This keeps each struct self-contained with straightforward serialization — no version-conditional branches, no optional fields. An enum per API key (e.g. `enum FetchRequest { V0(...), V4(...) }`) dispatches to the right variant after version negotiation.
+- **Typed send**: `BrokerClient::send<Req, Resp>(api_key, api_version, request)` handles header encoding, framing, and response decoding automatically.
+- **Version parameter**: The API version is passed to `encode()`/`decode()` — a single struct per message type handles all versions.
+- **Builder pattern**: Message types are `#[non_exhaustive]` and constructed via `Default::default()` + `.with_field(value)` chains.
+- **Newtypes**: `BrokerId(i32)`, `TopicName(StrBytes)`, etc. Access inner value via `.0` or deref.
+
+## Code comments
+
+When writing or editing code, add inline comments (`//`) where they help a reader **without project context** understand the code. Follow the full guidelines in `.claude/skills/comments/SKILL.md`. Key points:
+
+- Explain **why**, not what. Reference protocol behavior, spec requirements, or external constraints.
+- Preempt confusion — if a reader might think "is this a bug?" or "why not do X?", answer that.
+- Never restate what the code does. Never add doc comments (`///`) — those are handled separately.
+- Most code needs no comment. Only add them where they genuinely help.
 
 ## Important notes
 
-- The Kafka wire protocol uses big-endian encoding. All protocol serialization must use network byte order.
-- Kafka protocol versions matter: request/response formats change between API versions. Always be explicit about which version is being implemented.
+- Kafka protocol versions matter: request/response formats change between API versions. Always be explicit about which version is being used.
+- `MetadataRequest::default()` sets `topics: Some(vec![])` (no topics). Use `.with_topics(None)` to request all topics.

@@ -2,15 +2,22 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::{Arc, Mutex};
 
+use bytes::{BufMut, Bytes, BytesMut};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot};
 
+use kafka_protocol::messages::api_versions_response::ApiVersion;
+use kafka_protocol::messages::create_topics_request::CreatableTopic;
+use kafka_protocol::messages::{
+    ApiKey, CreateTopicsRequest, CreateTopicsResponse, MetadataRequest, MetadataResponse,
+    RequestHeader, ResponseHeader,
+};
+use kafka_protocol::protocol::{Decodable, Encodable, HeaderVersion, StrBytes};
+
 use crate::connection::Connection;
 use crate::error::{Error, Result};
-use crate::protocol::ApiVersion;
-use crate::protocol::metadata::{self, MetadataResponse};
 
-struct Request {
+struct RequestMsg {
     correlation_id: i32,
     data: Vec<u8>,
     response_tx: oneshot::Sender<Result<Vec<u8>>>,
@@ -20,15 +27,17 @@ type InFlight = Arc<Mutex<HashMap<i32, oneshot::Sender<Result<Vec<u8>>>>>>;
 
 #[derive(Clone)]
 pub struct BrokerClient {
-    request_tx: mpsc::Sender<Request>,
+    request_tx: mpsc::Sender<RequestMsg>,
     next_correlation_id: Arc<AtomicI32>,
     api_versions: Arc<[ApiVersion]>,
 }
 
+const CLIENT_ID: &str = "kafka-client";
+
 impl BrokerClient {
     pub fn new(connection: Connection) -> Self {
         let (stream, api_versions, last_correlation_id) = connection.into_parts();
-        let (request_tx, request_rx) = mpsc::channel::<Request>(32);
+        let (request_tx, request_rx) = mpsc::channel::<RequestMsg>(32);
 
         tracing::info!("spawning connection task");
         tokio::spawn(connection_task(stream, request_rx));
@@ -44,13 +53,6 @@ impl BrokerClient {
         &self,
         encode: impl FnOnce(i32) -> Vec<u8>,
     ) -> Result<Vec<u8>> {
-        // The Kafka protocol only requires correlation IDs to be unique among
-        // in-flight requests. The server echoes back whatever the client sends.
-        // Sequential generation is a convention (used by both the Java client
-        // and librdkafka), not a protocol requirement.
-        // For this reason, the sending order doesn't guarantee correlation ordering,
-        // i.e. the task can be yielded between this line and the send below.
-        // This is fine.
         let correlation_id = self.next_correlation_id.fetch_add(1, Ordering::Relaxed);
         let data = encode(correlation_id);
 
@@ -58,7 +60,7 @@ impl BrokerClient {
 
         let (response_tx, response_rx) = oneshot::channel();
 
-        let request = Request {
+        let request = RequestMsg {
             correlation_id,
             data,
             response_tx,
@@ -88,13 +90,58 @@ impl BrokerClient {
         result
     }
 
-    pub async fn fetch_metadata(&self) -> Result<MetadataResponse> {
+    /// Send a typed Kafka request and decode the response.
+    pub async fn send<Req, Resp>(
+        &self,
+        api_key: ApiKey,
+        api_version: i16,
+        request: Req,
+    ) -> Result<Resp>
+    where
+        Req: Encodable + HeaderVersion + Send + 'static,
+        Resp: Decodable + HeaderVersion,
+    {
         let response_data = self
             .send_raw(|correlation_id| {
-                metadata::encode_request_v1(correlation_id, "kafka-client", None)
+                let header = RequestHeader::default()
+                    .with_request_api_key(api_key as i16)
+                    .with_request_api_version(api_version)
+                    .with_correlation_id(correlation_id)
+                    .with_client_id(Some(StrBytes::from_static_str(CLIENT_ID)));
+
+                let header_version = Req::header_version(api_version);
+                let size = header.compute_size(header_version).unwrap()
+                    + request.compute_size(api_version).unwrap();
+                let mut buf = BytesMut::with_capacity(4 + size);
+                buf.put_i32(size as i32);
+                header.encode(&mut buf, header_version).unwrap();
+                request.encode(&mut buf, api_version).unwrap();
+                buf.to_vec()
             })
             .await?;
-        metadata::decode_response_v1(&response_data)
+
+        let mut buf = Bytes::from(response_data);
+        let resp_header_version = api_key.response_header_version(api_version);
+        let _resp_header = ResponseHeader::decode(&mut buf, resp_header_version)?;
+        let response = Resp::decode(&mut buf, api_version)?;
+        Ok(response)
+    }
+
+    pub async fn fetch_metadata(&self) -> Result<MetadataResponse> {
+        // topics: None requests metadata for all topics
+        let request = MetadataRequest::default().with_topics(None);
+        self.send(ApiKey::Metadata, 1, request).await
+    }
+
+    pub async fn create_topics(
+        &self,
+        topics: Vec<CreatableTopic>,
+        timeout_ms: i32,
+    ) -> Result<CreateTopicsResponse> {
+        let request = CreateTopicsRequest::default()
+            .with_topics(topics)
+            .with_timeout_ms(timeout_ms);
+        self.send(ApiKey::CreateTopics, 2, request).await
     }
 
     pub fn api_versions(&self) -> &[ApiVersion] {
@@ -104,7 +151,7 @@ impl BrokerClient {
 
 async fn connection_task(
     stream: crate::connection::Stream,
-    mut request_rx: mpsc::Receiver<Request>,
+    mut request_rx: mpsc::Receiver<RequestMsg>,
 ) {
     let (mut reader, mut writer) = tokio::io::split(stream);
     let in_flight: InFlight = Arc::new(Mutex::new(HashMap::new()));

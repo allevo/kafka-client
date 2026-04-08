@@ -1,11 +1,13 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use kafka_protocol::messages::create_topics_request::CreatableTopic;
+use kafka_protocol::messages::{CreateTopicsResponse, MetadataResponse};
+
 use crate::client::BrokerClient;
 use crate::config::Config;
 use crate::connection::{Auth, Connection, Security};
 use crate::error::{Error, Result};
-use crate::protocol::metadata::MetadataResponse;
 
 /// Translates broker addresses from metadata into actual connectable addresses.
 ///
@@ -61,25 +63,23 @@ impl Client {
                     for broker in &metadata.brokers {
                         let (host, port) = resolve_address(
                             &address_resolver,
-                            broker.node_id,
-                            &broker.host,
+                            broker.node_id.0,
+                            broker.host.as_str(),
                             broker.port,
                         );
                         if bootstrap_node_id.is_none()
                             && host == config.host
                             && port == config.port
                         {
-                            bootstrap_node_id = Some(broker.node_id);
+                            bootstrap_node_id = Some(broker.node_id.0);
                         }
-                        known_brokers.insert(broker.node_id, BrokerInfo { host, port });
+                        known_brokers.insert(broker.node_id.0, BrokerInfo { host, port });
                     }
 
                     let mut connections = HashMap::new();
                     if let Some(node_id) = bootstrap_node_id {
                         connections.insert(node_id, client);
                     } else {
-                        // Could not match bootstrap to a node_id — this broker
-                        // is still usable, just pick the first unoccupied node_id.
                         if let Some(&id) = known_brokers
                             .keys()
                             .find(|id| !connections.contains_key(id))
@@ -91,7 +91,7 @@ impl Client {
                     return Ok(Client {
                         security,
                         auth,
-                        controller_id: metadata.controller_id,
+                        controller_id: metadata.controller_id.0,
                         known_brokers,
                         connections,
                         address_resolver,
@@ -140,19 +140,28 @@ impl Client {
         let broker = self.any_broker()?;
         let metadata = broker.fetch_metadata().await?;
 
-        self.controller_id = metadata.controller_id;
+        self.controller_id = metadata.controller_id.0;
         self.known_brokers.clear();
         for broker in &metadata.brokers {
             let (host, port) = resolve_address(
                 &self.address_resolver,
-                broker.node_id,
-                &broker.host,
+                broker.node_id.0,
+                broker.host.as_str(),
                 broker.port,
             );
-            self.known_brokers.insert(broker.node_id, BrokerInfo { host, port });
+            self.known_brokers.insert(broker.node_id.0, BrokerInfo { host, port });
         }
 
         Ok(metadata)
+    }
+
+    pub async fn create_topics(
+        &mut self,
+        topics: Vec<CreatableTopic>,
+        timeout_ms: i32,
+    ) -> Result<CreateTopicsResponse> {
+        let controller = self.controller().await?;
+        controller.create_topics(topics, timeout_ms).await
     }
 
     pub fn controller_id(&self) -> i32 {

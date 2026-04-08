@@ -9,6 +9,9 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 tokio-rustls = "0.26"
 zeroize = "1"
 tracing = "0.1"
+kafka-protocol = { version = "0.17", default-features = false, features = ["client"] }
+bytes = "1"
+anyhow = "1"
 
 [dev-dependencies]
 testcontainers = "0.27"

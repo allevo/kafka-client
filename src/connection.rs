@@ -2,16 +2,21 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
+use bytes::{BufMut, Bytes, BytesMut};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
 
+use kafka_protocol::messages::api_versions_response::ApiVersion;
+use kafka_protocol::messages::{
+    ApiVersionsRequest, ApiVersionsResponse, RequestHeader, ResponseHeader,
+    SaslAuthenticateRequest, SaslAuthenticateResponse, SaslHandshakeRequest,
+    SaslHandshakeResponse,
+};
+use kafka_protocol::protocol::{Decodable, Encodable, HeaderVersion, StrBytes};
+
 use crate::config::Config;
 use crate::error::{Error, Result};
-use crate::protocol::ApiVersion;
-use crate::protocol::api_versions;
-use crate::protocol::sasl_authenticate;
-use crate::protocol::sasl_handshake;
 use crate::secret::SecretString;
 
 #[derive(Clone)]
@@ -77,6 +82,64 @@ pub struct Connection {
     correlation_id: i32,
 }
 
+const CLIENT_ID: &str = "kafka-client";
+
+/// Encode a Kafka request with its header and 4-byte size prefix.
+fn encode_request<R: Encodable + HeaderVersion>(
+    request: &R,
+    api_key: i16,
+    api_version: i16,
+    correlation_id: i32,
+) -> Result<BytesMut> {
+    let header = RequestHeader::default()
+        .with_request_api_key(api_key)
+        .with_request_api_version(api_version)
+        .with_correlation_id(correlation_id)
+        .with_client_id(Some(StrBytes::from_static_str(CLIENT_ID)));
+
+    let header_version = R::header_version(api_version);
+    let size = header.compute_size(header_version)? + request.compute_size(api_version)?;
+
+    let mut buf = BytesMut::with_capacity(4 + size);
+    buf.put_i32(size as i32);
+    header.encode(&mut buf, header_version)?;
+    request.encode(&mut buf, api_version)?;
+    Ok(buf)
+}
+
+/// Read a framed response from the stream: 4-byte size prefix, then payload.
+async fn read_response(stream: &mut Stream) -> Result<Bytes> {
+    let mut size_buf = [0u8; 4];
+    stream.read_exact(&mut size_buf).await?;
+    let response_size = i32::from_be_bytes(size_buf);
+
+    if response_size <= 0 || response_size > 1024 * 1024 {
+        return Err(Error::ProtocolError(format!(
+            "invalid response size: {response_size}"
+        )));
+    }
+
+    let mut response_buf = vec![0u8; response_size as usize];
+    stream.read_exact(&mut response_buf).await?;
+    Ok(Bytes::from(response_buf))
+}
+
+/// Decode a response header and verify correlation ID.
+fn decode_response_header(
+    buf: &mut Bytes,
+    header_version: i16,
+    expected_correlation_id: i32,
+) -> Result<()> {
+    let resp_header = ResponseHeader::decode(buf, header_version)?;
+    if resp_header.correlation_id != expected_correlation_id {
+        return Err(Error::ProtocolError(format!(
+            "correlation id mismatch: expected {expected_correlation_id}, got {}",
+            resp_header.correlation_id
+        )));
+    }
+    Ok(())
+}
+
 impl Connection {
     pub async fn connect(config: &Config, security: Security, auth: Auth) -> Result<Self> {
         let addr = format!("{}:{}", config.host, config.port);
@@ -108,30 +171,30 @@ impl Connection {
 
         let mut correlation_id: i32 = 0;
 
+        // ApiVersions request (v0)
+        let api_version: i16 = 0;
         correlation_id += 1;
         tracing::debug!(correlation_id, "sending ApiVersions request");
-        let request = api_versions::encode_request_v0(correlation_id, "kafka-client");
-        stream.write_all(&request).await?;
+        let request_buf = encode_request(
+            &ApiVersionsRequest::default(),
+            18, // ApiVersions api_key
+            api_version,
+            correlation_id,
+        )?;
+        stream.write_all(&request_buf).await?;
 
-        let mut size_buf = [0u8; 4];
-        stream.read_exact(&mut size_buf).await?;
-        let response_size = i32::from_be_bytes(size_buf);
+        let mut response_bytes = read_response(&mut stream).await?;
+        let resp_header_version = ApiVersionsResponse::header_version(api_version);
+        decode_response_header(&mut response_bytes, resp_header_version, correlation_id)?;
+        let versions_response = ApiVersionsResponse::decode(&mut response_bytes, api_version)?;
 
-        if response_size <= 0 || response_size > 1024 * 1024 {
-            return Err(Error::ProtocolError(format!(
-                "invalid response size: {response_size}"
-            )));
+        if versions_response.error_code != 0 {
+            return Err(Error::ApiError {
+                error_code: versions_response.error_code,
+            });
         }
 
-        let mut response_buf = vec![0u8; response_size as usize];
-        stream.read_exact(&mut response_buf).await?;
-
-        let (response_correlation_id, versions) = api_versions::decode_response_v0(&response_buf)?;
-        if response_correlation_id != correlation_id {
-            return Err(Error::ProtocolError(format!(
-                "correlation id mismatch: expected 1, got {response_correlation_id}"
-            )));
-        }
+        let versions = versions_response.api_keys;
         tracing::debug!(api_count = versions.len(), "received ApiVersions response");
 
         if let Auth::Plain {
@@ -149,63 +212,65 @@ impl Connection {
                 ));
             }
 
-            // SaslHandshake
+            // SaslHandshake (v1)
+            let api_version: i16 = 1;
             correlation_id += 1;
             tracing::debug!(correlation_id, "sending SaslHandshake request");
-            let request =
-                sasl_handshake::encode_request_v1(correlation_id, "kafka-client", "PLAIN");
-            stream.write_all(&request).await?;
+            let request_buf = encode_request(
+                &SaslHandshakeRequest::default()
+                    .with_mechanism(StrBytes::from_static_str("PLAIN")),
+                17, // SaslHandshake api_key
+                api_version,
+                correlation_id,
+            )?;
+            stream.write_all(&request_buf).await?;
 
-            let mut size_buf = [0u8; 4];
-            stream.read_exact(&mut size_buf).await?;
-            let response_size = i32::from_be_bytes(size_buf);
-            if response_size <= 0 || response_size > 1024 * 1024 {
-                return Err(Error::ProtocolError(format!(
-                    "invalid response size: {response_size}"
-                )));
-            }
-            let mut response_buf = vec![0u8; response_size as usize];
-            stream.read_exact(&mut response_buf).await?;
-            let (resp_corr_id, _mechanisms) =
-                sasl_handshake::decode_response_v1(&response_buf)?;
-            if resp_corr_id != correlation_id {
-                return Err(Error::ProtocolError(format!(
-                    "correlation id mismatch: expected {correlation_id}, got {resp_corr_id}"
+            let mut response_bytes = read_response(&mut stream).await?;
+            let resp_header_version = SaslHandshakeResponse::header_version(api_version);
+            decode_response_header(&mut response_bytes, resp_header_version, correlation_id)?;
+            let handshake_response =
+                SaslHandshakeResponse::decode(&mut response_bytes, api_version)?;
+
+            if handshake_response.error_code != 0 {
+                return Err(Error::AuthenticationError(format!(
+                    "SASL handshake failed with error code: {}",
+                    handshake_response.error_code
                 )));
             }
             tracing::debug!(correlation_id, "SaslHandshake complete");
 
-            // SaslAuthenticate
+            // SaslAuthenticate (v0)
+            let api_version: i16 = 0;
             correlation_id += 1;
             tracing::debug!(correlation_id, "sending SaslAuthenticate request");
             let password = password.expose_secret();
-            let mut token = zeroize::Zeroizing::new(
-                Vec::with_capacity(1 + username.len() + 1 + password.len()),
-            );
+            let mut token = Vec::with_capacity(1 + username.len() + 1 + password.len());
             token.push(0u8);
             token.extend_from_slice(username.as_bytes());
             token.push(0u8);
             token.extend_from_slice(password.as_bytes());
 
-            let request =
-                sasl_authenticate::encode_request_v0(correlation_id, "kafka-client", &token);
-            stream.write_all(&request).await?;
+            let request_buf = encode_request(
+                &SaslAuthenticateRequest::default()
+                    .with_auth_bytes(Bytes::copy_from_slice(&token)),
+                36, // SaslAuthenticate api_key
+                api_version,
+                correlation_id,
+            )?;
+            stream.write_all(&request_buf).await?;
 
-            let mut size_buf = [0u8; 4];
-            stream.read_exact(&mut size_buf).await?;
-            let response_size = i32::from_be_bytes(size_buf);
-            if response_size <= 0 || response_size > 1024 * 1024 {
-                return Err(Error::ProtocolError(format!(
-                    "invalid response size: {response_size}"
-                )));
-            }
-            let mut response_buf = vec![0u8; response_size as usize];
-            stream.read_exact(&mut response_buf).await?;
-            let resp_corr_id = sasl_authenticate::decode_response_v0(&response_buf)?;
-            if resp_corr_id != correlation_id {
-                return Err(Error::ProtocolError(format!(
-                    "correlation id mismatch: expected {correlation_id}, got {resp_corr_id}"
-                )));
+            let mut response_bytes = read_response(&mut stream).await?;
+            let resp_header_version = SaslAuthenticateResponse::header_version(api_version);
+            decode_response_header(&mut response_bytes, resp_header_version, correlation_id)?;
+            let auth_response =
+                SaslAuthenticateResponse::decode(&mut response_bytes, api_version)?;
+
+            if auth_response.error_code != 0 {
+                let msg = auth_response
+                    .error_message
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| format!("error code: {}", auth_response.error_code));
+                return Err(Error::AuthenticationError(msg));
             }
             tracing::info!(username = %username, "SASL/PLAIN authentication successful");
         }
