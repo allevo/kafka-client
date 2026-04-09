@@ -162,6 +162,10 @@ impl Client {
         topics: Vec<CreatableTopic>,
         timeout_ms: i32,
     ) -> Result<CreateTopicsResponse> {
+        // CreateTopics is routed to the controller.
+        // Since Kafka 2.4 (KIP-590) any broker will forward admin requests to the
+        // controller, but targeting the controller directly is still canonical in
+        // the other clients.
         let controller = self.controller().await?;
         controller.create_topics(topics, timeout_ms).await
     }
