@@ -15,11 +15,12 @@ async fn test_standalone_api_versions() {
     let broker = helpers::plaintext_broker().await;
 
     let config = crate::Config::new(&broker.host, broker.port);
-    let conn = crate::Connection::connect(&config, crate::Security::Plaintext, crate::Auth::None)
+    let conn = crate::Connection::connect(&config, crate::Security::Plaintext)
         .await
         .unwrap();
+    let client = crate::BrokerClient::new(conn, crate::Auth::None).await.unwrap();
 
-    let versions = conn.api_versions();
+    let versions = client.api_versions();
     assert!(!versions.is_empty());
     assert!(versions.iter().any(|v| v.api_key == 18));
 }
@@ -29,11 +30,11 @@ async fn test_standalone_fetch_metadata() {
     let broker = helpers::plaintext_broker().await;
 
     let config = crate::Config::new(&broker.host, broker.port);
-    let conn = crate::Connection::connect(&config, crate::Security::Plaintext, crate::Auth::None)
+    let conn = crate::Connection::connect(&config, crate::Security::Plaintext)
         .await
         .unwrap();
 
-    let client = crate::BrokerClient::new(conn);
+    let client = crate::BrokerClient::new(conn, crate::Auth::None).await.unwrap();
     let response = client.fetch_metadata().await.unwrap();
 
     assert!(!response.brokers.is_empty());

@@ -24,6 +24,9 @@ struct BrokerInfo {
 pub struct Client {
     security: Security,
     auth: Auth,
+    /// Captured from the bootstrap config that succeeded; reused when opening connections
+    /// to brokers discovered via metadata.
+    max_response_size: usize,
     controller_id: BrokerId,
     known_brokers: HashMap<BrokerId, BrokerInfo>,
     connections: HashMap<BrokerId, BrokerClient>,
@@ -52,9 +55,9 @@ impl Client {
     ) -> Result<Self> {
         let mut last_err = None;
         for config in bootstrap {
-            match Connection::connect(config, security.clone(), auth.clone()).await {
+            match Connection::connect(config, security.clone()).await {
                 Ok(conn) => {
-                    let client = BrokerClient::new(conn);
+                    let client = BrokerClient::new(conn, auth.clone()).await?;
                     let metadata = client.fetch_metadata().await?;
 
                     let mut known_brokers = HashMap::new();
@@ -89,6 +92,7 @@ impl Client {
                     return Ok(Client {
                         security,
                         auth,
+                        max_response_size: config.max_response_size,
                         controller_id: metadata.controller_id,
                         known_brokers,
                         connections,
@@ -117,10 +121,10 @@ impl Client {
                 Error::ProtocolError(format!("unknown broker node_id: {}", node_id.0))
             })?;
 
-            let config = Config::new(&info.host, info.port);
-            let conn =
-                Connection::connect(&config, self.security.clone(), self.auth.clone()).await?;
-            let client = BrokerClient::new(conn);
+            let config = Config::new(&info.host, info.port)
+                .with_max_response_size(self.max_response_size);
+            let conn = Connection::connect(&config, self.security.clone()).await?;
+            let client = BrokerClient::new(conn, self.auth.clone()).await?;
             self.connections.insert(node_id, client);
         }
 

@@ -24,6 +24,7 @@ pub struct SharedCluster {
 static PLAINTEXT: LazyLock<OnceCell<SharedBroker>> = LazyLock::new(OnceCell::new);
 static TLS: LazyLock<OnceCell<SharedBroker>> = LazyLock::new(OnceCell::new);
 static SASL: LazyLock<OnceCell<SharedBroker>> = LazyLock::new(OnceCell::new);
+static SASL_REAUTH: LazyLock<OnceCell<SharedBroker>> = LazyLock::new(OnceCell::new);
 static CLUSTER: LazyLock<OnceCell<SharedCluster>> = LazyLock::new(OnceCell::new);
 
 pub async fn plaintext_broker() -> &'static SharedBroker {
@@ -79,6 +80,28 @@ pub async fn sasl_broker() -> &'static SharedBroker {
         }
     })
     .await
+}
+
+pub async fn sasl_reauth_broker() -> &'static SharedBroker {
+    SASL_REAUTH
+        .get_or_init(|| async {
+            // 5-second session lifetime to quickly exercise re-auth
+            let kafka = containers::standalone_sasl_reauth_broker(5000)
+                .start()
+                .await
+                .unwrap();
+            let host = kafka.get_host().await.unwrap().to_string();
+            let port = kafka
+                .get_host_port_ipv4(containers::SASL_PLAINTEXT_PORT)
+                .await
+                .unwrap();
+            SharedBroker {
+                host,
+                port,
+                _container: Box::new(kafka),
+            }
+        })
+        .await
 }
 
 pub async fn plaintext_cluster() -> &'static SharedCluster {
