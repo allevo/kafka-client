@@ -50,7 +50,7 @@ async fn test_standalone_cluster_client() {
     let broker = helpers::plaintext_broker().await;
 
     let bootstrap = [crate::Config::new(&broker.host, broker.port)];
-    let mut client = crate::Client::connect(
+    let client = crate::Client::connect(
         &bootstrap,
         crate::Security::Plaintext,
         crate::Auth::None,
@@ -74,7 +74,7 @@ async fn test_standalone_create_topic() {
     let broker = helpers::plaintext_broker().await;
 
     let bootstrap = [crate::Config::new(&broker.host, broker.port)];
-    let mut client = crate::Client::connect(
+    let client = crate::Client::connect(
         &bootstrap,
         crate::Security::Plaintext,
         crate::Auth::None,

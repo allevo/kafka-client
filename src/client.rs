@@ -52,6 +52,8 @@ type InFlight = Arc<Mutex<HashMap<CorrelationId, oneshot::Sender<Result<Vec<u8>>
 
 #[derive(Clone)]
 pub struct BrokerClient {
+    // Stable per-instance identity assigned at construction.
+    id: u64,
     request_tx: mpsc::Sender<RequestMsg>,
     next_correlation_id: Arc<AtomicI32>,
     api_versions: Arc<[ApiVersion]>,
@@ -90,6 +92,7 @@ impl BrokerClient {
         tokio::spawn(read_task(reader, in_flight, max_response_size, read_shutdown_tx, shutdown.clone()));
 
         let client = BrokerClient {
+            id: fastrand::u64(..),
             request_tx,
             next_correlation_id: Arc::new(AtomicI32::new(correlation_id + 1)),
             api_versions: api_versions.into(),
@@ -224,6 +227,26 @@ impl BrokerClient {
 
     pub fn api_versions(&self) -> &[ApiVersion] {
         &self.api_versions
+    }
+
+    /// Returns `true` if the broker shut down
+    pub(crate) fn is_shutdown(&self) -> bool {
+        // Acquire pairs with read_task's Release store at the bottom of read_task,
+        // matching the ordering send_raw already uses.
+        self.shutdown.load(Ordering::Acquire)
+    }
+
+    /// Stable per-instance identity assigned at construction.
+    pub(crate) fn id(&self) -> u64 {
+        self.id
+    }
+
+    /// Test-only: flip the shutdown flag without actually killing the socket.
+    /// Lets unit tests exercise the corpse-eviction path without orchestrating
+    /// a real broker disconnect.
+    #[cfg(test)]
+    pub(crate) fn force_shutdown_for_test(&self) {
+        self.shutdown.store(true, Ordering::Release);
     }
 
     /// Run a SASL/PLAIN handshake + authenticate against the broker. Used both for initial

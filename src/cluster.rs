@@ -1,8 +1,10 @@
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
+use arc_swap::ArcSwap;
 use kafka_protocol::messages::create_topics_request::CreatableTopic;
 use kafka_protocol::messages::{BrokerId, CreateTopicsResponse, MetadataResponse};
+use tokio::sync::OnceCell;
 
 use crate::client::BrokerClient;
 use crate::config::Config;
@@ -21,16 +23,34 @@ struct BrokerInfo {
     port: u16,
 }
 
-pub struct Client {
+/// Immutable view of the cluster, published atomically via `ArcSwap`.
+///
+/// Readers do `inner.metadata.load()` and walk this snapshot without locking;
+/// writers (only `refresh_metadata`) build a fresh snapshot and `store()` it.
+struct MetadataSnapshot {
+    controller_id: BrokerId,
+    brokers: HashMap<BrokerId, BrokerInfo>,
+}
+
+/// Shared state behind every `Client` clone. Held inside an `Arc` so the
+/// public `Client` handle is cheap to clone and pass between tokio tasks.
+struct ClientInner {
     security: Security,
     auth: Auth,
     /// Captured from the bootstrap config that succeeded; reused when opening connections
     /// to brokers discovered via metadata.
     max_response_size: usize,
-    controller_id: BrokerId,
-    known_brokers: HashMap<BrokerId, BrokerInfo>,
-    connections: HashMap<BrokerId, BrokerClient>,
     address_resolver: Option<AddressResolver>,
+
+    metadata: ArcSwap<MetadataSnapshot>,
+
+    /// Per-broker connection slots.
+    connections: Mutex<HashMap<BrokerId, Arc<OnceCell<BrokerClient>>>>,
+}
+
+#[derive(Clone)]
+pub struct Client {
+    inner: Arc<ClientInner>,
 }
 
 impl Client {
@@ -54,13 +74,14 @@ impl Client {
         address_resolver: Option<AddressResolver>,
     ) -> Result<Self> {
         let mut last_err = None;
+
         for config in bootstrap {
             match Connection::connect(config, security.clone()).await {
                 Ok(conn) => {
                     let client = BrokerClient::new(conn, auth.clone()).await?;
                     let metadata = client.fetch_metadata().await?;
 
-                    let mut known_brokers = HashMap::new();
+                    let mut brokers = HashMap::with_capacity(metadata.brokers.len());
                     let mut bootstrap_node_id = None;
 
                     for broker in &metadata.brokers {
@@ -76,31 +97,40 @@ impl Client {
                         {
                             bootstrap_node_id = Some(broker.node_id);
                         }
-                        known_brokers.insert(broker.node_id, BrokerInfo { host, port });
+                        brokers.insert(broker.node_id, BrokerInfo { host, port });
                     }
 
-                    let mut connections = HashMap::new();
+                    // Seed the connection map with the bootstrap broker only when we
+                    // can match its wire address to a metadata entry — otherwise we'd
+                    // be inserting a connection-to-host-X under broker-id-Y, which
+                    // gives later callers the wrong broker. If unmatched, we drop the
+                    // bootstrap connection and let the next `broker(id)` call dial fresh.
+                    let mut connections: HashMap<BrokerId, Arc<OnceCell<BrokerClient>>> =
+                        HashMap::new();
                     if let Some(node_id) = bootstrap_node_id {
-                        connections.insert(node_id, client);
-                    } else if let Some(&id) = known_brokers
-                        .keys()
-                        .find(|&&id| !connections.contains_key(&id))
-                    {
-                        connections.insert(id, client);
+                        connections.insert(node_id, Arc::new(OnceCell::new_with(Some(client))));
                     }
 
-                    return Ok(Client {
+                    let inner = ClientInner {
                         security,
                         auth,
                         max_response_size: config.max_response_size,
-                        controller_id: metadata.controller_id,
-                        known_brokers,
-                        connections,
                         address_resolver,
+                        metadata: ArcSwap::new(Arc::new(MetadataSnapshot {
+                            controller_id: metadata.controller_id,
+                            brokers,
+                        })),
+                        connections: Mutex::new(connections),
+                    };
+
+                    return Ok(Client {
+                        inner: Arc::new(inner),
                     });
                 }
                 Err(e) => {
                     tracing::warn!(host = %config.host, port = config.port, error = %e, "bootstrap broker unreachable");
+
+                    // We use the first "good" broker, ignoring the before errors.
                     last_err = Some(e);
                 }
             }
@@ -111,54 +141,161 @@ impl Client {
         }))
     }
 
-    pub async fn controller(&mut self) -> Result<&BrokerClient> {
-        self.broker(self.controller_id).await
+    pub async fn controller(&self) -> Result<BrokerClient> {
+        let id = self.inner.metadata.load().controller_id;
+        self.broker(id).await
     }
 
-    pub async fn broker(&mut self, node_id: BrokerId) -> Result<&BrokerClient> {
-        if !self.connections.contains_key(&node_id) {
-            let info = self.known_brokers.get(&node_id).ok_or_else(|| {
+    pub async fn broker(&self, node_id: BrokerId) -> Result<BrokerClient> {
+        // Fast path: get the connection if:
+        // - it is still alive
+        // - the metadata contains it
+        {
+            let metadata = self.inner.metadata.load();
+            let mut map = self.inner.connections.lock().unwrap();
+            if let Some(cell) = map.get(&node_id) {
+                if let Some(client) = cell.get() {
+                    if !client.is_shutdown() && metadata.brokers.contains_key(&node_id) {
+                        return Ok(client.clone());
+                    }
+                    // Dead or no longer in metadata — evict so the cold path
+                    // either redials (shutdown) or rejects (unknown id).
+                    map.remove(&node_id);
+                }
+            }
+        }
+
+        // Cold path: No live brokerclient is found
+        // - Get metadata
+        // - Replace (mainly insert) a new OnceCell to the connections map
+        // - Init connection   
+
+        let (host, port) = {
+            let snap = self.inner.metadata.load();
+            let info = snap.brokers.get(&node_id).ok_or_else(|| {
                 Error::ProtocolError(format!("unknown broker node_id: {}", node_id.0))
             })?;
+            (info.host.clone(), info.port)
+        };
 
-            let config = Config::new(&info.host, info.port)
-                .with_max_response_size(self.max_response_size);
-            let conn = Connection::connect(&config, self.security.clone()).await?;
-            let client = BrokerClient::new(conn, self.auth.clone()).await?;
-            self.connections.insert(node_id, client);
+        let cell = {
+            let mut map = self.inner.connections.lock().unwrap();
+
+            // During a lock we return or insert the arc by node_id
+            map.entry(node_id)
+                .or_insert_with(|| Arc::new(OnceCell::new()))
+                .clone()
+        };
+
+        let security = self.inner.security.clone();
+        let auth = self.inner.auth.clone();
+        let max_response_size = self.inner.max_response_size;
+        let client = cell
+            .get_or_try_init(|| async move {
+                let config = Config::new(&host, port).with_max_response_size(max_response_size);
+                let conn = Connection::connect(&config, security).await?;
+                BrokerClient::new(conn, auth).await
+            })
+            .await?;
+        Ok(client.clone())
+    }
+
+    pub async fn any_broker(&self) -> Result<BrokerClient> {
+        // Fast path: find the first connection that is still alive
+        {
+            let metadata = self.inner.metadata.load();
+            let map = self.inner.connections.lock().unwrap();
+            for (broker_id, cell) in &*map {
+                if let Some(client) = cell.get() {
+                    if !client.is_shutdown() && metadata.brokers.contains_key(broker_id) {
+                        return Ok(client.clone());
+                    }
+                }
+            }
         }
 
-        Ok(&self.connections[&node_id])
+        // Otherwise route through `broker(id)` for the first known broker —
+        // that path handles dialing and slot insertion uniformly.
+        let id = {
+            let snap = self.inner.metadata.load();
+            *snap
+                .brokers
+                .keys()
+                .next()
+                .ok_or_else(|| Error::ProtocolError("no known brokers".into()))?
+        };
+        self.broker(id).await
     }
 
-    pub fn any_broker(&self) -> Result<&BrokerClient> {
-        self.connections
-            .values()
-            .next()
-            .ok_or_else(|| Error::ProtocolError("no connected brokers".into()))
-    }
-
-    pub async fn refresh_metadata(&mut self) -> Result<MetadataResponse> {
-        let broker = self.any_broker()?;
+    pub async fn refresh_metadata(&self) -> Result<MetadataResponse> {
+        let broker = self.any_broker().await?;
         let metadata = broker.fetch_metadata().await?;
 
-        self.controller_id = metadata.controller_id;
-        self.known_brokers.clear();
-        for broker in &metadata.brokers {
+        let mut brokers = HashMap::with_capacity(metadata.brokers.len());
+        for b in &metadata.brokers {
             let (host, port) = resolve_address(
-                &self.address_resolver,
-                broker.node_id,
-                broker.host.as_str(),
-                broker.port,
+                &self.inner.address_resolver,
+                b.node_id,
+                b.host.as_str(),
+                b.port,
             );
-            self.known_brokers.insert(broker.node_id, BrokerInfo { host, port });
+            brokers.insert(b.node_id, BrokerInfo { host, port });
         }
+
+        self.apply_metadata_snapshot(MetadataSnapshot {
+            controller_id: metadata.controller_id,
+            brokers,
+        });
 
         Ok(metadata)
     }
 
+    /// Clean up connections & replace metadata
+    fn apply_metadata_snapshot(&self, snap: MetadataSnapshot) {
+        {
+            let mut conns = self.inner.connections.lock().unwrap();
+            conns.retain(|id, _| snap.brokers.contains_key(id));
+        }
+        // Atomic publish: concurrent readers either see the old or the new
+        // snapshot, never a torn view.
+        self.inner.metadata.store(Arc::new(snap));
+    }
+
+    /// Test-only: number of slots currently held in the connection cache.
+    /// Used to assert that bogus `broker(id)` calls don't leak empty slots.
+    #[cfg(test)]
+    pub(crate) fn connection_slot_count(&self) -> usize {
+        self.inner.connections.lock().unwrap().len()
+    }
+
+    /// Test-only: replace the published metadata snapshot with a synthetic
+    /// one, going through the same prune-then-publish helper that
+    /// `refresh_metadata` uses. Lets tests simulate a broker disappearing
+    /// from the cluster without orchestrating a real container shutdown.
+    #[cfg(test)]
+    pub(crate) fn replace_metadata_for_test(
+        &self,
+        controller_id: BrokerId,
+        brokers: Vec<(BrokerId, String, u16)>,
+    ) {
+        let mut map = HashMap::with_capacity(brokers.len());
+        for (id, host, port) in brokers {
+            map.insert(id, BrokerInfo { host, port });
+        }
+        self.apply_metadata_snapshot(MetadataSnapshot {
+            controller_id,
+            brokers: map,
+        });
+    }
+
+    /// Test-only: does the connection cache currently have a slot for this id?
+    #[cfg(test)]
+    pub(crate) fn has_connection_slot(&self, node_id: BrokerId) -> bool {
+        self.inner.connections.lock().unwrap().contains_key(&node_id)
+    }
+
     pub async fn create_topics(
-        &mut self,
+        &self,
         topics: Vec<CreatableTopic>,
         timeout_ms: i32,
     ) -> Result<CreateTopicsResponse> {
@@ -171,7 +308,7 @@ impl Client {
     }
 
     pub fn controller_id(&self) -> BrokerId {
-        self.controller_id
+        self.inner.metadata.load().controller_id
     }
 }
 

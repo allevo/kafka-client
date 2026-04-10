@@ -107,7 +107,11 @@ pub async fn sasl_reauth_broker() -> &'static SharedBroker {
 pub async fn plaintext_cluster() -> &'static SharedCluster {
     CLUSTER
         .get_or_init(|| async {
-            let prefix = "shared";
+            // Randomize the prefix per test process so concurrent / interrupted
+            // runs don't collide on Docker container names (the containers are
+            // not always reaped between runs).
+            let prefix = format!("shared-{:08x}", fastrand::u32(..));
+            let prefix = prefix.as_str();
             let network = &format!("{prefix}-network");
             let quorum_voters = containers::quorum_voters_plaintext(prefix);
 
