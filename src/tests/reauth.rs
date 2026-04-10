@@ -25,6 +25,7 @@ async fn test_session_lifetime_ms_parsed() {
 /// metadata requests over a period longer than `connections.max.reauth.ms` (5 s).
 /// Without re-auth the broker would kill the connection.
 #[tokio::test]
+#[tracing_test::traced_test]
 async fn test_connection_survives_reauth() {
     let broker = helpers::sasl_reauth_broker().await;
 
@@ -55,4 +56,20 @@ async fn test_connection_survives_reauth() {
     }
 
     assert!(successes >= 10, "expected at least 10 successes, got {successes}");
+
+    // Verify the background reauth task actually fired and succeeded.
+    // With a 5-second session lifetime over 12 seconds, at least 2 re-auths should occur.
+    logs_assert(|lines: &[&str]| {
+        let reauth_count = lines
+            .iter()
+            .filter(|line| line.contains("re-authentication successful"))
+            .count();
+        if reauth_count >= 2 {
+            Ok(())
+        } else {
+            Err(format!(
+                "expected at least 2 re-authentications, but found {reauth_count}"
+            ))
+        }
+    });
 }
