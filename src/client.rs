@@ -220,9 +220,9 @@ impl BrokerClient {
     }
 
     pub async fn fetch_metadata(&self) -> Result<MetadataResponse> {
-        // topics: None requests metadata for all topics
+        let version = negotiate_version(&self.api_versions, ApiKey::Metadata, 1)?;
         let request = MetadataRequest::default().with_topics(None);
-        self.send(ApiKey::Metadata, 1, request).await
+        self.send(ApiKey::Metadata, version, request).await
     }
 
     pub async fn create_topics(
@@ -230,10 +230,11 @@ impl BrokerClient {
         topics: Vec<CreatableTopic>,
         timeout_ms: i32,
     ) -> Result<CreateTopicsResponse> {
+        let version = negotiate_version(&self.api_versions, ApiKey::CreateTopics, 2)?;
         let request = CreateTopicsRequest::default()
             .with_topics(topics)
             .with_timeout_ms(timeout_ms);
-        self.send(ApiKey::CreateTopics, 2, request).await
+        self.send(ApiKey::CreateTopics, version, request).await
     }
 
     pub fn api_versions(&self) -> &[ApiVersion] {
@@ -335,6 +336,27 @@ impl BrokerClient {
 
         Ok(duration)
     }
+}
+
+/// Find `api_key` in api_versions and returns the `min(desired, broker_max)`
+fn negotiate_version(api_versions: &[ApiVersion], api_key: ApiKey, desired: i16) -> Result<i16> {
+    let range = api_versions
+        .iter()
+        .find(|v| v.api_key == api_key as i16)
+        .ok_or_else(|| {
+            Error::ProtocolError(format!(
+                "broker does not support API {:?} (key {})",
+                api_key, api_key as i16,
+            ))
+        })?;
+    let version = desired.min(range.max_version);
+    if version < range.min_version {
+        return Err(Error::ProtocolError(format!(
+            "API {:?}: broker supports versions {}..={}, but client needs version {}",
+            api_key, range.min_version, range.max_version, desired,
+        )));
+    }
+    Ok(version)
 }
 
 /// Build the SASL/PLAIN auth token: \0<username>\0<password>
