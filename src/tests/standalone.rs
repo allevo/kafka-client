@@ -1,5 +1,5 @@
-use kafka_protocol::messages::create_topics_request::CreatableTopic;
 use kafka_protocol::messages::TopicName;
+use kafka_protocol::messages::create_topics_request::CreatableTopic;
 use kafka_protocol::protocol::StrBytes;
 
 use super::helpers;
@@ -18,7 +18,9 @@ async fn test_standalone_api_versions() {
     let conn = crate::Connection::connect(&config, crate::Security::Plaintext)
         .await
         .unwrap();
-    let client = crate::BrokerClient::new(conn, crate::Auth::None).await.unwrap();
+    let client = crate::BrokerClient::new(conn, crate::Auth::None)
+        .await
+        .unwrap();
 
     let versions = client.api_versions();
     assert!(!versions.is_empty());
@@ -34,7 +36,9 @@ async fn test_standalone_fetch_metadata() {
         .await
         .unwrap();
 
-    let client = crate::BrokerClient::new(conn, crate::Auth::None).await.unwrap();
+    let client = crate::BrokerClient::new(conn, crate::Auth::None)
+        .await
+        .unwrap();
     let response = client.fetch_metadata().await.unwrap();
 
     assert!(!response.brokers.is_empty());
@@ -50,13 +54,9 @@ async fn test_standalone_cluster_client() {
     let broker = helpers::plaintext_broker().await;
 
     let bootstrap = [crate::Config::new(&broker.host, broker.port)];
-    let client = crate::Client::connect(
-        &bootstrap,
-        crate::Security::Plaintext,
-        crate::Auth::None,
-    )
-    .await
-    .unwrap();
+    let client = crate::Client::connect(&bootstrap, crate::Security::Plaintext, crate::Auth::None)
+        .await
+        .unwrap();
 
     assert!(*client.controller_id() >= 0);
 
@@ -74,13 +74,9 @@ async fn test_standalone_create_topic() {
     let broker = helpers::plaintext_broker().await;
 
     let bootstrap = [crate::Config::new(&broker.host, broker.port)];
-    let client = crate::Client::connect(
-        &bootstrap,
-        crate::Security::Plaintext,
-        crate::Auth::None,
-    )
-    .await
-    .unwrap();
+    let client = crate::Client::connect(&bootstrap, crate::Security::Plaintext, crate::Auth::None)
+        .await
+        .unwrap();
 
     let topic = CreatableTopic::default()
         .with_name(TopicName::from(StrBytes::from_static_str("test-topic-1")))
@@ -98,10 +94,14 @@ async fn test_standalone_create_topic() {
     );
 
     let metadata = client.refresh_metadata().await.unwrap();
-    let found = metadata.topics.iter().find(|t| {
-        t.name.as_ref().map(|n| n.as_str()) == Some("test-topic-1")
-    });
-    assert!(found.is_some(), "topic 'test-topic-1' not found in metadata");
+    let found = metadata
+        .topics
+        .iter()
+        .find(|t| t.name.as_ref().map(|n| n.as_str()) == Some("test-topic-1"));
+    assert!(
+        found.is_some(),
+        "topic 'test-topic-1' not found in metadata"
+    );
     let Some(found) = found else { panic!() };
     assert_eq!(found.partitions.len(), 3);
     for partition in &found.partitions {

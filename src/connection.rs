@@ -22,7 +22,6 @@ pub struct Connection {
 
 const CLIENT_ID: &str = "kafka-client";
 
-
 impl Connection {
     pub async fn connect(config: &Config, security: Security) -> Result<Self> {
         let addr = format!("{}:{}", config.host, config.port);
@@ -39,10 +38,7 @@ impl Connection {
                 tracing::debug!(host = %config.host, "starting TLS handshake");
                 let server_name = rustls::pki_types::ServerName::try_from(config.host.as_str())
                     .map_err(|_| {
-                        Error::ProtocolError(format!(
-                            "invalid TLS server name: {}",
-                            config.host
-                        ))
+                        Error::ProtocolError(format!("invalid TLS server name: {}", config.host))
                     })?
                     .to_owned();
                 let connector = TlsConnector::from(tls_config);
@@ -59,7 +55,10 @@ impl Connection {
         })
     }
 
-    pub async fn fetch_api_versions(&mut self, correlation_id: &mut i32) -> Result<Vec<ApiVersion>> {
+    pub async fn fetch_api_versions(
+        &mut self,
+        correlation_id: &mut i32,
+    ) -> Result<Vec<ApiVersion>> {
         // ApiVersions request (v0)
         let api_version: i16 = 0;
         *correlation_id += 1;
@@ -84,12 +83,16 @@ impl Connection {
         }
 
         let api_versions = versions_response.api_keys;
-        tracing::debug!(api_count = api_versions.len(), "received ApiVersions response");
+        tracing::debug!(
+            api_count = api_versions.len(),
+            "received ApiVersions response"
+        );
 
         Ok(api_versions)
     }
 }
 
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum Stream {
     Plain(TcpStream),
     Tls(tokio_rustls::client::TlsStream<TcpStream>),
@@ -135,7 +138,6 @@ impl AsyncWrite for Stream {
     }
 }
 
-
 /// Encode a Kafka request with its header and 4-byte size prefix.
 fn encode_request<R: Encodable + HeaderVersion>(
     request: &R,
@@ -154,7 +156,9 @@ fn encode_request<R: Encodable + HeaderVersion>(
 
     let mut buf = BytesMut::with_capacity(4 + size);
     let Ok(size) = i32::try_from(size) else {
-        return Err(Error::ProtocolError(format!("Request too large for a i32 sized request: {size}")));
+        return Err(Error::ProtocolError(format!(
+            "Request too large for a i32 sized request: {size}"
+        )));
     };
     buf.put_i32(size);
     header.encode(&mut buf, header_version)?;

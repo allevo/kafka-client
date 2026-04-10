@@ -85,7 +85,12 @@ async fn test_cluster_client() {
     assert_eq!(node_ids, vec![BrokerId(1), BrokerId(2), BrokerId(3)]);
 
     // Each broker should eventually see all 3 peers
-    for id in [client.controller_id(), BrokerId(1), BrokerId(2), BrokerId(3)] {
+    for id in [
+        client.controller_id(),
+        BrokerId(1),
+        BrokerId(2),
+        BrokerId(3),
+    ] {
         let broker = client.broker(id).await.unwrap();
         let mut m = broker.fetch_metadata().await.unwrap();
         for _ in 0..10 {
@@ -95,7 +100,12 @@ async fn test_cluster_client() {
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
             m = broker.fetch_metadata().await.unwrap();
         }
-        assert_eq!(m.brokers.len(), 3, "broker {} sees wrong broker count", id.0);
+        assert_eq!(
+            m.brokers.len(),
+            3,
+            "broker {} sees wrong broker count",
+            id.0
+        );
     }
 }
 

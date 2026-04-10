@@ -55,7 +55,10 @@ async fn test_connection_survives_reauth() {
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
 
-    assert!(successes >= 10, "expected at least 10 successes, got {successes}");
+    assert!(
+        successes >= 10,
+        "expected at least 10 successes, got {successes}"
+    );
 
     // Verify the background reauth task actually fired and succeeded.
     // With a 5-second session lifetime over 12 seconds, at least 2 re-auths should occur.

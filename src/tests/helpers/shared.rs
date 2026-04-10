@@ -2,9 +2,9 @@ use std::collections::HashMap;
 use std::sync::LazyLock;
 
 use kafka_protocol::messages::BrokerId;
-use testcontainers::runners::AsyncRunner;
 use testcontainers::ImageExt;
-use testcontainers_modules::kafka::apache::{Kafka, KAFKA_PORT};
+use testcontainers::runners::AsyncRunner;
+use testcontainers_modules::kafka::apache::{KAFKA_PORT, Kafka};
 use tokio::sync::OnceCell;
 
 use super::containers;
@@ -44,10 +44,7 @@ pub async fn plaintext_broker() -> &'static SharedBroker {
 
 pub async fn tls_broker() -> &'static SharedBroker {
     TLS.get_or_init(|| async {
-        let kafka = containers::standalone_tls_broker()
-            .start()
-            .await
-            .unwrap();
+        let kafka = containers::standalone_tls_broker().start().await.unwrap();
         let host = kafka.get_host().await.unwrap().to_string();
         let port = kafka
             .get_host_port_ipv4(containers::SSL_PORT)

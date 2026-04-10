@@ -20,7 +20,8 @@ pub fn fixtures_path() -> PathBuf {
 }
 
 fn read_fixture(name: &str) -> Vec<u8> {
-    std::fs::read(fixtures_path().join(name)).unwrap_or_else(|_| panic!("Failed to read fixture: {name}"))
+    std::fs::read(fixtures_path().join(name))
+        .unwrap_or_else(|_| panic!("Failed to read fixture: {name}"))
 }
 
 fn with_ssl_files(req: ContainerRequest<GenericImage>) -> ContainerRequest<GenericImage> {
@@ -33,10 +34,7 @@ fn with_ssl_files(req: ContainerRequest<GenericImage>) -> ContainerRequest<Gener
     ];
     let mut req = req;
     for name in files {
-        req = req.with_copy_to(
-            format!("/etc/kafka/secrets/{name}"),
-            read_fixture(name),
-        );
+        req = req.with_copy_to(format!("/etc/kafka/secrets/{name}"), read_fixture(name));
     }
     req
 }
@@ -132,10 +130,7 @@ pub fn standalone_sasl_plaintext_broker() -> ContainerRequest<GenericImage> {
     GenericImage::new(IMAGE, TAG)
         .with_wait_for(WaitFor::message_on_stdout("Kafka Server started"))
         .with_exposed_port(SASL_PLAINTEXT_PORT.tcp())
-        .with_copy_to(
-            "/etc/kafka/secrets/jaas.conf",
-            jaas_config.to_vec(),
-        )
+        .with_copy_to("/etc/kafka/secrets/jaas.conf", jaas_config.to_vec())
         .with_env_var("KAFKA_NODE_ID", "1")
         .with_env_var("KAFKA_PROCESS_ROLES", "broker,controller")
         .with_env_var(
@@ -182,10 +177,7 @@ pub fn standalone_sasl_reauth_broker(reauth_ms: u32) -> ContainerRequest<Generic
     GenericImage::new(IMAGE, TAG)
         .with_wait_for(WaitFor::message_on_stdout("Kafka Server started"))
         .with_exposed_port(SASL_PLAINTEXT_PORT.tcp())
-        .with_copy_to(
-            "/etc/kafka/secrets/jaas.conf",
-            jaas_config.to_vec(),
-        )
+        .with_copy_to("/etc/kafka/secrets/jaas.conf", jaas_config.to_vec())
         .with_env_var("KAFKA_NODE_ID", "1")
         .with_env_var("KAFKA_PROCESS_ROLES", "broker,controller")
         .with_env_var(
@@ -212,10 +204,7 @@ pub fn standalone_sasl_reauth_broker(reauth_ms: u32) -> ContainerRequest<Generic
         .with_env_var("KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR", "1")
         .with_env_var("KAFKA_LOG_DIRS", "/tmp/kraft-combined-logs")
         .with_env_var("KAFKA_SASL_ENABLED_MECHANISMS", "PLAIN")
-        .with_env_var(
-            "KAFKA_CONNECTIONS_MAX_REAUTH_MS",
-            reauth_ms.to_string(),
-        )
+        .with_env_var("KAFKA_CONNECTIONS_MAX_REAUTH_MS", reauth_ms.to_string())
         .with_env_var(
             "KAFKA_OPTS",
             "-Djava.security.auth.login.config=/etc/kafka/secrets/jaas.conf",

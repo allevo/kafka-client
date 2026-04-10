@@ -91,9 +91,7 @@ impl Client {
                             broker.host.as_str(),
                             broker.port,
                         )?;
-                        if bootstrap_node_id.is_none()
-                            && host == config.host
-                            && port == config.port
+                        if bootstrap_node_id.is_none() && host == config.host && port == config.port
                         {
                             bootstrap_node_id = Some(broker.node_id);
                         }
@@ -136,9 +134,8 @@ impl Client {
             }
         }
 
-        Err(last_err.unwrap_or_else(|| {
-            Error::ProtocolError("no bootstrap brokers provided".into())
-        }))
+        Err(last_err
+            .unwrap_or_else(|| Error::ProtocolError("no bootstrap brokers provided".into())))
     }
 
     pub async fn controller(&self) -> Result<BrokerClient> {
@@ -153,22 +150,22 @@ impl Client {
         {
             let metadata = self.inner.metadata.load();
             let mut map = self.inner.connections.lock().unwrap();
-            if let Some(cell) = map.get(&node_id) {
-                if let Some(client) = cell.get() {
-                    if !client.is_shutdown() && metadata.brokers.contains_key(&node_id) {
-                        return Ok(client.clone());
-                    }
-                    // Dead or no longer in metadata — evict so the cold path
-                    // either redials (shutdown) or rejects (unknown id).
-                    map.remove(&node_id);
+            if let Some(cell) = map.get(&node_id)
+                && let Some(client) = cell.get()
+            {
+                if !client.is_shutdown() && metadata.brokers.contains_key(&node_id) {
+                    return Ok(client.clone());
                 }
+                // Dead or no longer in metadata — evict so the cold path
+                // either redials (shutdown) or rejects (unknown id).
+                map.remove(&node_id);
             }
         }
 
         // Cold path: No live brokerclient is found
         // - Get metadata
         // - Replace (mainly insert) a new OnceCell to the connections map
-        // - Init connection   
+        // - Init connection
 
         let (host, port) = {
             let snap = self.inner.metadata.load();
@@ -206,10 +203,11 @@ impl Client {
             let metadata = self.inner.metadata.load();
             let map = self.inner.connections.lock().unwrap();
             for (broker_id, cell) in &*map {
-                if let Some(client) = cell.get() {
-                    if !client.is_shutdown() && metadata.brokers.contains_key(broker_id) {
-                        return Ok(client.clone());
-                    }
+                if let Some(client) = cell.get()
+                    && !client.is_shutdown()
+                    && metadata.brokers.contains_key(broker_id)
+                {
+                    return Ok(client.clone());
                 }
             }
         }
@@ -291,7 +289,11 @@ impl Client {
     /// Test-only: does the connection cache currently have a slot for this id?
     #[cfg(test)]
     pub(crate) fn has_connection_slot(&self, node_id: BrokerId) -> bool {
-        self.inner.connections.lock().unwrap().contains_key(&node_id)
+        self.inner
+            .connections
+            .lock()
+            .unwrap()
+            .contains_key(&node_id)
     }
 
     pub async fn create_topics(
@@ -322,9 +324,11 @@ fn resolve_address(
         Some(f) => f(node_id, host, port),
         None => {
             let Ok(port) = u16::try_from(port) else {
-                return Err(Error::ProtocolError(format!("Cannot convert {port} port number to u16")))
+                return Err(Error::ProtocolError(format!(
+                    "Cannot convert {port} port number to u16"
+                )));
             };
             Ok((host.to_owned(), port))
-        },
+        }
     }
 }

@@ -11,7 +11,9 @@ use tokio::sync::{mpsc, oneshot};
 use kafka_protocol::messages::api_versions_response::ApiVersion;
 use kafka_protocol::messages::create_topics_request::CreatableTopic;
 use kafka_protocol::messages::{
-    ApiKey, CreateTopicsRequest, CreateTopicsResponse, MetadataRequest, MetadataResponse, RequestHeader, ResponseHeader, SaslAuthenticateRequest, SaslAuthenticateResponse, SaslHandshakeRequest, SaslHandshakeResponse
+    ApiKey, CreateTopicsRequest, CreateTopicsResponse, MetadataRequest, MetadataResponse,
+    RequestHeader, ResponseHeader, SaslAuthenticateRequest, SaslAuthenticateResponse,
+    SaslHandshakeRequest, SaslHandshakeResponse,
 };
 use kafka_protocol::protocol::{Decodable, Encodable, HeaderVersion, StrBytes};
 
@@ -24,9 +26,11 @@ use crate::secret::SecretString;
 #[derive(Clone)]
 pub enum Auth {
     None,
-    Plain { username: String, password: SecretString },
+    Plain {
+        username: String,
+        password: SecretString,
+    },
 }
-
 
 #[derive(Debug, Hash, PartialEq, Eq, Clone, Copy)]
 pub struct CorrelationId(i32);
@@ -44,9 +48,7 @@ impl TryFrom<&[u8]> for CorrelationId {
         if value.len() < 4 {
             return Err("Buffer not enough length");
         }
-        let buff: [u8; 4] = [
-            value[0], value[1], value[2], value[3]
-        ];
+        let buff: [u8; 4] = [value[0], value[1], value[2], value[3]];
         Ok(Self(i32::from_be_bytes(buff)))
     }
 }
@@ -95,7 +97,6 @@ impl BrokerClient {
         let (request_tx, request_rx) = mpsc::channel::<RequestMsg>(32);
         let in_flight: InFlight = Arc::new(Mutex::new(HashMap::new()));
 
-
         // Connect `write_task` to `read_task` to communicate when the shutdown happens
         let (read_shutdown_tx, read_shutdown_rx) = oneshot::channel::<()>();
         // Lets `reauth_task` signal `read_task` to tear down the connection on failure.
@@ -103,8 +104,21 @@ impl BrokerClient {
         let shutdown = Arc::new(AtomicBool::new(false));
 
         tracing::info!("spawning write/read tasks");
-        tokio::spawn(write_task(writer, request_rx, in_flight.clone(), read_shutdown_rx));
-        tokio::spawn(read_task(reader, in_flight, max_response_size, read_shutdown_tx, shutdown.clone(), reauth_shutdown_rx, pool.clone()));
+        tokio::spawn(write_task(
+            writer,
+            request_rx,
+            in_flight.clone(),
+            read_shutdown_rx,
+        ));
+        tokio::spawn(read_task(
+            reader,
+            in_flight,
+            max_response_size,
+            read_shutdown_tx,
+            shutdown.clone(),
+            reauth_shutdown_rx,
+            pool.clone(),
+        ));
 
         let client = BrokerClient {
             id: fastrand::u64(..),
@@ -125,7 +139,12 @@ impl BrokerClient {
         // sleeps and re-authenticates periodically.
         if let Some(lifetime) = session_lifetime {
             tracing::info!(?lifetime, "spawning re-auth task");
-            tokio::spawn(reauth_task(client.clone(), auth, lifetime, reauth_shutdown_tx));
+            tokio::spawn(reauth_task(
+                client.clone(),
+                auth,
+                lifetime,
+                reauth_shutdown_tx,
+            ));
         } else {
             tracing::info!("Broker doesn't require re-auth task");
             // Store reauth_shutdown_tx, so the `read_task` can poll it even if it will never be resolved
@@ -161,16 +180,17 @@ impl BrokerClient {
         }
 
         // correlation_id is a client side parameter. There is not guarantees of the values
-        // No lock is needed. 
-        let correlation_id = CorrelationId(self.next_correlation_id.fetch_add(1, Ordering::Relaxed));
+        // No lock is needed.
+        let correlation_id =
+            CorrelationId(self.next_correlation_id.fetch_add(1, Ordering::Relaxed));
 
         // Below:
-        // - Serialize the request 
+        // - Serialize the request
         //   It is made here to not pay the serialization cost "globally"
         // - Send the request to the background task `write_task`
         // - Wait for the response
         // - Deserialize the respone
-        //   It is made here to not pay the cost "globally" 
+        //   It is made here to not pay the cost "globally"
 
         let header = RequestHeader::default()
             .with_request_api_key(api_key as i16)
@@ -179,8 +199,7 @@ impl BrokerClient {
             .with_client_id(Some(StrBytes::from_static_str(CLIENT_ID)));
 
         let header_version = Req::header_version(api_version);
-        let size = header.compute_size(header_version)?
-            + request.compute_size(api_version)?;
+        let size = header.compute_size(header_version)? + request.compute_size(api_version)?;
         let mut buf = self.pool.get(4 + size);
         buf.clear(); // pool.get() returns len == size with stale data; reset for encoding
         buf.put_i32(size as i32);
@@ -207,7 +226,10 @@ impl BrokerClient {
         })?;
 
         let result = response_rx.await.map_err(|_| {
-            tracing::error!(?correlation_id, "connection task dropped without responding");
+            tracing::error!(
+                ?correlation_id,
+                "connection task dropped without responding"
+            );
             Error::Io(std::io::Error::new(
                 std::io::ErrorKind::ConnectionAborted,
                 "connection task dropped without responding",
@@ -218,10 +240,10 @@ impl BrokerClient {
             Ok(buf) => {
                 tracing::debug!(?correlation_id, bytes = buf.len(), "received response");
                 buf
-            },
+            }
             Err(e) => {
                 tracing::warn!(?correlation_id, error = %e, "request failed");
-                return Err(e)
+                return Err(e);
             }
         };
 
@@ -229,7 +251,10 @@ impl BrokerClient {
         let resp_header_version = api_key.response_header_version(api_version);
         let _resp_header = ResponseHeader::decode(&mut buf, resp_header_version)?;
 
-        debug_assert_eq!(_resp_header.correlation_id, *correlation_id, "Correlation ids doesn't match. (Req, Res) pair is wrong");
+        debug_assert_eq!(
+            _resp_header.correlation_id, *correlation_id,
+            "Correlation ids doesn't match. (Req, Res) pair is wrong"
+        );
 
         let response = Resp::decode(&mut buf, api_version)?;
         Ok(response)
@@ -287,8 +312,14 @@ impl BrokerClient {
 
         tracing::info!(username = %username, "starting SASL/PLAIN authentication");
 
-        let has_handshake = self.api_versions.iter().any(|v| v.api_key == ApiKey::SaslHandshake as i16);
-        let has_authenticate = self.api_versions.iter().any(|v| v.api_key == ApiKey::SaslAuthenticate as i16);
+        let has_handshake = self
+            .api_versions
+            .iter()
+            .any(|v| v.api_key == ApiKey::SaslHandshake as i16);
+        let has_authenticate = self
+            .api_versions
+            .iter()
+            .any(|v| v.api_key == ApiKey::SaslAuthenticate as i16);
         if !has_handshake || !has_authenticate {
             return Err(Error::AuthenticationError(
                 "broker does not support SASL authentication (missing API key 17 or 36)".into(),
@@ -300,8 +331,7 @@ impl BrokerClient {
             .send(
                 ApiKey::SaslHandshake,
                 1,
-                SaslHandshakeRequest::default()
-                    .with_mechanism(StrBytes::from_static_str("PLAIN")),
+                SaslHandshakeRequest::default().with_mechanism(StrBytes::from_static_str("PLAIN")),
             )
             .await?;
         if handshake_resp.error_code != 0 {
@@ -389,7 +419,12 @@ fn reauth_delay(session_lifetime: Duration) -> Duration {
 /// Background task: periodically re-authenticate the connection to keep it alive past the
 /// broker's `connections.max.reauth.ms` (KIP-368). Exits when the connection dies, when
 /// re-auth fails, or when the broker stops returning a session lifetime.
-async fn reauth_task(client: BrokerClient, auth: Auth, mut session_lifetime: Duration, reauth_shutdown_tx: oneshot::Sender<()>) {
+async fn reauth_task(
+    client: BrokerClient,
+    auth: Auth,
+    mut session_lifetime: Duration,
+    reauth_shutdown_tx: oneshot::Sender<()>,
+) {
     loop {
         let delay = reauth_delay(session_lifetime);
         tracing::debug!(?delay, "re-auth task sleeping");
@@ -510,7 +545,11 @@ async fn read_task(
             break;
         };
         if response_size == 0 || response_size > max_response_size {
-            tracing::error!(response_size, max_response_size, "invalid response size, closing read task");
+            tracing::error!(
+                response_size,
+                max_response_size,
+                "invalid response size, closing read task"
+            );
             break;
         }
 
@@ -521,7 +560,7 @@ async fn read_task(
 
         // pool.get() returns len == response_size via set_len; read_exact overwrites all bytes.
         let mut response_buf = pool.get(response_size);
-        if let Err(e) = reader.read_exact(&mut *response_buf).await {
+        if let Err(e) = reader.read_exact(&mut response_buf).await {
             // Mid-frame disconnect: we already read the size header, so an EOF here
             // means the broker dropped us partway through a response. Still demote
             // the clean-close case to info to avoid noise on user-initiated shutdown.
@@ -540,7 +579,11 @@ async fn read_task(
                 break;
             }
         };
-        tracing::trace!(?correlation_id, bytes = response_buf.len(), "received response from broker");
+        tracing::trace!(
+            ?correlation_id,
+            bytes = response_buf.len(),
+            "received response from broker"
+        );
 
         let tx = {
             let mut map = in_flight.lock().unwrap();
@@ -550,7 +593,10 @@ async fn read_task(
         if let Some(tx) = tx {
             let _ = tx.send(Ok(response_buf));
         } else {
-            tracing::warn!(?correlation_id, "no in-flight request for correlation id. Ignore it");
+            tracing::warn!(
+                ?correlation_id,
+                "no in-flight request for correlation id. Ignore it"
+            );
         }
     }
 
@@ -594,14 +640,20 @@ fn drain_in_flight(in_flight: &InFlight, message: &str) {
         tracing::warn!(count, reason = message, "draining in-flight requests");
     }
     for (_, tx) in map.drain() {
-        if tx.send(Err(Error::Io(std::io::Error::new(
-            std::io::ErrorKind::ConnectionAborted,
-            message.to_string(),
-        )))).is_err() {
+        if tx
+            .send(Err(Error::Io(std::io::Error::new(
+                std::io::ErrorKind::ConnectionAborted,
+                message.to_string(),
+            ))))
+            .is_err()
+        {
             // The oneshot receiver was dropped before we could deliver the abort,
             // so the caller has already given up waiting (e.g. its future was
             // cancelled). Nothing to do, but log it so we notice if it becomes common.
-            tracing::error!(reason = message, "failed to notify in-flight caller during drain: receiver dropped");
+            tracing::error!(
+                reason = message,
+                "failed to notify in-flight caller during drain: receiver dropped"
+            );
         }
     }
 }
