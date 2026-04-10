@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::{Arc, LockResult, Mutex};
 use std::time::Duration;
 
-use bytes::{BufMut, Bytes, BytesMut};
+use bytes::{BufMut, Bytes};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot};
 
@@ -169,7 +169,7 @@ impl BrokerClient {
         let header_version = Req::header_version(api_version);
         let size = header.compute_size(header_version)?
             + request.compute_size(api_version)?;
-        let mut buf = BytesMut::with_capacity(4 + size);
+        let mut buf = Vec::with_capacity(4 + size);
         buf.put_i32(size as i32);
         header.encode(&mut buf, header_version)?;
         request.encode(&mut buf, api_version)?;
