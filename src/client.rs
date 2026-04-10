@@ -297,12 +297,7 @@ impl BrokerClient {
 
         // Negotiate SaslAuthenticate version: min(2, broker_max). v1+ is required to receive
         // session_lifetime_ms (KIP-368), so we cap at 2 to avoid asking for fields we don't parse.
-        let auth_version = self
-            .api_versions
-            .iter()
-            .find(|v| v.api_key == ApiKey::SaslAuthenticate as i16)
-            .map(|v| v.max_version.min(2))
-            .unwrap_or(0);
+        let auth_version = negotiate_version(&self.api_versions, ApiKey::SaslAuthenticate, 2)?;
         tracing::debug!(auth_version, "negotiated SaslAuthenticate version");
 
         let token = build_plain_token(username, password.expose_secret());
@@ -440,6 +435,10 @@ async fn write_task(
         }
         if let Err(e) = writer.flush().await {
             tracing::error!(error = %e, "flush failed, exiting write task");
+            let mut map = in_flight.lock().unwrap();
+            if let Some(tx) = map.remove(&req.correlation_id) {
+                let _ = tx.send(Err(Error::Io(std::io::Error::new(e.kind(), e.to_string()))));
+            }
             break;
         }
     }

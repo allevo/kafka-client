@@ -86,7 +86,7 @@ impl Connection {
         )?;
         self.stream.write_all(&request_buf).await?;
 
-        let mut response_bytes = read_response(&mut self.stream).await?;
+        let mut response_bytes = read_response(&mut self.stream, self.max_response_size).await?;
         let resp_header_version = ApiVersionsResponse::header_version(api_version);
         decode_response_header(&mut response_bytes, resp_header_version, *correlation_id)?;
         let versions_response = ApiVersionsResponse::decode(&mut response_bytes, api_version)?;
@@ -167,19 +167,22 @@ fn encode_request<R: Encodable + HeaderVersion>(
     let size = header.compute_size(header_version)? + request.compute_size(api_version)?;
 
     let mut buf = BytesMut::with_capacity(4 + size);
-    buf.put_i32(size as i32);
+    let Ok(size) = i32::try_from(size) else {
+        return Err(Error::ProtocolError(format!("Request too large for a i32 sized request: {size}")));
+    };
+    buf.put_i32(size);
     header.encode(&mut buf, header_version)?;
     request.encode(&mut buf, api_version)?;
     Ok(buf)
 }
 
 /// Read a framed response from the stream: 4-byte size prefix, then payload.
-async fn read_response(stream: &mut Stream) -> Result<Bytes> {
+async fn read_response(stream: &mut Stream, max_response_size: usize) -> Result<Bytes> {
     let mut size_buf = [0u8; 4];
     stream.read_exact(&mut size_buf).await?;
     let response_size = i32::from_be_bytes(size_buf);
 
-    if response_size <= 0 || response_size > 1024 * 1024 {
+    if response_size <= 0 || response_size as usize > max_response_size {
         return Err(Error::ProtocolError(format!(
             "invalid response size: {response_size}"
         )));
