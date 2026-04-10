@@ -1,5 +1,4 @@
 use std::pin::Pin;
-use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use bytes::{BufMut, Bytes, BytesMut};
@@ -13,21 +12,8 @@ use kafka_protocol::messages::{
 };
 use kafka_protocol::protocol::{Decodable, Encodable, HeaderVersion, StrBytes};
 
-use crate::config::Config;
+use crate::config::{Config, Security};
 use crate::error::{Error, Result};
-use crate::secret::SecretString;
-
-#[derive(Clone)]
-pub enum Security {
-    Plaintext,
-    Ssl(Arc<rustls::ClientConfig>),
-}
-
-#[derive(Clone)]
-pub enum Auth {
-    None,
-    Plain { username: String, password: SecretString },
-}
 
 pub struct Connection {
     pub(crate) stream: Stream,

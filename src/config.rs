@@ -1,5 +1,13 @@
+use std::sync::Arc;
+
 /// Default maximum response size: 100 MiB.
 pub const DEFAULT_MAX_RESPONSE_SIZE: usize = 100 * 1024 * 1024;
+
+#[derive(Clone)]
+pub enum Security {
+    Plaintext,
+    Ssl(Arc<rustls::ClientConfig>),
+}
 
 pub struct Config {
     pub host: String,

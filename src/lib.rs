@@ -1,14 +1,14 @@
+pub mod broker;
 pub mod client;
-pub mod cluster;
 pub mod config;
 pub mod connection;
 pub mod error;
 pub mod secret;
 
-pub use client::BrokerClient;
-pub use cluster::Client;
-pub use config::Config;
-pub use connection::{Auth, Connection, Security};
+pub use broker::{Auth, BrokerClient};
+pub use client::Client;
+pub use config::{Config, Security};
+pub use connection::Connection;
 pub use error::Error;
 pub use secret::SecretString;
 
