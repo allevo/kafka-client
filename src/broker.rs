@@ -201,7 +201,9 @@ impl BrokerClient {
         let header_version = Req::header_version(api_version);
         let size = header.compute_size(header_version)? + request.compute_size(api_version)?;
         let mut buf = self.pool.get(4 + size);
-        buf.clear(); // pool.get() returns len == size with stale data; reset for encoding
+        debug_assert_eq!(buf.len(), 4 + size);
+        // We want to start from position 0, discarding dirty (and old) values
+        buf.clear();
         buf.put_i32(size as i32);
         header.encode(&mut *buf, header_version)?;
         request.encode(&mut *buf, api_version)?;
@@ -558,8 +560,9 @@ async fn read_task(
             break;
         }
 
-        // pool.get() returns len == response_size via set_len; read_exact overwrites all bytes.
         let mut response_buf = pool.get(response_size);
+        debug_assert_eq!(response_buf.len(), response_size);
+
         if let Err(e) = reader.read_exact(&mut response_buf).await {
             // Mid-frame disconnect: we already read the size header, so an EOF here
             // means the broker dropped us partway through a response. Still demote
