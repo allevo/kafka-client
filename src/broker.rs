@@ -15,6 +15,8 @@ use kafka_protocol::messages::{
 };
 use kafka_protocol::protocol::{Decodable, Encodable, HeaderVersion, StrBytes};
 
+use zeropool::BufferPool;
+
 use crate::connection::Connection;
 use crate::error::{Error, Result};
 use crate::secret::SecretString;
@@ -51,11 +53,11 @@ impl TryFrom<&[u8]> for CorrelationId {
 
 struct RequestMsg {
     correlation_id: CorrelationId,
-    data: Vec<u8>,
-    response_tx: oneshot::Sender<Result<Vec<u8>>>,
+    data: zeropool::PooledBuffer,
+    response_tx: oneshot::Sender<Result<zeropool::PooledBuffer>>,
 }
 
-type InFlight = Arc<Mutex<HashMap<CorrelationId, oneshot::Sender<Result<Vec<u8>>>>>>;
+type InFlight = Arc<Mutex<HashMap<CorrelationId, oneshot::Sender<Result<zeropool::PooledBuffer>>>>>;
 
 #[derive(Clone)]
 pub struct BrokerClient {
@@ -63,6 +65,7 @@ pub struct BrokerClient {
     id: u64,
     request_tx: mpsc::Sender<RequestMsg>,
     next_correlation_id: Arc<AtomicI32>,
+    pool: BufferPool,
     api_versions: Arc<[ApiVersion]>,
     // Flipped by `read_task` the moment it decides to exit, so `send_raw` can
     // reject new requests immediately instead of letting them sit in the mpsc
@@ -83,6 +86,7 @@ impl BrokerClient {
 
         let api_versions = connection.fetch_api_versions(&mut correlation_id).await?;
 
+        let pool = BufferPool::new();
         let max_response_size = connection.max_response_size;
 
         // Split the stream and build the shared in-flight map up front, so the read and
@@ -100,11 +104,12 @@ impl BrokerClient {
 
         tracing::info!("spawning write/read tasks");
         tokio::spawn(write_task(writer, request_rx, in_flight.clone(), read_shutdown_rx));
-        tokio::spawn(read_task(reader, in_flight, max_response_size, read_shutdown_tx, shutdown.clone(), reauth_shutdown_rx));
+        tokio::spawn(read_task(reader, in_flight, max_response_size, read_shutdown_tx, shutdown.clone(), reauth_shutdown_rx, pool.clone()));
 
         let client = BrokerClient {
             id: fastrand::u64(..),
             request_tx,
+            pool,
             next_correlation_id: Arc::new(AtomicI32::new(correlation_id + 1)),
             api_versions: api_versions.into(),
             shutdown,
@@ -176,11 +181,12 @@ impl BrokerClient {
         let header_version = Req::header_version(api_version);
         let size = header.compute_size(header_version)?
             + request.compute_size(api_version)?;
-        let mut buf = Vec::with_capacity(4 + size);
+        let mut buf = self.pool.get(4 + size);
+        buf.clear(); // pool.get() returns len == size with stale data; reset for encoding
         buf.put_i32(size as i32);
-        header.encode(&mut buf, header_version)?;
-        request.encode(&mut buf, api_version)?;
-        let data = buf.to_vec();
+        header.encode(&mut *buf, header_version)?;
+        request.encode(&mut *buf, api_version)?;
+        let data = buf;
 
         tracing::debug!(?correlation_id, bytes = data.len(), "sending request");
 
@@ -219,7 +225,7 @@ impl BrokerClient {
             }
         };
 
-        let mut buf = Bytes::from(response_data);
+        let mut buf = Bytes::from_owner(response_data);
         let resp_header_version = api_key.response_header_version(api_version);
         let _resp_header = ResponseHeader::decode(&mut buf, resp_header_version)?;
 
@@ -469,6 +475,7 @@ async fn read_task(
     read_shutdown: oneshot::Sender<()>,
     shutdown: Arc<AtomicBool>,
     reauth_shutdown_rx: oneshot::Receiver<()>,
+    pool: BufferPool,
 ) {
     let mut size_buf = [0u8; 4];
     let mut reauth_shutdown = std::pin::pin!(reauth_shutdown_rx);
@@ -512,8 +519,9 @@ async fn read_task(
             break;
         }
 
-        let mut response_buf = vec![0u8; response_size];
-        if let Err(e) = reader.read_exact(&mut response_buf).await {
+        // pool.get() returns len == response_size via set_len; read_exact overwrites all bytes.
+        let mut response_buf = pool.get(response_size);
+        if let Err(e) = reader.read_exact(&mut *response_buf).await {
             // Mid-frame disconnect: we already read the size header, so an EOF here
             // means the broker dropped us partway through a response. Still demote
             // the clean-close case to info to avoid noise on user-initiated shutdown.
