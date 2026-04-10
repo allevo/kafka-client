@@ -125,19 +125,22 @@ impl BrokerClient {
         Ok(client)
     }
 
-    pub async fn send_raw(
+    /// Send a typed Kafka request and decode the response.
+    pub async fn send<Req, Resp>(
         &self,
-        encode: impl FnOnce(CorrelationId) -> Vec<u8>,
-    ) -> Result<Vec<u8>> {
-        // Fast-path rejection once `read_task` has decided to exit. There is an
-        // unavoidable TOCTOU window: a caller can pass this check, then `read_task`
-        // can flip the flag and drain `in_flight`, then the caller's request_tx.send
-        // below still succeeds (`write_task` hasn't dropped request_rx yet). That
-        // request will sit in the channel, `write_task` will wake via the biased
-        // shutdown branch without processing it, and the dropped oneshot will
-        // resolve the caller's response_rx into a `ConnectionAborted` error further
-        // down. So this flag is a best-effort fast path; the dropped-oneshot path
-        // remains the safety net for the racing minority.
+        api_key: ApiKey,
+        api_version: i16,
+        request: Req,
+    ) -> Result<Resp>
+    where
+        Req: Encodable + HeaderVersion + Send + 'static,
+        Resp: Decodable + HeaderVersion,
+    {
+        // Fast-path rejection once `read_task` has decided to exit.
+        // NB: a small unavoidable TOCTOU window is still possibile.
+        //     But it is temporary.
+        // So this flag is a best-effort fast path; In the TOCTOU window
+        // there's a safety net.
         if self.shutdown.load(Ordering::Acquire) {
             return Err(Error::Io(std::io::Error::new(
                 std::io::ErrorKind::ConnectionAborted,
@@ -145,20 +148,44 @@ impl BrokerClient {
             )));
         }
 
+        // correlation_id is a client side parameter. There is not guarantees of the values
+        // No lock is needed. 
         let correlation_id = CorrelationId(self.next_correlation_id.fetch_add(1, Ordering::Relaxed));
-        let data = encode(correlation_id);
+
+        // Below:
+        // - Serialize the request 
+        //   It is made here to not pay the serialization cost "globally"
+        // - Send the request to the background task `write_task`
+        // - Wait for the response
+        // - Deserialize the respone
+        //   It is made here to not pay the cost "globally" 
+
+        let header = RequestHeader::default()
+            .with_request_api_key(api_key as i16)
+            .with_request_api_version(api_version)
+            .with_correlation_id(*correlation_id)
+            .with_client_id(Some(StrBytes::from_static_str(CLIENT_ID)));
+
+        let header_version = Req::header_version(api_version);
+        let size = header.compute_size(header_version)?
+            + request.compute_size(api_version)?;
+        let mut buf = BytesMut::with_capacity(4 + size);
+        buf.put_i32(size as i32);
+        header.encode(&mut buf, header_version)?;
+        request.encode(&mut buf, api_version)?;
+        let data = buf.to_vec();
 
         tracing::debug!(?correlation_id, bytes = data.len(), "sending request");
 
         let (response_tx, response_rx) = oneshot::channel();
 
-        let request = RequestMsg {
+        let request_msg = RequestMsg {
             correlation_id,
             data,
             response_tx,
         };
 
-        self.request_tx.send(request).await.map_err(|_| {
+        self.request_tx.send(request_msg).await.map_err(|_| {
             tracing::error!("connection task has shut down");
             Error::Io(std::io::Error::new(
                 std::io::ErrorKind::ConnectionAborted,
@@ -174,47 +201,23 @@ impl BrokerClient {
             ))
         })?;
 
-        match &result {
-            Ok(buf) => tracing::debug!(?correlation_id, bytes = buf.len(), "received response"),
-            Err(e) => tracing::warn!(?correlation_id, error = %e, "request failed"),
-        }
-
-        result
-    }
-
-    /// Send a typed Kafka request and decode the response.
-    pub async fn send<Req, Resp>(
-        &self,
-        api_key: ApiKey,
-        api_version: i16,
-        request: Req,
-    ) -> Result<Resp>
-    where
-        Req: Encodable + HeaderVersion + Send + 'static,
-        Resp: Decodable + HeaderVersion,
-    {
-        let response_data = self
-            .send_raw(|correlation_id| {
-                let header = RequestHeader::default()
-                    .with_request_api_key(api_key as i16)
-                    .with_request_api_version(api_version)
-                    .with_correlation_id(*correlation_id)
-                    .with_client_id(Some(StrBytes::from_static_str(CLIENT_ID)));
-
-                let header_version = Req::header_version(api_version);
-                let size = header.compute_size(header_version).unwrap()
-                    + request.compute_size(api_version).unwrap();
-                let mut buf = BytesMut::with_capacity(4 + size);
-                buf.put_i32(size as i32);
-                header.encode(&mut buf, header_version).unwrap();
-                request.encode(&mut buf, api_version).unwrap();
-                buf.to_vec()
-            })
-            .await?;
+        let response_data = match result {
+            Ok(buf) => {
+                tracing::debug!(?correlation_id, bytes = buf.len(), "received response");
+                buf
+            },
+            Err(e) => {
+                tracing::warn!(?correlation_id, error = %e, "request failed");
+                return Err(e)
+            }
+        };
 
         let mut buf = Bytes::from(response_data);
         let resp_header_version = api_key.response_header_version(api_version);
         let _resp_header = ResponseHeader::decode(&mut buf, resp_header_version)?;
+
+        debug_assert_eq!(_resp_header.correlation_id, *correlation_id, "Correlation ids doesn't match. (Req, Res) pair is wrong");
+
         let response = Resp::decode(&mut buf, api_version)?;
         Ok(response)
     }
