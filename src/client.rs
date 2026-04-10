@@ -35,9 +35,9 @@ impl TryFrom<&[u8]> for CorrelationId {
         if value.len() < 4 {
             return Err("Buffer not enough length");
         }
-        let buff: [u8; 4] = value[0..4]
-            .try_into()
-            .expect("The length is checked above");
+        let buff: [u8; 4] = [
+            value[0], value[1], value[2], value[3]
+        ];
         Ok(Self(i32::from_be_bytes(buff)))
     }
 }
@@ -61,6 +61,8 @@ pub struct BrokerClient {
     // reject new requests immediately instead of letting them sit in the mpsc
     // channel until `write_task` notices the shutdown signal and drops `request_rx`.
     shutdown: Arc<AtomicBool>,
+    // Holds the reauth-shutdown sender alive when no reauth task is running
+    _reauth_shutdown_tx: Arc<Mutex<Option<oneshot::Sender<()>>>>,
 }
 
 const CLIENT_ID: &str = "kafka-client";
@@ -85,11 +87,13 @@ impl BrokerClient {
 
         // Connect `write_task` to `read_task` to communicate when the shutdown happens
         let (read_shutdown_tx, read_shutdown_rx) = oneshot::channel::<()>();
+        // Lets `reauth_task` signal `read_task` to tear down the connection on failure.
+        let (reauth_shutdown_tx, reauth_shutdown_rx) = oneshot::channel::<()>();
         let shutdown = Arc::new(AtomicBool::new(false));
 
         tracing::info!("spawning write/read tasks");
         tokio::spawn(write_task(writer, request_rx, in_flight.clone(), read_shutdown_rx));
-        tokio::spawn(read_task(reader, in_flight, max_response_size, read_shutdown_tx, shutdown.clone()));
+        tokio::spawn(read_task(reader, in_flight, max_response_size, read_shutdown_tx, shutdown.clone(), reauth_shutdown_rx));
 
         let client = BrokerClient {
             id: fastrand::u64(..),
@@ -97,6 +101,9 @@ impl BrokerClient {
             next_correlation_id: Arc::new(AtomicI32::new(correlation_id + 1)),
             api_versions: api_versions.into(),
             shutdown,
+            // Keep the sender alive so the oneshot in read_task stays pending.
+            // Moved into reauth_task below if reauth is needed.
+            _reauth_shutdown_tx: Arc::new(Mutex::new(None)),
         };
 
         let session_lifetime = client.authenticate(&auth).await?;
@@ -106,9 +113,13 @@ impl BrokerClient {
         // sleeps and re-authenticates periodically.
         if let Some(lifetime) = session_lifetime {
             tracing::info!(?lifetime, "spawning re-auth task");
-            tokio::spawn(reauth_task(client.clone(), auth, lifetime));
+            tokio::spawn(reauth_task(client.clone(), auth, lifetime, reauth_shutdown_tx));
         } else {
             tracing::info!("Broker doesn't require re-auth task");
+            // Store reauth_shutdown_tx, so the `read_task` can poll it even if it will never be resolved
+            // This make the code easier at a little cost of a `tokio::sync::oneshot::Receiver::poll`
+            let mut guard = client._reauth_shutdown_tx.lock().unwrap();
+            *guard = Some(reauth_shutdown_tx);
         }
 
         Ok(client)
@@ -316,11 +327,13 @@ impl BrokerClient {
             "SASL/PLAIN authentication successful"
         );
 
-        Ok(if session_lifetime_ms > 0 {
+        let duration = if session_lifetime_ms > 0 {
             Some(Duration::from_millis(session_lifetime_ms as u64))
         } else {
             None
-        })
+        };
+
+        Ok(duration)
     }
 }
 
@@ -343,7 +356,7 @@ fn reauth_delay(session_lifetime: Duration) -> Duration {
 /// Background task: periodically re-authenticate the connection to keep it alive past the
 /// broker's `connections.max.reauth.ms` (KIP-368). Exits when the connection dies, when
 /// re-auth fails, or when the broker stops returning a session lifetime.
-async fn reauth_task(client: BrokerClient, auth: Auth, mut session_lifetime: Duration) {
+async fn reauth_task(client: BrokerClient, auth: Auth, mut session_lifetime: Duration, reauth_shutdown_tx: oneshot::Sender<()>) {
     loop {
         let delay = reauth_delay(session_lifetime);
         tracing::debug!(?delay, "re-auth task sleeping");
@@ -357,10 +370,11 @@ async fn reauth_task(client: BrokerClient, auth: Auth, mut session_lifetime: Dur
             }
             Ok(None) => {
                 tracing::info!("re-auth returned no session lifetime, stopping reauth task");
-                return;
+                return; // drops sender → read_task sees Err(Closed), ignores it
             }
             Err(e) => {
-                tracing::error!(error = %e, "re-authentication failed, stopping reauth task");
+                tracing::error!(error = %e, "re-authentication failed, shutting down connection");
+                let _ = reauth_shutdown_tx.send(()); // signal read_task to tear down
                 return;
             }
         }
@@ -423,10 +437,24 @@ async fn read_task(
     max_response_size: usize,
     read_shutdown: oneshot::Sender<()>,
     shutdown: Arc<AtomicBool>,
+    reauth_shutdown_rx: oneshot::Receiver<()>,
 ) {
     let mut size_buf = [0u8; 4];
+    let mut reauth_shutdown = std::pin::pin!(reauth_shutdown_rx);
     loop {
-        if let Err(e) = reader.read_exact(&mut size_buf).await {
+        let read_result = tokio::select! {
+            biased;
+            // The sender is either held alive inside `BrokerClient` (no reauth
+            // needed — stays pending forever) or owned by `reauth_task` (only
+            // sends on failure). Either way this branch only fires on failure.
+            _ = &mut reauth_shutdown => {
+                tracing::error!("re-authentication failed, shutting down connection");
+                break;
+            }
+            result = reader.read_exact(&mut size_buf) => result,
+        };
+
+        if let Err(e) = read_result {
             // UnexpectedEof on a frame boundary means the peer closed cleanly between
             // responses — typically the user dropping the client. Anything else is a
             // genuine surprise (mid-frame disconnect, reset, etc.) and worth a warning.
@@ -443,14 +471,14 @@ async fn read_task(
             tracing::error!(response_size, "invalid response size, closing read task");
             break;
         };
-        if response_size <= 0 || response_size > max_response_size {
+        if response_size == 0 || response_size > max_response_size {
             tracing::error!(response_size, max_response_size, "invalid response size, closing read task");
             break;
         }
 
         if response_size < 4 {
-            tracing::warn!(response_size, "response too short, skipping");
-            continue;
+            tracing::error!(response_size, "response too short.");
+            break;
         }
 
         let mut response_buf = vec![0u8; response_size];
@@ -466,7 +494,13 @@ async fn read_task(
             break;
         }
 
-        let correlation_id = CorrelationId::try_from(&response_buf[0..4]).unwrap();
+        let correlation_id = match CorrelationId::try_from(response_buf.as_slice()) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::error!(error = %e, "Cannot get correlation_id");
+                break;
+            }
+        };
         tracing::trace!(?correlation_id, bytes = response_buf.len(), "received response from broker");
 
         let tx = {

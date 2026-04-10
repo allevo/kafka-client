@@ -16,7 +16,7 @@ use crate::error::{Error, Result};
 /// Receives `(node_id, advertised_host, advertised_port)` and returns
 /// `(actual_host, actual_port)`. Useful when brokers sit behind NAT,
 /// Docker port mapping, or a proxy.
-type AddressResolver = Arc<dyn Fn(BrokerId, &str, i32) -> (String, u16) + Send + Sync>;
+type AddressResolver = Arc<dyn Fn(BrokerId, &str, i32) -> Result<(String, u16)> + Send + Sync>;
 
 struct BrokerInfo {
     host: String,
@@ -62,7 +62,7 @@ impl Client {
         bootstrap: &[Config],
         security: Security,
         auth: Auth,
-        resolver: impl Fn(BrokerId, &str, i32) -> (String, u16) + Send + Sync + 'static,
+        resolver: impl Fn(BrokerId, &str, i32) -> Result<(String, u16)> + Send + Sync + 'static,
     ) -> Result<Self> {
         Self::connect_inner(bootstrap, security, auth, Some(Arc::new(resolver))).await
     }
@@ -90,7 +90,7 @@ impl Client {
                             broker.node_id,
                             broker.host.as_str(),
                             broker.port,
-                        );
+                        )?;
                         if bootstrap_node_id.is_none()
                             && host == config.host
                             && port == config.port
@@ -238,7 +238,7 @@ impl Client {
                 b.node_id,
                 b.host.as_str(),
                 b.port,
-            );
+            )?;
             brokers.insert(b.node_id, BrokerInfo { host, port });
         }
 
@@ -317,9 +317,14 @@ fn resolve_address(
     node_id: BrokerId,
     host: &str,
     port: i32,
-) -> (String, u16) {
+) -> Result<(String, u16)> {
     match resolver {
         Some(f) => f(node_id, host, port),
-        None => (host.to_owned(), port as u16),
+        None => {
+            let Ok(port) = u16::try_from(port) else {
+                return Err(Error::ProtocolError(format!("Cannot convert {port} port number to u16")))
+            };
+            Ok((host.to_owned(), port))
+        },
     }
 }

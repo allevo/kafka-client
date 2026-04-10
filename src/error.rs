@@ -6,6 +6,7 @@ pub enum Error {
     ProtocolError(String),
     AuthenticationError(String),
     ApiError { error_code: i16 },
+    ReauthenticationFailed(String),
 }
 
 impl fmt::Display for Error {
@@ -15,6 +16,7 @@ impl fmt::Display for Error {
             Error::ProtocolError(msg) => write!(f, "protocol error: {msg}"),
             Error::AuthenticationError(msg) => write!(f, "authentication error: {msg}"),
             Error::ApiError { error_code } => write!(f, "broker error code: {error_code}"),
+            Error::ReauthenticationFailed(msg) => write!(f, "re-authentication failed: {msg}"),
         }
     }
 }

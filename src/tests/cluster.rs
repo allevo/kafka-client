@@ -19,7 +19,7 @@ async fn connected_3node_client() -> (crate::Client, HashMap<BrokerId, (String, 
         &bootstrap,
         crate::Security::Plaintext,
         crate::Auth::None,
-        move |node_id, _host, _port| resolver_map[&node_id].clone(),
+        move |node_id, _host, _port| Ok(resolver_map[&node_id].clone()),
     )
     .await
     .unwrap();
@@ -57,7 +57,7 @@ async fn test_cluster_client() {
         &bootstrap,
         crate::Security::Plaintext,
         crate::Auth::None,
-        move |node_id, _host, _port| addr_map[&node_id].clone(),
+        move |node_id, _host, _port| Ok(addr_map[&node_id].clone()),
     )
     .await
     .unwrap();
@@ -117,7 +117,7 @@ async fn test_cluster_client_concurrent_access() {
         &bootstrap,
         crate::Security::Plaintext,
         crate::Auth::None,
-        move |node_id, _host, _port| addr_map[&node_id].clone(),
+        move |node_id, _host, _port| Ok(addr_map[&node_id].clone()),
     )
     .await
     .unwrap();
