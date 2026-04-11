@@ -637,10 +637,14 @@ async fn read_task(
         if let Some(tx) = tx {
             let _ = tx.send(Ok(response_buf));
         } else {
-            tracing::warn!(
+            // The queue is out of sync with the broker's response stream.
+            // Every subsequent response would also mismatch, so the
+            // connection is irrecoverable — tear it down.
+            tracing::error!(
                 ?correlation_id,
-                "no in-flight request for correlation id. Ignore it"
+                "in-flight queue desynchronized, closing connection"
             );
+            break;
         }
     }
 
