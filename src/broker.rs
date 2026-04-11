@@ -467,8 +467,7 @@ async fn write_task(
     let mut request_batch: Vec<RequestMsg> = Vec::with_capacity(RECV_MANY_BATCH_COUNT);
     let mut data_batch = Vec::with_capacity(RECV_MANY_BATCH_COUNT);
 
-    'outer:
-    loop {
+    'outer: loop {
         request_batch.clear();
         data_batch.clear();
 
@@ -504,7 +503,8 @@ async fn write_task(
                 {
                     let mut map = in_flight.lock().unwrap();
                     if let Some(tx) = map.remove(&correlation_id) {
-                        let _ = tx.send(Err(Error::Io(std::io::Error::new(e.kind(), e.to_string()))));                                                                                                                                                                                                                                  
+                        let _ =
+                            tx.send(Err(Error::Io(std::io::Error::new(e.kind(), e.to_string()))));
                     }
                 }
 
