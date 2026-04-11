@@ -451,47 +451,69 @@ async fn reauth_task(
     }
 }
 
+const RECV_MANY_BATCH_COUNT: usize = 32;
+
 /// Write task: pulls `RequestMsg`s from the channel, registers them in `in_flight`, and
-/// writes them to the broker. Exits on a write/flush error, when the request
-/// channel is closed (BrokerClient dropped), or when the read task signals shutdown.
+/// writes them to the broker. Uses `recv_many` to request_batch queued requests and flush
+/// once per request_batch, reducing syscalls under concurrent load. Exits on a write/flush
+/// error, when the request channel is closed (BrokerClient dropped), or when the
+/// read task signals shutdown.
 async fn write_task(
     mut writer: tokio::io::WriteHalf<crate::connection::Stream>,
     mut request_rx: mpsc::Receiver<RequestMsg>,
     in_flight: InFlight,
     mut read_shutdown: oneshot::Receiver<()>,
 ) {
+    let mut request_batch: Vec<RequestMsg> = Vec::with_capacity(RECV_MANY_BATCH_COUNT);
+    let mut data_batch = Vec::with_capacity(RECV_MANY_BATCH_COUNT);
+
+    'outer:
     loop {
-        let req = tokio::select! {
+        request_batch.clear();
+        data_batch.clear();
+
+        let count = tokio::select! {
             biased;
             _ = &mut read_shutdown => {
                 tracing::warn!("read task signaled shutdown, exiting write task");
                 break;
             }
-            req = request_rx.recv() => req,
+            // recv_many is cancel-safe: messages already moved into `request_batch`
+            // survive cancellation and would be processed on the next iteration.
+            count = request_rx.recv_many(&mut request_batch, RECV_MANY_BATCH_COUNT) => count,
         };
-        let Some(req) = req else {
+        if count == 0 {
             tracing::debug!("request channel closed, exiting write task");
             break;
-        };
-        tracing::trace!(correlation_id = ?req.correlation_id, bytes = req.data.len(), "writing request to broker");
+        }
+
+        tracing::trace!(count, "writing request request_batch to broker");
+
         {
             let mut map = in_flight.lock().unwrap();
-            map.insert(req.correlation_id, req.response_tx);
-        }
-        if let Err(e) = writer.write_all(&req.data).await {
-            tracing::error!(correlation_id = ?req.correlation_id, error = %e, "write failed");
-            let mut map = in_flight.lock().unwrap();
-            if let Some(tx) = map.remove(&req.correlation_id) {
-                let _ = tx.send(Err(Error::Io(std::io::Error::new(e.kind(), e.to_string()))));
+            for req in request_batch.drain(0..count) {
+                map.insert(req.correlation_id, req.response_tx);
+                data_batch.push((req.correlation_id, req.data));
             }
-            break;
         }
+
+        for (correlation_id, data) in data_batch.drain(0..count) {
+            if let Err(e) = writer.write_all(&data).await {
+                tracing::error!(correlation_id = ?correlation_id, error = %e, "write failed");
+
+                {
+                    let mut map = in_flight.lock().unwrap();
+                    if let Some(tx) = map.remove(&correlation_id) {
+                        let _ = tx.send(Err(Error::Io(std::io::Error::new(e.kind(), e.to_string()))));                                                                                                                                                                                                                                  
+                    }
+                }
+
+                break 'outer;
+            }
+        }
+
         if let Err(e) = writer.flush().await {
             tracing::error!(error = %e, "flush failed, exiting write task");
-            let mut map = in_flight.lock().unwrap();
-            if let Some(tx) = map.remove(&req.correlation_id) {
-                let _ = tx.send(Err(Error::Io(std::io::Error::new(e.kind(), e.to_string()))));
-            }
             break;
         }
     }
