@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::ops::Deref;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::{Arc, LockResult, Mutex};
@@ -59,7 +59,8 @@ struct RequestMsg {
     response_tx: oneshot::Sender<Result<zeropool::PooledBuffer>>,
 }
 
-type InFlight = Arc<Mutex<HashMap<CorrelationId, oneshot::Sender<Result<zeropool::PooledBuffer>>>>>;
+type InFlight =
+    Arc<Mutex<VecDeque<(CorrelationId, oneshot::Sender<Result<zeropool::PooledBuffer>>)>>>;
 
 #[derive(Clone)]
 pub struct BrokerClient {
@@ -95,7 +96,14 @@ impl BrokerClient {
         // write tasks are siblings spawned.
         let (reader, writer) = tokio::io::split(connection.stream);
         let (request_tx, request_rx) = mpsc::channel::<RequestMsg>(32);
-        let in_flight: InFlight = Arc::new(Mutex::new(HashMap::new()));
+
+        // Invariant: kafka guarantees in-order responses on a single connection.
+        // Therefore:
+        // - `write_task` push back requests
+        // - `read_task` pop front
+        // It is easier and faster than HashMap
+        // See: https://kafka.apache.org/42/design/protocol/#network
+        let in_flight: InFlight = Arc::new(Mutex::new(VecDeque::new()));
 
         // Connect `write_task` to `read_task` to communicate when the shutdown happens
         let (read_shutdown_tx, read_shutdown_rx) = oneshot::channel::<()>();
@@ -489,9 +497,9 @@ async fn write_task(
         tracing::trace!(count, "writing request request_batch to broker");
 
         {
-            let mut map = in_flight.lock().unwrap();
+            let mut q = in_flight.lock().unwrap();
             for req in request_batch.drain(0..count) {
-                map.insert(req.correlation_id, req.response_tx);
+                q.push_back((req.correlation_id, req.response_tx));
                 data_batch.push((req.correlation_id, req.data));
             }
         }
@@ -501,8 +509,9 @@ async fn write_task(
                 tracing::error!(correlation_id = ?correlation_id, error = %e, "write failed");
 
                 {
-                    let mut map = in_flight.lock().unwrap();
-                    if let Some(tx) = map.remove(&correlation_id) {
+                    let mut q = in_flight.lock().unwrap();
+                    // The failed entry is always the last one we pushed.
+                    if let Some((_, tx)) = q.pop_back() {
                         let _ =
                             tx.send(Err(Error::Io(std::io::Error::new(e.kind(), e.to_string()))));
                     }
@@ -611,8 +620,18 @@ async fn read_task(
         );
 
         let tx = {
-            let mut map = in_flight.lock().unwrap();
-            map.remove(&correlation_id)
+            let mut q = in_flight.lock().unwrap();
+            match q.front() {
+                Some((id, _)) if *id == correlation_id => q.pop_front().map(|(_, tx)| tx),
+                Some((id, _)) => {
+                    debug_assert_eq!(*id, correlation_id, "Kafka in-order responses guarantee is broken");
+                    None
+                },
+                None => {
+                    debug_assert!(false, "Unexpected response. No request is performed");
+                    None
+                },
+            }
         };
 
         if let Some(tx) = tx {
@@ -655,16 +674,16 @@ fn is_connection_closed(e: &std::io::Error) -> bool {
 }
 
 fn drain_in_flight(in_flight: &InFlight, message: &str) {
-    let mut map = match in_flight.lock() {
+    let mut q = match in_flight.lock() {
         LockResult::Ok(guard) => guard,
         LockResult::Err(err) => err.into_inner(),
     };
 
-    let count = map.len();
+    let count = q.len();
     if count > 0 {
         tracing::warn!(count, reason = message, "draining in-flight requests");
     }
-    for (_, tx) in map.drain() {
+    for (_, tx) in q.drain(..) {
         if tx
             .send(Err(Error::Io(std::io::Error::new(
                 std::io::ErrorKind::ConnectionAborted,
