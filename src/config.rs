@@ -21,6 +21,10 @@ pub struct Config {
     /// case `connect` inherits OS defaults. A peer that accepts TCP but never sends
     /// TLS bytes can hang the caller indefinitely.
     pub connection_setup_timeout: Option<Duration>,
+    /// Idle connection time. `None` disables the check.
+    /// Recommended: slightly below the broker's own idle close (default 10 min).
+    /// Re-auth flow reset the timer.
+    pub connections_max_idle: Option<Duration>,
 }
 
 impl Config {
@@ -30,6 +34,7 @@ impl Config {
             port,
             max_response_size: DEFAULT_MAX_RESPONSE_SIZE,
             connection_setup_timeout: None,
+            connections_max_idle: None,
         }
     }
 
@@ -40,6 +45,11 @@ impl Config {
 
     pub fn with_connection_setup_timeout(mut self, timeout: Duration) -> Self {
         self.connection_setup_timeout = Some(timeout);
+        self
+    }
+
+    pub fn with_connections_max_idle(mut self, d: Duration) -> Self {
+        self.connections_max_idle = Some(d);
         self
     }
 }

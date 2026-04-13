@@ -1,6 +1,7 @@
 use std::io::{self, ErrorKind};
 use std::pin::Pin;
 use std::task::{Context, Poll};
+use std::time::Duration;
 
 use bytes::{BufMut, Bytes, BytesMut};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
@@ -21,6 +22,7 @@ use crate::error::{Error, Result};
 pub struct Connection {
     pub(crate) stream: Stream,
     pub(crate) max_response_size: usize,
+    pub(crate) connections_max_idle: Option<Duration>,
 }
 
 const CLIENT_ID: &str = "kafka-client";
@@ -80,6 +82,7 @@ impl Connection {
         Ok(Connection {
             stream,
             max_response_size: config.max_response_size,
+            connections_max_idle: config.connections_max_idle,
         })
     }
 

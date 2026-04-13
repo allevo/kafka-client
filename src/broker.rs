@@ -97,6 +97,8 @@ impl BrokerClient {
         let pool = BufferPool::new();
         let max_response_size = connection.max_response_size;
 
+        let connections_max_idle = jitter_connection_max_idle(connection.connections_max_idle);
+
         // Split the stream and build the shared in-flight map up front, so the read and
         // write tasks are siblings spawned.
         let (reader, writer) = tokio::io::split(connection.stream);
@@ -134,6 +136,7 @@ impl BrokerClient {
             reauth_shutdown_rx,
             close.clone(),
             pool.clone(),
+            connections_max_idle,
         ));
 
         let client = BrokerClient {
@@ -571,9 +574,12 @@ async fn read_task(
     reauth_shutdown_rx: oneshot::Receiver<()>,
     close: Arc<Notify>,
     pool: BufferPool,
+    connections_max_idle: Option<Duration>,
 ) {
     let mut size_buf = [0u8; 4];
     let mut reauth_shutdown = std::pin::pin!(reauth_shutdown_rx);
+    let mut last_activity = tokio::time::Instant::now();
+
     loop {
         let read_result = tokio::select! {
             biased;
@@ -589,6 +595,28 @@ async fn read_task(
             // drains in_flight, which also tears down `write_task`.
             _ = close.notified() => {
                 tracing::info!("client requested shutdown");
+                break;
+            }
+            // Idle-close arm. When the feature is disabled we park on
+            // `pending()` forever, which `select!` just ignores.
+            _ = async {
+                match connections_max_idle {
+                    Some(connections_max_idle) => tokio::time::sleep_until(last_activity + connections_max_idle).await,
+                    None => std::future::pending::<()>().await,
+                }
+            } => {
+                // If any request is still pending, we reset the counter,
+                // so we can wait the response.
+                // NB: SASL re-auth exchange counts
+                if !in_flight.lock().unwrap().is_empty() {
+                    last_activity = tokio::time::Instant::now();
+                    continue;
+                }
+                tracing::warn!(
+                    idle = ?last_activity.elapsed(),
+                    connections_max_idle = ?connections_max_idle,
+                    "connections.max.idle exceeded, closing broker connection"
+                );
                 break;
             }
             result = reader.read_exact(&mut size_buf) => result,
@@ -639,6 +667,10 @@ async fn read_task(
             }
             break;
         }
+
+        // Bump only after a full frame lands so the rule stays simple:
+        // "a response arrived".
+        last_activity = tokio::time::Instant::now();
 
         let correlation_id = match CorrelationId::try_from(response_buf.as_slice()) {
             Ok(c) => c,
@@ -738,4 +770,18 @@ fn drain_in_flight(in_flight: &InFlight, message: &str) {
             );
         }
     }
+}
+
+/// per-broker jitter: subtract up to 2s only when the
+/// limit is at least 4s, so we never jitter below 2s. Prevents a cluster
+/// of brokers that went idle in lockstep from all disconnecting at the
+/// same instant.
+fn jitter_connection_max_idle(conf: Option<Duration>) -> Option<Duration> {
+    conf.map(|d| {
+        if d >= Duration::from_secs(4) {
+            d - Duration::from_millis(fastrand::u64(0..2000))
+        } else {
+            d
+        }
+    })
 }

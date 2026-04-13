@@ -6,3 +6,4 @@ mod standalone;
 mod standalone_sasl;
 mod standalone_tls;
 mod timeout_connection;
+mod timeout_idle;
