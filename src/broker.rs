@@ -9,11 +9,9 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot};
 
 use kafka_protocol::messages::api_versions_response::ApiVersion;
-use kafka_protocol::messages::create_topics_request::CreatableTopic;
 use kafka_protocol::messages::{
-    ApiKey, CreateTopicsRequest, CreateTopicsResponse, MetadataRequest, MetadataResponse,
-    RequestHeader, ResponseHeader, SaslAuthenticateRequest, SaslAuthenticateResponse,
-    SaslHandshakeRequest, SaslHandshakeResponse,
+    ApiKey, MetadataRequest, MetadataResponse, RequestHeader, ResponseHeader,
+    SaslAuthenticateRequest, SaslAuthenticateResponse, SaslHandshakeRequest, SaslHandshakeResponse,
 };
 use kafka_protocol::protocol::{Decodable, Encodable, HeaderVersion, StrBytes};
 
@@ -276,20 +274,15 @@ impl BrokerClient {
         self.send(ApiKey::Metadata, version, request).await
     }
 
-    pub async fn create_topics(
-        &self,
-        topics: Vec<CreatableTopic>,
-        timeout_ms: i32,
-    ) -> Result<CreateTopicsResponse> {
-        let version = negotiate_version(&self.api_versions, ApiKey::CreateTopics, 2)?;
-        let request = CreateTopicsRequest::default()
-            .with_topics(topics)
-            .with_timeout_ms(timeout_ms);
-        self.send(ApiKey::CreateTopics, version, request).await
-    }
-
     pub fn api_versions(&self) -> &[ApiVersion] {
         &self.api_versions
+    }
+
+    /// Resolve the wire version to use for `api_key`: picks
+    /// `min(desired, broker_max)` after confirming the broker advertises
+    /// the API at all before calling [`BrokerClient::send`].
+    pub fn negotiate_version(&self, api_key: ApiKey, desired: i16) -> Result<i16> {
+        negotiate_version(&self.api_versions, api_key, desired)
     }
 
     /// Returns `true` if the broker shut down

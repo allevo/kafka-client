@@ -1,3 +1,4 @@
+pub mod admin;
 pub mod broker;
 pub mod client;
 pub mod config;
@@ -5,6 +6,7 @@ pub mod connection;
 pub mod error;
 pub mod secret;
 
+pub use admin::AdminClient;
 pub use broker::{Auth, BrokerClient};
 pub use client::Client;
 pub use config::{Config, Security};

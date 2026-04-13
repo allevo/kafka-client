@@ -2,10 +2,10 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use arc_swap::ArcSwap;
-use kafka_protocol::messages::create_topics_request::CreatableTopic;
-use kafka_protocol::messages::{BrokerId, CreateTopicsResponse, MetadataResponse};
+use kafka_protocol::messages::{BrokerId, MetadataResponse};
 use tokio::sync::OnceCell;
 
+use crate::admin::AdminClient;
 use crate::broker::{Auth, BrokerClient};
 use crate::config::{Config, Security};
 use crate::connection::Connection;
@@ -78,8 +78,8 @@ impl Client {
         for config in bootstrap {
             match Connection::connect(config, security.clone()).await {
                 Ok(conn) => {
-                    let client = BrokerClient::new(conn, auth.clone()).await?;
-                    let metadata = client.fetch_metadata().await?;
+                    let broker = BrokerClient::new(conn, auth.clone()).await?;
+                    let metadata = broker.fetch_metadata().await?;
 
                     let mut brokers = HashMap::with_capacity(metadata.brokers.len());
                     let mut bootstrap_node_id = None;
@@ -106,7 +106,7 @@ impl Client {
                     let mut connections: HashMap<BrokerId, Arc<OnceCell<BrokerClient>>> =
                         HashMap::new();
                     if let Some(node_id) = bootstrap_node_id {
-                        connections.insert(node_id, Arc::new(OnceCell::new_with(Some(client))));
+                        connections.insert(node_id, Arc::new(OnceCell::new_with(Some(broker))));
                     }
 
                     let inner = ClientInner {
@@ -151,10 +151,10 @@ impl Client {
             let metadata = self.inner.metadata.load();
             let mut map = self.inner.connections.lock().unwrap();
             if let Some(cell) = map.get(&node_id)
-                && let Some(client) = cell.get()
+                && let Some(broker) = cell.get()
             {
-                if !client.is_shutdown() && metadata.brokers.contains_key(&node_id) {
-                    return Ok(client.clone());
+                if !broker.is_shutdown() && metadata.brokers.contains_key(&node_id) {
+                    return Ok(broker.clone());
                 }
                 // Dead or no longer in metadata — evict so the cold path
                 // either redials (shutdown) or rejects (unknown id).
@@ -187,14 +187,14 @@ impl Client {
         let security = self.inner.security.clone();
         let auth = self.inner.auth.clone();
         let max_response_size = self.inner.max_response_size;
-        let client = cell
+        let broker = cell
             .get_or_try_init(|| async move {
                 let config = Config::new(&host, port).with_max_response_size(max_response_size);
                 let conn = Connection::connect(&config, security).await?;
                 BrokerClient::new(conn, auth).await
             })
             .await?;
-        Ok(client.clone())
+        Ok(broker.clone())
     }
 
     pub async fn any_broker(&self) -> Result<BrokerClient> {
@@ -203,11 +203,11 @@ impl Client {
             let metadata = self.inner.metadata.load();
             let map = self.inner.connections.lock().unwrap();
             for (broker_id, cell) in &*map {
-                if let Some(client) = cell.get()
-                    && !client.is_shutdown()
+                if let Some(broker) = cell.get()
+                    && !broker.is_shutdown()
                     && metadata.brokers.contains_key(broker_id)
                 {
-                    return Ok(client.clone());
+                    return Ok(broker.clone());
                 }
             }
         }
@@ -296,21 +296,15 @@ impl Client {
             .contains_key(&node_id)
     }
 
-    pub async fn create_topics(
-        &self,
-        topics: Vec<CreatableTopic>,
-        timeout_ms: i32,
-    ) -> Result<CreateTopicsResponse> {
-        // CreateTopics is routed to the controller.
-        // Since Kafka 2.4 (KIP-590) any broker will forward admin requests to the
-        // controller, but targeting the controller directly is still canonical in
-        // the other clients.
-        let controller = self.controller().await?;
-        controller.create_topics(topics, timeout_ms).await
-    }
-
     pub fn controller_id(&self) -> BrokerId {
         self.inner.metadata.load().controller_id
+    }
+
+    /// Returns an [`AdminClient`] handle for cluster-management RPCs
+    /// (topic creation, config changes, etc.). Cheap to call — the returned
+    /// handle shares this `Client`'s connection pool and metadata cache.
+    pub fn admin(&self) -> AdminClient {
+        AdminClient::new(self.clone())
     }
 }
 

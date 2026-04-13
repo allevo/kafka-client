@@ -83,7 +83,7 @@ async fn test_standalone_create_topic() {
         .with_num_partitions(3)
         .with_replication_factor(1);
 
-    let response = client.create_topics(vec![topic], 5000).await.unwrap();
+    let response = client.admin().create_topics(vec![topic], 5000).await.unwrap();
     assert_eq!(response.topics.len(), 1);
     assert_eq!(response.topics[0].name.as_str(), "test-topic-1");
     // Accept both 0 (success) and 36 (TOPIC_ALREADY_EXISTS) since the broker is shared
