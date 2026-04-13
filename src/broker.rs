@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use bytes::{BufMut, Bytes};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{Notify, mpsc, oneshot};
 
 use kafka_protocol::messages::api_versions_response::ApiVersion;
 use kafka_protocol::messages::{
@@ -68,10 +68,15 @@ pub struct BrokerClient {
     next_correlation_id: Arc<AtomicI32>,
     pool: BufferPool,
     api_versions: Arc<[ApiVersion]>,
-    // Flipped by `read_task` the moment it decides to exit, so `send_raw` can
+    // Flipped by `read_task` the moment it decides to exit, so `send` can
     // reject new requests immediately instead of letting them sit in the mpsc
     // channel until `write_task` notices the shutdown signal and drops `request_rx`.
     shutdown: Arc<AtomicBool>,
+    // User-initiated shutdown signal. `read_task` selects on `close.notified()`;
+    // waking it tears down the connection through the existing read→write shutdown
+    // chain, regardless of how many `BrokerClient` clones are still holding
+    // `request_tx`. See `shutdown()` below.
+    close: Arc<Notify>,
     // Holds the reauth-shutdown sender alive when no reauth task is running
     _reauth_shutdown_tx: Arc<Mutex<Option<oneshot::Sender<()>>>>,
 }
@@ -108,6 +113,7 @@ impl BrokerClient {
         // Lets `reauth_task` signal `read_task` to tear down the connection on failure.
         let (reauth_shutdown_tx, reauth_shutdown_rx) = oneshot::channel::<()>();
         let shutdown = Arc::new(AtomicBool::new(false));
+        let close = Arc::new(Notify::new());
 
         tracing::info!("spawning write/read tasks");
         tokio::spawn(write_task(
@@ -123,6 +129,7 @@ impl BrokerClient {
             read_shutdown_tx,
             shutdown.clone(),
             reauth_shutdown_rx,
+            close.clone(),
             pool.clone(),
         ));
 
@@ -133,6 +140,7 @@ impl BrokerClient {
             next_correlation_id: Arc::new(AtomicI32::new(correlation_id + 1)),
             api_versions: api_versions.into(),
             shutdown,
+            close,
             // Keep the sender alive so the oneshot in read_task stays pending.
             // Moved into reauth_task below if reauth is needed.
             _reauth_shutdown_tx: Arc::new(Mutex::new(None)),
@@ -285,10 +293,20 @@ impl BrokerClient {
         negotiate_version(&self.api_versions, api_key, desired)
     }
 
+    /// Signal this broker connection to tear down. After calling this, the
+    /// background read/write tasks will exit asynchronously and any pending
+    /// in-flight requests will complete with `ConnectionAborted`. Idempotent:
+    /// safe to call on an already-shut-down broker.
+    pub fn shutdown(&self) {
+        self.shutdown.store(true, Ordering::Release);
+
+        self.close.notify_one();
+    }
+
     /// Returns `true` if the broker shut down
     pub(crate) fn is_shutdown(&self) -> bool {
         // Acquire pairs with read_task's Release store at the bottom of read_task,
-        // matching the ordering send_raw already uses.
+        // matching the ordering send already uses.
         self.shutdown.load(Ordering::Acquire)
     }
 
@@ -536,6 +554,7 @@ async fn read_task(
     read_shutdown: oneshot::Sender<()>,
     shutdown: Arc<AtomicBool>,
     reauth_shutdown_rx: oneshot::Receiver<()>,
+    close: Arc<Notify>,
     pool: BufferPool,
 ) {
     let mut size_buf = [0u8; 4];
@@ -548,6 +567,13 @@ async fn read_task(
             // sends on failure). Either way this branch only fires on failure.
             _ = &mut reauth_shutdown => {
                 tracing::error!("re-authentication failed, shutting down connection");
+                break;
+            }
+            // User-initiated shutdown via `BrokerClient::shutdown()`.
+            // Breaking here drops `read_shutdown` and
+            // drains in_flight, which also tears down `write_task`.
+            _ = close.notified() => {
+                tracing::info!("client requested shutdown");
                 break;
             }
             result = reader.read_exact(&mut size_buf) => result,
@@ -641,9 +667,9 @@ async fn read_task(
         }
     }
 
-    // Flip the shared flag *before* draining so any caller currently in send_raw
+    // Flip the shared flag *before* draining so any caller currently in send
     // sees it as early as possible. This is a best-effort fast path: there is
-    // still a TOCTOU window between the flag check in send_raw and the channel
+    // still a TOCTOU window between the flag check in send and the channel
     // send, which is documented at the check site and handled by the
     // dropped-oneshot safety net.
     shutdown.store(true, Ordering::Release);

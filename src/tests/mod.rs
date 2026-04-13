@@ -1,3 +1,4 @@
+mod close;
 mod cluster;
 mod helpers;
 mod reauth;

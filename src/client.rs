@@ -300,6 +300,26 @@ impl Client {
         self.inner.metadata.load().controller_id
     }
 
+    /// Signal shutdown on every pooled broker connection and clear the pool.
+    ///
+    /// Idempotent. Takes `&self` rather than consuming `self` because `Client`
+    /// is `Clone` — consuming one handle would imply finality that other
+    /// clones don't honour. After `close()` returns, background read/write
+    /// tasks are signalled but exit asynchronously; outstanding
+    /// [`BrokerClient`] clones handed out by [`Client::broker`] will fail new
+    /// requests with `ConnectionAborted`. A subsequent `broker(id)` call on
+    /// this `Client` (or any clone) will redial — there is no "closed" flag.
+    pub fn close(&self) {
+        let mut map = self.inner.connections.lock().unwrap();
+        for (_id, cell) in map.drain() {
+            // Uninitialized cells have no background tasks to signal; they'll
+            // drop cleanly. Only initialized slots need an active shutdown.
+            if let Some(broker) = cell.get() {
+                broker.shutdown();
+            }
+        }
+    }
+
     /// Returns an [`AdminClient`] handle for cluster-management RPCs
     /// (topic creation, config changes, etc.). Cheap to call — the returned
     /// handle shares this `Client`'s connection pool and metadata cache.
