@@ -1,9 +1,11 @@
+use std::io::{self, ErrorKind};
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
 use bytes::{BufMut, Bytes, BytesMut};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::TcpStream;
+use tokio::time::timeout;
 use tokio_rustls::TlsConnector;
 
 use kafka_protocol::messages::api_versions_response::ApiVersion;
@@ -11,6 +13,7 @@ use kafka_protocol::messages::{
     ApiVersionsRequest, ApiVersionsResponse, RequestHeader, ResponseHeader,
 };
 use kafka_protocol::protocol::{Decodable, Encodable, HeaderVersion, StrBytes};
+use tracing::warn;
 
 use crate::config::{Config, Security};
 use crate::error::{Error, Result};
@@ -26,26 +29,51 @@ impl Connection {
     pub async fn connect(config: &Config, security: Security) -> Result<Self> {
         let addr = format!("{}:{}", config.host, config.port);
         tracing::info!(addr = %addr, "connecting to broker");
-        let tcp = TcpStream::connect(&addr).await?;
-        tracing::debug!(addr = %addr, "TCP connection established");
 
-        let stream = match security {
-            Security::Plaintext => {
-                tracing::debug!("using plaintext connection");
-                Stream::Plain(tcp)
-            }
-            Security::Ssl(tls_config) => {
-                tracing::debug!(host = %config.host, "starting TLS handshake");
-                let server_name = rustls::pki_types::ServerName::try_from(config.host.as_str())
-                    .map_err(|_| {
-                        Error::ProtocolError(format!("invalid TLS server name: {}", config.host))
-                    })?
-                    .to_owned();
-                let connector = TlsConnector::from(tls_config);
-                let tls_stream = connector.connect(server_name, tcp).await?;
-                tracing::debug!(host = %config.host, "TLS handshake complete");
-                Stream::Tls(tls_stream)
-            }
+        // Bound TCP connect + TLS handshake by `connection_setup_timeout`.
+        let setup = async {
+            let tcp = TcpStream::connect(&addr).await?;
+            tracing::debug!(addr = %addr, "TCP connection established");
+
+            let stream = match security {
+                Security::Plaintext => {
+                    tracing::debug!("using plaintext connection");
+                    Stream::Plain(tcp)
+                }
+                Security::Ssl(tls_config) => {
+                    tracing::debug!(host = %config.host, "starting TLS handshake");
+                    let server_name =
+                        rustls::pki_types::ServerName::try_from(config.host.as_str())
+                            .map_err(|_| {
+                                Error::ProtocolError(format!(
+                                    "invalid TLS server name: {}",
+                                    config.host
+                                ))
+                            })?
+                            .to_owned();
+                    let connector = TlsConnector::from(tls_config);
+                    let tls_stream = connector.connect(server_name, tcp).await?;
+                    tracing::debug!(host = %config.host, "TLS handshake complete");
+                    Stream::Tls(tls_stream)
+                }
+            };
+            Ok::<Stream, Error>(stream)
+        };
+
+        let stream = match config.connection_setup_timeout {
+            Some(duration) => match timeout(duration, setup).await {
+                Ok(res) => res?,
+                // `None` would also be valid here, but tests pin `Error::Io(TimedOut)`
+                // so callers can match on `io_err.kind()`.
+                Err(_) => {
+                    warn!(timeout = ?duration, "Connection setup timed out");
+                    return Err(Error::Io(io::Error::new(
+                        ErrorKind::TimedOut,
+                        "connection setup timed out",
+                    )));
+                }
+            },
+            None => setup.await?,
         };
 
         tracing::info!(addr = %addr, "connected to broker");
