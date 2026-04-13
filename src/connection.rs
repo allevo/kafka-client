@@ -37,6 +37,11 @@ impl Connection {
             let tcp = TcpStream::connect(&addr).await?;
             tracing::debug!(addr = %addr, "TCP connection established");
 
+            // Disable Nagle's algorithm to avoid ~40 ms delayed-ACK stalls on small
+            // pipelined RPCs.
+            tcp.set_nodelay(true)?;
+            tracing::debug!("TCP_NODELAY enabled");
+
             let stream = match security {
                 Security::Plaintext => {
                     tracing::debug!("using plaintext connection");

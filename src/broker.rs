@@ -490,17 +490,26 @@ async fn reauth_task(
 
 const RECV_MANY_BATCH_COUNT: usize = 32;
 
+// Buffer capacity to keep maximum RECV_MANY_BATCH_COUNT batch in memory
+// before flushing.
+const WRITE_BUFFER_CAPACITY: usize = 128 * 1024;
+
 /// Write task: pulls `RequestMsg`s from the channel, registers them in `in_flight`, and
 /// writes them to the broker. Uses `recv_many` to request_batch queued requests and flush
 /// once per request_batch, reducing syscalls under concurrent load. Exits on a write/flush
 /// error, when the request channel is closed (BrokerClient dropped), or when the
 /// read task signals shutdown.
 async fn write_task(
-    mut writer: tokio::io::WriteHalf<crate::connection::Stream>,
+    writer: tokio::io::WriteHalf<crate::connection::Stream>,
     mut request_rx: mpsc::Receiver<RequestMsg>,
     in_flight: InFlight,
     mut read_shutdown: oneshot::Receiver<()>,
 ) {
+    // This wrap avoids one syscall per write.
+    // NB1: Large Produce/Fetch payloads bypass the buffer via BufWriter's large-write fast path.
+    // NB2: We disabled Nagle algo with TCP_NODELAY flag.
+    //      This means the flush on buffer forces the write
+    let mut writer = tokio::io::BufWriter::with_capacity(WRITE_BUFFER_CAPACITY, writer);
     let mut request_batch: Vec<RequestMsg> = Vec::with_capacity(RECV_MANY_BATCH_COUNT);
     let mut data_batch = Vec::with_capacity(RECV_MANY_BATCH_COUNT);
 
