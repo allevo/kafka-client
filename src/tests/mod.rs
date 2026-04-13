@@ -1,4 +1,4 @@
-// mod cluster;
+mod cluster;
 mod helpers;
 mod reauth;
 mod standalone;
