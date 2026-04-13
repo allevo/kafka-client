@@ -77,6 +77,8 @@ pub struct BrokerClient {
     // chain, regardless of how many `BrokerClient` clones are still holding
     // `request_tx`. See `shutdown()` below.
     close: Arc<Notify>,
+    // The reauth_task-shutdown notify.
+    reauth_close: Arc<Notify>,
     // Holds the reauth-shutdown sender alive when no reauth task is running
     _reauth_shutdown_tx: Arc<Mutex<Option<oneshot::Sender<()>>>>,
 }
@@ -114,6 +116,7 @@ impl BrokerClient {
         let (reauth_shutdown_tx, reauth_shutdown_rx) = oneshot::channel::<()>();
         let shutdown = Arc::new(AtomicBool::new(false));
         let close = Arc::new(Notify::new());
+        let reauth_close = Arc::new(Notify::new());
 
         tracing::info!("spawning write/read tasks");
         tokio::spawn(write_task(
@@ -141,6 +144,7 @@ impl BrokerClient {
             api_versions: api_versions.into(),
             shutdown,
             close,
+            reauth_close,
             // Keep the sender alive so the oneshot in read_task stays pending.
             // Moved into reauth_task below if reauth is needed.
             _reauth_shutdown_tx: Arc::new(Mutex::new(None)),
@@ -301,6 +305,7 @@ impl BrokerClient {
         self.shutdown.store(true, Ordering::Release);
 
         self.close.notify_one();
+        self.reauth_close.notify_one();
     }
 
     /// Returns `true` if the broker shut down
@@ -449,7 +454,15 @@ async fn reauth_task(
     loop {
         let delay = reauth_delay(session_lifetime);
         tracing::debug!(?delay, "re-auth task sleeping");
-        tokio::time::sleep(delay).await;
+        // Force to stop the task when a shutdown is requested instead of
+        // waiting the next cicle.
+        tokio::select! {
+            _ = tokio::time::sleep(delay) => {}
+            _ = client.reauth_close.notified() => {
+                tracing::info!("reauth task observed shutdown, exiting");
+                return;
+            }
+        }
 
         tracing::info!("re-auth timer fired, starting re-authentication");
         match client.authenticate(&auth).await {
@@ -459,15 +472,17 @@ async fn reauth_task(
             }
             Ok(None) => {
                 tracing::info!("re-auth returned no session lifetime, stopping reauth task");
-                return; // drops sender → read_task sees Err(Closed), ignores it
+                break; // drops sender → read_task sees Err(Closed), ignores it
             }
             Err(e) => {
                 tracing::error!(error = %e, "re-authentication failed, shutting down connection");
                 let _ = reauth_shutdown_tx.send(()); // signal read_task to tear down
-                return;
+                break;
             }
         }
     }
+
+    tracing::warn!("re-authentication loop is end");
 }
 
 const RECV_MANY_BATCH_COUNT: usize = 32;
