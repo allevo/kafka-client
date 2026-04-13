@@ -1,4 +1,5 @@
 pub mod containers;
+pub mod proxy;
 pub mod shared;
 pub mod tls;
 
