@@ -1020,6 +1020,7 @@ dependencies = [
  "kafka-protocol",
  "rustls",
  "rustls-pemfile",
+ "socket2",
  "testcontainers",
  "testcontainers-modules",
  "tokio",

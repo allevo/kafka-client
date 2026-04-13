@@ -40,7 +40,14 @@ impl Connection {
             // Disable Nagle's algorithm to avoid ~40 ms delayed-ACK stalls on small
             // pipelined RPCs.
             tcp.set_nodelay(true)?;
-            tracing::debug!("TCP_NODELAY enabled");
+
+            {
+                use socket2::SockRef;
+                let sock_ref = SockRef::from(&tcp);
+                sock_ref.set_keepalive(true)?;
+            }
+
+            tracing::debug!("TCP_NODELAY and KEEPALIVE flags enabled");
 
             let stream = match security {
                 Security::Plaintext => {
