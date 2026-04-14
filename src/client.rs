@@ -1,9 +1,13 @@
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::collections::hash_map::Entry;
+use std::sync::{Arc, Mutex, Weak};
+use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use kafka_protocol::messages::{BrokerId, MetadataResponse};
-use tokio::sync::OnceCell;
+use tokio::sync::oneshot;
+use tokio::task::AbortHandle;
+use tracing::warn;
 
 use crate::admin::AdminClient;
 use crate::broker::{Auth, BrokerClient};
@@ -23,14 +27,43 @@ struct BrokerInfo {
     port: u16,
 }
 
-/// Immutable view of the cluster, published atomically via `ArcSwap`.
-///
-/// Readers do `inner.metadata.load()` and walk this snapshot without locking;
-/// writers (only `refresh_metadata`) build a fresh snapshot and `store()` it.
+/// Immutable view of the cluster. This is the cached metadata response.
 struct MetadataSnapshot {
     controller_id: BrokerId,
     brokers: HashMap<BrokerId, BrokerInfo>,
 }
+
+/// Accumulator for keep track which callers will be awaked for 
+/// a given broker id. On success, all senders are notified.
+type Inbox = Arc<Mutex<Vec<oneshot::Sender<BrokerClient>>>>;
+
+/// Kills the wrapped task when this value is dropped.
+struct AbortOnDrop(AbortHandle);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// Describe the status per-broker:
+///
+/// - `Resolved` — living `BrokerClient`. The happy path
+///   in `Client::broker` finds it here and clones.
+///   NB: It may be shut down.
+/// - `Dialing` — a background task is already running to create a valid connection
+///   A new caller wants to push own `oneshot::Sender` onto
+///   `inbox` and await it.
+enum Slot {
+    Resolved(BrokerClient),
+    Dialing {
+        inbox: Inbox,
+        /// Drop the background task when this is dropped.
+        abort_on_drop: AbortOnDrop,
+    },
+}
+
+type ConnectionMap = Mutex<HashMap<BrokerId, Slot>>;
 
 /// Shared state behind every `Client` clone. Held inside an `Arc` so the
 /// public `Client` handle is cheap to clone and pass between tokio tasks.
@@ -42,10 +75,12 @@ struct ClientInner {
     max_response_size: usize,
     address_resolver: Option<AddressResolver>,
 
+    reconnect_backoff: Duration,
+    reconnect_backoff_max: Duration,
+
     metadata: ArcSwap<MetadataSnapshot>,
 
-    /// Per-broker connection slots.
-    connections: Mutex<HashMap<BrokerId, Arc<OnceCell<BrokerClient>>>>,
+    connections: Arc<ConnectionMap>,
 }
 
 #[derive(Clone)]
@@ -103,10 +138,9 @@ impl Client {
                     // be inserting a connection-to-host-X under broker-id-Y, which
                     // gives later callers the wrong broker. If unmatched, we drop the
                     // bootstrap connection and let the next `broker(id)` call dial fresh.
-                    let mut connections: HashMap<BrokerId, Arc<OnceCell<BrokerClient>>> =
-                        HashMap::new();
+                    let mut connections: HashMap<BrokerId, Slot> = HashMap::new();
                     if let Some(node_id) = bootstrap_node_id {
-                        connections.insert(node_id, Arc::new(OnceCell::new_with(Some(broker))));
+                        connections.insert(node_id, Slot::Resolved(broker));
                     }
 
                     let inner = ClientInner {
@@ -114,11 +148,13 @@ impl Client {
                         auth,
                         max_response_size: config.max_response_size,
                         address_resolver,
+                        reconnect_backoff: config.reconnect_backoff,
+                        reconnect_backoff_max: config.reconnect_backoff_max,
                         metadata: ArcSwap::new(Arc::new(MetadataSnapshot {
                             controller_id: metadata.controller_id,
                             brokers,
                         })),
-                        connections: Mutex::new(connections),
+                        connections: Arc::new(Mutex::new(connections)),
                     };
 
                     return Ok(Client {
@@ -143,30 +179,18 @@ impl Client {
         self.broker(id).await
     }
 
+    /// Return a usable `BrokerClient` for `node_id`.
+    ///
+    /// Fast path: under the connections-map mutex, return a clone of the
+    /// cached `Slot::Resolved` client if it's live and the id is still
+    /// known to metadata.
+    ///
+    /// Cold path: spawn (or join) a per-broker `perform_backoff_retry`
+    /// task. Each caller pushes a fresh `oneshot::Sender` into the
+    /// dialer's `Inbox` and awaits the result.
     pub async fn broker(&self, node_id: BrokerId) -> Result<BrokerClient> {
-        // Fast path: get the connection if:
-        // - it is still alive
-        // - the metadata contains it
-        {
-            let metadata = self.inner.metadata.load();
-            let mut map = self.inner.connections.lock().unwrap();
-            if let Some(cell) = map.get(&node_id)
-                && let Some(broker) = cell.get()
-            {
-                if !broker.is_shutdown() && metadata.brokers.contains_key(&node_id) {
-                    return Ok(broker.clone());
-                }
-                // Dead or no longer in metadata — evict so the cold path
-                // either redials (shutdown) or rejects (unknown id).
-                map.remove(&node_id);
-            }
-        }
-
-        // Cold path: No live brokerclient is found
-        // - Get metadata
-        // - Replace (mainly insert) a new OnceCell to the connections map
-        // - Init connection
-
+        // Validate membership before touching the slot map so a bogus id
+        // doesn't leak an empty slot.
         let (host, port) = {
             let snap = self.inner.metadata.load();
             let info = snap.brokers.get(&node_id).ok_or_else(|| {
@@ -175,54 +199,106 @@ impl Client {
             (info.host.clone(), info.port)
         };
 
-        let cell = {
-            let mut map = self.inner.connections.lock().unwrap();
+        let rx = {
+            let mut map = self.inner.connections
+                .lock()
+                .unwrap();
 
-            // During a lock we return or insert the arc by node_id
-            map.entry(node_id)
-                .or_insert_with(|| Arc::new(OnceCell::new()))
-                .clone()
+            // Fast path: live cached client.
+            if let Some(Slot::Resolved(c)) = map.get(&node_id) {
+                if !c.is_shutdown() {
+                    return Ok(c.clone());
+                }
+            }
+
+            // Cold path:
+            // - absent slot: spawn dialer with the oneshot sender
+            // - an existing `Dialing`: add the oneshot sender to the list
+            // - an existing `Resolver`: it is dead, so (almost) the same as the "absent slot" case
+            // In case a new dialer is spawn, a background tokio task is spawn
+            // in which there's implemented the retry loop logic.
+            let (tx, rx) = oneshot::channel();
+            match map.entry(node_id) {
+                Entry::Occupied(mut e) => match e.get_mut() {
+                    Slot::Dialing { inbox, .. } => {
+                        inbox.lock().unwrap().push(tx);
+                    }
+                    Slot::Resolved(s) => {
+                        assert!(s.is_shutdown(), "Broker Client is shot down");
+
+                        let inbox: Inbox = Arc::new(Mutex::new(vec![tx]));
+                        let abort =
+                            spawn_dialer(&self.inner, node_id, host, port, inbox.clone(), 1);
+                        e.insert(Slot::Dialing {
+                            inbox,
+                            abort_on_drop: abort,
+                        });
+                    }
+                },
+                Entry::Vacant(v) => {
+                    let inbox: Inbox = Arc::new(Mutex::new(vec![tx]));
+                    let abort = spawn_dialer(&self.inner, node_id, host, port, inbox.clone(), 0);
+                    v.insert(Slot::Dialing {
+                        inbox,
+                        abort_on_drop: abort,
+                    });
+                }
+            }
+
+            rx
         };
 
-        let security = self.inner.security.clone();
-        let auth = self.inner.auth.clone();
-        let max_response_size = self.inner.max_response_size;
-        let broker = cell
-            .get_or_try_init(|| async move {
-                let config = Config::new(&host, port).with_max_response_size(max_response_size);
-                let conn = Connection::connect(&config, security).await?;
-                BrokerClient::new(conn, auth).await
-            })
-            .await?;
-        Ok(broker.clone())
+        match rx.await {
+            Ok(client) => Ok(client),
+            Err(_) => Err(Error::ProtocolError("broker dial cancelled".into())),
+        }
     }
 
     pub async fn any_broker(&self) -> Result<BrokerClient> {
-        // Fast path: find the first connection that is still alive
+        // Fast path: find the first connection that is still alive.
         {
             let metadata = self.inner.metadata.load();
             let map = self.inner.connections.lock().unwrap();
-            for (broker_id, cell) in &*map {
-                if let Some(broker) = cell.get()
-                    && !broker.is_shutdown()
-                    && metadata.brokers.contains_key(broker_id)
-                {
-                    return Ok(broker.clone());
+            for (broker_id, slot) in map.iter() {
+                if let Slot::Resolved(broker) = slot {
+                    if !broker.is_shutdown() && metadata.brokers.contains_key(broker_id) {
+                        return Ok(broker.clone());
+                    }
                 }
             }
         }
 
-        // Otherwise route through `broker(id)` for the first known broker —
-        // that path handles dialing and slot insertion uniformly.
-        let id = {
+        // Otherwise route through `broker(id)` for each known broker —
+        // that path handles dialing, gating, and slot insertion uniformly.
+        // Iterate over ids so one dead broker (gated by its dialer's
+        // backoff sleep) doesn't starve callers when another id is
+        // healthy.
+        let ids: Vec<BrokerId> = {
             let snap = self.inner.metadata.load();
-            *snap
-                .brokers
-                .keys()
-                .next()
-                .ok_or_else(|| Error::ProtocolError("no known brokers".into()))?
+            snap.brokers.keys().copied().collect()
         };
-        self.broker(id).await
+        if ids.is_empty() {
+            return Err(Error::ProtocolError("no known brokers".into()));
+        }
+
+        let mut last_err = None;
+        for id in ids {
+            // Skip any broker whose slot is currently `Dialing`: its
+            // backoff loop is running and `broker(id)` would park us on
+            // a potentially long sleep. A healthy sibling is worth more
+            // to `any_broker`'s callers than a gated one.
+            {
+                let map = self.inner.connections.lock().unwrap();
+                if matches!(map.get(&id), Some(Slot::Dialing { .. })) {
+                    continue;
+                }
+            }
+            match self.broker(id).await {
+                Ok(c) => return Ok(c),
+                Err(e) => last_err = Some(e),
+            }
+        }
+        Err(last_err.unwrap_or_else(|| Error::ProtocolError("no reachable brokers".into())))
     }
 
     pub async fn refresh_metadata(&self) -> Result<MetadataResponse> {
@@ -248,7 +324,10 @@ impl Client {
         Ok(metadata)
     }
 
-    /// Clean up connections & replace metadata
+    /// Clean up connections & replace metadata. Pruned slots drop their
+    /// `Slot::Dialing` variant (if any), which aborts the background
+    /// dialer — callers parked on its inbox wake with a closed-channel
+    /// error and return promptly.
     fn apply_metadata_snapshot(&self, snap: MetadataSnapshot) {
         {
             let mut conns = self.inner.connections.lock().unwrap();
@@ -302,20 +381,17 @@ impl Client {
 
     /// Signal shutdown on every pooled broker connection and clear the pool.
     ///
-    /// Idempotent. Takes `&self` rather than consuming `self` because `Client`
-    /// is `Clone` — consuming one handle would imply finality that other
-    /// clones don't honour. After `close()` returns, background read/write
-    /// tasks are signalled but exit asynchronously; outstanding
-    /// [`BrokerClient`] clones handed out by [`Client::broker`] will fail new
-    /// requests with `ConnectionAborted`. A subsequent `broker(id)` call on
-    /// this `Client` (or any clone) will redial — there is no "closed" flag.
+    /// Idempotent. After `close()` returns, background read/write
+    /// tasks are signalled but exit asynchronously.
     pub fn close(&self) {
         let mut map = self.inner.connections.lock().unwrap();
-        for (_id, cell) in map.drain() {
-            // Uninitialized cells have no background tasks to signal; they'll
-            // drop cleanly. Only initialized slots need an active shutdown.
-            if let Some(broker) = cell.get() {
-                broker.shutdown();
+        for (_id, slot) in map.drain() {
+            match slot {
+                Slot::Resolved(broker) => broker.shutdown(),
+                Slot::Dialing { abort_on_drop, .. } => {
+                    // The following drop will drop the background retry task.
+                    drop(abort_on_drop);
+                },
             }
         }
     }
@@ -326,6 +402,189 @@ impl Client {
     pub fn admin(&self) -> AdminClient {
         AdminClient::new(self.clone())
     }
+}
+
+/// Spawn a `perform_backoff_retry` task for `node_id`.
+///
+/// Returns a structure to abort the spawned task when dropped.
+/// NB: be sure to call this function holding the connections-map mutex.
+fn spawn_dialer(
+    inner: &ClientInner,
+    node_id: BrokerId,
+    host: String,
+    port: u16,
+    inbox: Inbox,
+    initial_times: u32,
+) -> AbortOnDrop {
+    // Weak reference allows to not have a long running task that holds all the connections
+    // If closed, the following chain happens:
+    // - Client drops → ClientInner drops
+    // - ClientInner drops → the strong Arc<ConnectionMap> inside it drops
+    // - Arc<ConnectionMap> drops → map drops
+    // - map drops → every Slot::Dialing drops
+    // - Slot::Dialing drops → AbortOnDrop fires
+    // - AbortOnDrop fires → every dialer task is aborted at its next await
+    let connections = Arc::downgrade(&inner.connections);
+    let security = inner.security.clone();
+    let auth = inner.auth.clone();
+    let max_response_size = inner.max_response_size;
+    let base = inner.reconnect_backoff;
+    let max = inner.reconnect_backoff_max;
+    let handle = tokio::spawn(perform_backoff_retry(
+        inbox,
+        connections,
+        node_id,
+        host,
+        port,
+        security,
+        auth,
+        max_response_size,
+        base,
+        max,
+        initial_times,
+    ));
+    AbortOnDrop(handle.abort_handle())
+}
+
+/// Background dialer loop for the given broker id.
+#[allow(clippy::too_many_arguments)]
+async fn perform_backoff_retry(
+    inbox: Inbox,
+    connections: Weak<ConnectionMap>,
+    node_id: BrokerId,
+    host: String,
+    port: u16,
+    security: Security,
+    auth: Auth,
+    max_response_size: usize,
+    base: Duration,
+    max: Duration,
+    initial_times: u32,
+) {
+    let mut times: u32 = initial_times;
+
+
+    // The loop:
+    // - success: lock the map and replace the slot with `Slot::Reesolved`.
+    //             Notify all the waiters.
+    // - fails: retry with a backoff
+    // 
+    // NB: if the waiters list is empty, the loop exited because no one is asking
+    // for this broker anymore.
+    //
+    loop {
+        if times > 0 {
+            tokio::time::sleep(next_backoff(times, base, max)).await;
+
+            let Some(map_arc) = connections.upgrade() else {
+                return;
+            };
+            let mut map = map_arc.lock().unwrap();
+
+            // If metadata changed, we stop to deal with this broker
+            if !slot_is_ours(&map, node_id, &inbox) {
+                return;
+            }
+            {
+                let mut guard = inbox.lock().unwrap();
+                // Remove all "old" waiters. They may go await after waiting a while
+                // If the vec is empty, it means no waiters are there.
+                // Therefore, we can exit.
+                guard.retain(|tx| !tx.is_closed());
+                if guard.is_empty() {
+                    map.remove(&node_id);
+                    return;
+                }
+            }
+            // At least one live waiter remains: fall through and dial.
+            drop(map);
+        }
+
+        let dial_result: Result<BrokerClient> = async {
+            let config = Config::new(&host, port).with_max_response_size(max_response_size);
+            let conn = Connection::connect(&config, security.clone()).await?;
+            BrokerClient::new(conn, auth.clone()).await
+        }
+        .await;
+
+        let client = match dial_result {
+            Ok(client) => client,
+            Err(e) => {
+                tracing::warn!(
+                    node_id = node_id.0,
+                    %host,
+                    port,
+                    error = %e,
+                    "broker dial failed; will retry after backoff",
+                );
+                times = times.saturating_add(1);
+                continue;
+            }
+        };
+
+        let Some(map_arc) = connections.upgrade() else {
+            return;
+        };
+        let mut map = map_arc.lock().unwrap();
+
+        {
+            let mut guard = inbox.lock().unwrap();
+            for tx in guard.drain(..) {
+                let _ = tx.send(client.clone());
+            }
+        }
+
+        if !slot_is_ours(&map, node_id, &inbox) {
+            return;
+        }
+
+        map.insert(node_id, Slot::Resolved(client));
+        return;
+    }
+}
+
+/// True iff the slot at `node_id` is `Dialing` with an inbox `Arc`
+/// pointer-equal to ours. Used by `perform_backoff_retry` to detect
+/// whether its slot has been replaced (metadata pruning + respawn) so
+/// it can abandon the map entry rather than overwrite a newer dialer.
+fn slot_is_ours(
+    map: &std::sync::MutexGuard<'_, HashMap<BrokerId, Slot>>,
+    node_id: BrokerId,
+    inbox: &Inbox,
+) -> bool {
+    matches!(
+        map.get(&node_id),
+        Some(Slot::Dialing { inbox: slot_inbox, .. })
+            if Arc::ptr_eq(slot_inbox, inbox)
+    )
+}
+
+/// Reconnect backoff formula: `base * 2^(attempts-1)` capped at `max`,
+/// with symmetric ±20 % jitter (Java `ExponentialBackoff`-style; simpler
+/// than librdkafka's asymmetric −25 %/+50 % and serves the same
+/// thundering-herd purpose). `attempts` is the number of consecutive
+/// failures recorded, so `attempts == 1` returns ≈ `base`.
+pub(crate) fn next_backoff(attempts: u32, base: Duration, max: Duration) -> Duration {
+    let shift = attempts.saturating_sub(1).min(31);
+    // Multiply in nanos to keep the math in one unit. Both saturating_mul
+    // and the cap keep us safely inside u128.
+    let multiplier: u128 = 1u128 << shift;
+    let nominal = base
+        .as_nanos()
+        .saturating_mul(multiplier)
+        .min(max.as_nanos());
+    // ±20 % jitter. Using `fastrand` (already a dependency) — reseeded
+    // per-call via the thread-local RNG.
+    let jitter_span = (nominal / 5) as i128; // 20 % of nominal
+    let jitter = if jitter_span > 0 {
+        fastrand::i128(-jitter_span..=jitter_span)
+    } else {
+        0
+    };
+    let result = (nominal as i128 + jitter).max(0) as u128;
+    // Cap at u64::MAX nanos — Duration::from_nanos expects u64.
+    let nanos_u64 = result.min(u64::MAX as u128) as u64;
+    Duration::from_nanos(nanos_u64)
 }
 
 fn resolve_address(

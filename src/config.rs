@@ -4,6 +4,14 @@ use std::time::Duration;
 /// Default maximum response size: 100 MiB.
 pub const DEFAULT_MAX_RESPONSE_SIZE: usize = 100 * 1024 * 1024;
 
+/// Base reconnect backoff (librdkafka default, friendlier than Java's 50 ms
+/// to a recovering broker). See `Config::reconnect_backoff`.
+pub const DEFAULT_RECONNECT_BACKOFF: Duration = Duration::from_millis(100);
+
+/// Cap on reconnect backoff (librdkafka default). See
+/// `Config::reconnect_backoff_max`.
+pub const DEFAULT_RECONNECT_BACKOFF_MAX: Duration = Duration::from_secs(10);
+
 #[derive(Clone)]
 pub enum Security {
     Plaintext,
@@ -25,6 +33,12 @@ pub struct Config {
     /// Recommended: slightly below the broker's own idle close (default 10 min).
     /// Re-auth flow reset the timer.
     pub connections_max_idle: Option<Duration>,
+    /// Base reconnect backoff applied after a failed dial to a broker. The
+    /// next dial to the same broker-id is gated by at least this duration
+    /// (plus jitter) after the previous failure.
+    pub reconnect_backoff: Duration,
+    /// Upper bound on the exponential reconnect backoff.
+    pub reconnect_backoff_max: Duration,
 }
 
 impl Config {
@@ -35,7 +49,19 @@ impl Config {
             max_response_size: DEFAULT_MAX_RESPONSE_SIZE,
             connection_setup_timeout: None,
             connections_max_idle: None,
+            reconnect_backoff: DEFAULT_RECONNECT_BACKOFF,
+            reconnect_backoff_max: DEFAULT_RECONNECT_BACKOFF_MAX,
         }
+    }
+
+    pub fn with_reconnect_backoff(mut self, base: Duration) -> Self {
+        self.reconnect_backoff = base;
+        self
+    }
+
+    pub fn with_reconnect_backoff_max(mut self, max: Duration) -> Self {
+        self.reconnect_backoff_max = max;
+        self
     }
 
     pub fn with_max_response_size(mut self, size: usize) -> Self {

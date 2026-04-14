@@ -2,6 +2,7 @@ mod close;
 mod cluster;
 mod helpers;
 mod reauth;
+mod reconnect_backoff;
 mod standalone;
 mod standalone_sasl;
 mod standalone_tls;
