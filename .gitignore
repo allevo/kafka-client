@@ -2,3 +2,7 @@
 /kafka
 /librdkafka
 
+*.html
+*.md
+!CLAUDE.md
+!README.md
