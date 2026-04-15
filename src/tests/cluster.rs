@@ -38,6 +38,7 @@ async fn connected_3node_client() -> (crate::Client, HashMap<BrokerId, (String, 
 
 #[tokio::test]
 async fn test_cluster_plaintext() {
+    let _ = tracing_subscriber::fmt::try_init();
     let cluster = helpers::plaintext_cluster().await;
 
     for (host, port) in cluster.addr_map.values() {
@@ -47,6 +48,7 @@ async fn test_cluster_plaintext() {
 
 #[tokio::test]
 async fn test_cluster_client() {
+    let _ = tracing_subscriber::fmt::try_init();
     let cluster = helpers::plaintext_cluster().await;
 
     let addr_map = cluster.addr_map.clone();
@@ -117,6 +119,7 @@ async fn test_cluster_client() {
 /// whole thing terminates without panics or deadlocks.
 #[tokio::test]
 async fn test_cluster_client_concurrent_access() {
+    let _ = tracing_subscriber::fmt::try_init();
     let cluster = helpers::plaintext_cluster().await;
 
     let addr_map = cluster.addr_map.clone();
@@ -193,6 +196,7 @@ async fn test_cluster_client_concurrent_access() {
 /// connection cache, so a bogus call leaves the slot count unchanged.
 #[tokio::test]
 async fn test_broker_unknown_id_does_not_pollute_connections() {
+    let _ = tracing_subscriber::fmt::try_init();
     let (client, _addr_map) = connected_3node_client().await;
 
     let before = client.connection_slot_count();
@@ -213,6 +217,7 @@ async fn test_broker_unknown_id_does_not_pollute_connections() {
 /// `refresh_metadata` so the test exercises the production code path.
 #[tokio::test]
 async fn test_broker_removed_from_metadata_is_pruned() {
+    let _ = tracing_subscriber::fmt::try_init();
     let (client, addr_map) = connected_3node_client().await;
 
     // Force a slot for broker 2 into the cache.
@@ -253,6 +258,7 @@ async fn test_broker_removed_from_metadata_is_pruned() {
 #[tokio::test]
 #[tracing_test::traced_test]
 async fn test_pruned_broker_tasks_are_torn_down() {
+    let _ = tracing_subscriber::fmt::try_init();
     let _ = tracing_subscriber::fmt::try_init();
 
     let broker = helpers::sasl_reauth_broker().await;
@@ -337,6 +343,7 @@ async fn test_pruned_broker_tasks_are_torn_down() {
 /// the cold path dials a fresh connection.
 #[tokio::test]
 async fn test_broker_dead_connection_is_replaced() {
+    let _ = tracing_subscriber::fmt::try_init();
     let (client, _addr_map) = connected_3node_client().await;
 
     let first = client.broker(BrokerId(2)).await.unwrap();
@@ -368,6 +375,7 @@ async fn test_broker_dead_connection_is_replaced() {
 /// through to a fresh dial instead.
 #[tokio::test]
 async fn test_any_broker_skips_dead_connections() {
+    let _ = tracing_subscriber::fmt::try_init();
     let (client, _addr_map) = connected_3node_client().await;
 
     // Populate the cache for all three brokers, then poison every entry.

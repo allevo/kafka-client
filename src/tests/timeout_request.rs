@@ -72,6 +72,7 @@ fn metadata_request_build(_version: i16) -> MetadataRequest {
 /// succeed (exercises the `Client::broker` self-heal fast path).
 #[tokio::test]
 async fn request_timeout_wire_phase_stall() {
+    let _ = tracing_subscriber::fmt::try_init();
     let upstream = helpers::plaintext_broker().await;
 
     // Count Metadata responses. Delay the first one past the budget;
@@ -161,6 +162,7 @@ async fn request_timeout_wire_phase_stall() {
 /// indefinitely on a parked dialer.
 #[tokio::test]
 async fn request_timeout_acquisition_phase_stall() {
+    let _ = tracing_subscriber::fmt::try_init();
     let listener = start_stall_listener().await;
 
     let request_timeout = Duration::from_millis(400);
@@ -199,6 +201,7 @@ async fn request_timeout_acquisition_phase_stall() {
 /// in-flight for that node" semantics.
 #[tokio::test]
 async fn request_timeout_tears_down_concurrent_callers() {
+    let _ = tracing_subscriber::fmt::try_init();
     let upstream = helpers::plaintext_broker().await;
 
     // After the handshake, delay every subsequent Metadata response.
@@ -326,6 +329,7 @@ async fn client_via_proxy_resolver(
 /// end-to-end.
 #[tokio::test]
 async fn retry_loop_recovers_after_request_timeout() {
+    let _ = tracing_subscriber::fmt::try_init();
     let upstream = helpers::plaintext_broker().await;
 
     // Delay only the first Metadata request; pass every request after
@@ -392,6 +396,7 @@ async fn retry_loop_recovers_after_request_timeout() {
 /// last attempt.
 #[tokio::test]
 async fn retry_loop_respects_api_timeout_cap() {
+    let _ = tracing_subscriber::fmt::try_init();
     let upstream = helpers::plaintext_broker().await;
 
     // Start the proxy with a transparent plan so bootstrap's Metadata

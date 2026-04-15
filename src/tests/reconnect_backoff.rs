@@ -104,6 +104,7 @@ async fn client_through_proxy(proxy: &ProxyHandle, base: Duration, max: Duration
 
 #[tokio::test]
 async fn backoff_formula_stays_within_jitter_bounds() {
+    let _ = tracing_subscriber::fmt::try_init();
     let base = Duration::from_millis(100);
     let max = Duration::from_millis(1_000);
 
@@ -133,6 +134,7 @@ async fn backoff_formula_stays_within_jitter_bounds() {
 
 #[tokio::test]
 async fn gate_arms_after_first_failure() {
+    let _ = tracing_subscriber::fmt::try_init();
     let broker = helpers::plaintext_broker().await;
     let times = Arc::new(Mutex::new(Vec::<Instant>::new()));
     let proxy =
@@ -178,6 +180,7 @@ async fn gate_arms_after_first_failure() {
 
 #[tokio::test]
 async fn exponential_growth_caps_at_max() {
+    let _ = tracing_subscriber::fmt::try_init();
     let broker = helpers::plaintext_broker().await;
     let times = Arc::new(Mutex::new(Vec::<Instant>::new()));
     let proxy =
@@ -230,6 +233,7 @@ async fn exponential_growth_caps_at_max() {
 
 #[tokio::test]
 async fn success_resets_backoff_state() {
+    let _ = tracing_subscriber::fmt::try_init();
     let broker = helpers::plaintext_broker().await;
     let times = Arc::new(Mutex::new(Vec::<Instant>::new()));
     let proxy =
@@ -298,6 +302,7 @@ async fn success_resets_backoff_state() {
 
 #[tokio::test]
 async fn concurrent_callers_single_flight() {
+    let _ = tracing_subscriber::fmt::try_init();
     let broker = helpers::plaintext_broker().await;
     let counter = Arc::new(AtomicUsize::new(0));
     let proxy =
@@ -339,6 +344,7 @@ async fn concurrent_callers_single_flight() {
 
 #[tokio::test]
 async fn dead_broker_does_not_starve_any_broker() {
+    let _ = tracing_subscriber::fmt::try_init();
     let broker = helpers::plaintext_broker().await;
     let counter = Arc::new(AtomicUsize::new(0));
     let proxy =
@@ -379,6 +385,7 @@ async fn dead_broker_does_not_starve_any_broker() {
 
 #[tokio::test]
 async fn close_does_not_block_on_sleeping_gate() {
+    let _ = tracing_subscriber::fmt::try_init();
     let broker = helpers::plaintext_broker().await;
     let counter = Arc::new(AtomicUsize::new(0));
     let proxy =
@@ -420,6 +427,7 @@ async fn close_does_not_block_on_sleeping_gate() {
 
 #[tokio::test]
 async fn failing_dial_does_not_wake_waiters() {
+    let _ = tracing_subscriber::fmt::try_init();
     let broker = helpers::plaintext_broker().await;
     let counter = Arc::new(AtomicUsize::new(0));
     let proxy =

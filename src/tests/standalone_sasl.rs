@@ -2,6 +2,7 @@ use super::helpers;
 
 #[tokio::test]
 async fn test_standalone_sasl_plaintext_api_versions() {
+    let _ = tracing_subscriber::fmt::try_init();
     let broker = helpers::sasl_broker().await;
 
     let config = crate::Config::new(&broker.host, broker.port);
@@ -23,6 +24,7 @@ async fn test_standalone_sasl_plaintext_api_versions() {
 
 #[tokio::test]
 async fn test_standalone_sasl_plaintext_bad_credentials() {
+    let _ = tracing_subscriber::fmt::try_init();
     let broker = helpers::sasl_broker().await;
 
     let config = crate::Config::new(&broker.host, broker.port);

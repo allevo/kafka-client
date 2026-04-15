@@ -5,6 +5,7 @@ use super::helpers;
 /// Verify that BrokerClient::connect succeeds against a broker that enforces re-auth.
 #[tokio::test]
 async fn test_session_lifetime_ms_parsed() {
+    let _ = tracing_subscriber::fmt::try_init();
     let broker = helpers::sasl_reauth_broker().await;
 
     let config = crate::Config::new(&broker.host, broker.port);
@@ -27,6 +28,7 @@ async fn test_session_lifetime_ms_parsed() {
 #[tokio::test]
 #[tracing_test::traced_test]
 async fn test_connection_survives_reauth() {
+    let _ = tracing_subscriber::fmt::try_init();
     let broker = helpers::sasl_reauth_broker().await;
 
     let config = crate::Config::new(&broker.host, broker.port);

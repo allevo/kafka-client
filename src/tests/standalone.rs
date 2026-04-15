@@ -6,12 +6,14 @@ use super::helpers;
 
 #[tokio::test]
 async fn test_standalone_plaintext() {
+    let _ = tracing_subscriber::fmt::try_init();
     let broker = helpers::plaintext_broker().await;
     helpers::assert_tcp_reachable(&broker.host, broker.port).await;
 }
 
 #[tokio::test]
 async fn test_standalone_api_versions() {
+    let _ = tracing_subscriber::fmt::try_init();
     let broker = helpers::plaintext_broker().await;
 
     let config = crate::Config::new(&broker.host, broker.port);
@@ -29,6 +31,7 @@ async fn test_standalone_api_versions() {
 
 #[tokio::test]
 async fn test_standalone_fetch_metadata() {
+    let _ = tracing_subscriber::fmt::try_init();
     let broker = helpers::plaintext_broker().await;
 
     let config = crate::Config::new(&broker.host, broker.port);
@@ -51,6 +54,7 @@ async fn test_standalone_fetch_metadata() {
 
 #[tokio::test]
 async fn test_standalone_cluster_client() {
+    let _ = tracing_subscriber::fmt::try_init();
     let broker = helpers::plaintext_broker().await;
 
     let bootstrap = [crate::Config::new(&broker.host, broker.port)];
@@ -71,6 +75,7 @@ async fn test_standalone_cluster_client() {
 
 #[tokio::test]
 async fn test_standalone_create_topic() {
+    let _ = tracing_subscriber::fmt::try_init();
     let broker = helpers::plaintext_broker().await;
 
     let bootstrap = [crate::Config::new(&broker.host, broker.port)];

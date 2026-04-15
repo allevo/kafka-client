@@ -6,6 +6,7 @@ use super::helpers;
 
 #[tokio::test]
 async fn idle_happy_path_under_load() {
+    let _ = tracing_subscriber::fmt::try_init();
     // Tight loop of metadata requests must keep the connection alive:
     // every response bumps `last_activity`, so the idle arm never fires.
     let broker = helpers::plaintext_broker().await;
@@ -31,6 +32,7 @@ async fn idle_happy_path_under_load() {
 
 #[tokio::test]
 async fn idle_close_fires_when_connection_is_idle() {
+    let _ = tracing_subscriber::fmt::try_init();
     let broker = helpers::plaintext_broker().await;
 
     let config = crate::Config::new(&broker.host, broker.port)
@@ -66,6 +68,7 @@ async fn idle_close_fires_when_connection_is_idle() {
 
 #[tokio::test]
 async fn idle_disabled_never_closes() {
+    let _ = tracing_subscriber::fmt::try_init();
     let broker = helpers::plaintext_broker().await;
 
     let config = crate::Config::new(&broker.host, broker.port);
