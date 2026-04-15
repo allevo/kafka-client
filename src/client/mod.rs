@@ -442,14 +442,26 @@ impl Client {
         Ok(metadata)
     }
 
-    /// Clean up connections & replace metadata. Pruned slots drop their
-    /// `Slot::Dialing` variant (if any), which aborts the background
-    /// dialer — callers parked on its inbox wake with a closed-channel
-    /// error and return promptly.
+    /// Clean up connections & replace metadata. Pruned `Slot::Resolved`
+    /// entries are signalled via `BrokerClient::shutdown` so their
+    /// read/write/reauth tasks exit instead of running on against a broker
+    /// the cluster no longer recognizes; pruned `Slot::Dialing` entries
+    /// drop their `AbortOnDrop`, which aborts the background dialer so
+    /// callers parked on its inbox wake with a closed-channel error.
     fn apply_metadata_snapshot(&self, snap: MetadataSnapshot) {
         {
             let mut conns = self.inner.connections.lock().unwrap();
-            conns.retain(|id, _| snap.brokers.contains_key(id));
+            conns.retain(|id, slot| {
+                if snap.brokers.contains_key(id) {
+                    return true;
+                }
+                match slot {
+                    Slot::Resolved(broker) => broker.shutdown(),
+                    // AbortOnDrop fires when the slot is dropped below.
+                    Slot::Dialing { .. } => {}
+                }
+                false
+            });
         }
         // Atomic publish: concurrent readers either see the old or the new
         // snapshot, never a torn view.

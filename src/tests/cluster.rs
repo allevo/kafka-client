@@ -239,6 +239,96 @@ async fn test_broker_removed_from_metadata_is_pruned() {
     assert!(matches!(result, Err(Error::NoBrokerAvailable(_))));
 }
 
+/// Pruning a broker from the metadata snapshot must also tear down its
+/// background `read_task`, `write_task`, and `reauth_task`. Dropping the
+/// cached `BrokerClient` from the connection map is not enough on its own —
+/// `reauth_task` holds its own clone of the request channel, so without an
+/// explicit `shutdown()` the connection survives until the broker-side idle
+/// timeout.
+///
+/// We use the SASL re-auth broker so that `reauth_task` is actually spawned
+/// (it only runs when the broker advertises a session lifetime), then assert
+/// via `tracing_test` that all three task-exit log lines fire after a
+/// metadata prune.
+#[tokio::test]
+#[tracing_test::traced_test]
+async fn test_pruned_broker_tasks_are_torn_down() {
+    let _ = tracing_subscriber::fmt::try_init();
+
+    let broker = helpers::sasl_reauth_broker().await;
+    let auth = crate::Auth::Plain {
+        username: "admin".into(),
+        password: crate::SecretString::new("admin-secret".into()),
+    };
+    let bootstrap = [crate::Config::new(&broker.host, broker.port)];
+    // The SASL container advertises an internal hostname in its metadata that
+    // is not reachable from the test host. Route every broker-id lookup back
+    // to the container's external address — the mapping `connected_3node_client`
+    // uses for the plaintext cluster, adapted for a single node.
+    let ext_host = broker.host.clone();
+    let ext_port = broker.port;
+    let client = crate::Client::connect_with_resolver(
+        &bootstrap,
+        crate::Security::Plaintext,
+        auth,
+        move |_node_id, _host, _port| Ok((ext_host.clone(), ext_port)),
+    )
+    .await
+    .unwrap();
+
+    // Force a `Slot::Resolved` for the controller so we have something to
+    // prune. `Client::connect_inner` only seeds the bootstrap broker when its
+    // wire address matches a metadata entry verbatim; with the SASL container
+    // those addresses don't line up, so we dial explicitly. `BrokerClient::new`
+    // spawns `reauth_task` for any SASL broker that advertises a session
+    // lifetime — give it a moment to land its first "sleeping" log so we know
+    // it's actually running before we prune.
+    let bootstrap_id = client.controller_id();
+    let _b = client.broker(bootstrap_id).await.unwrap();
+    assert!(client.has_connection_slot(bootstrap_id));
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert!(
+        logs_contain("re-auth task sleeping"),
+        "reauth_task never started; the test's preconditions are wrong"
+    );
+
+    // Prune the cached broker by publishing an empty metadata snapshot. The
+    // fix under test is in `apply_metadata_snapshot`, which must call
+    // `BrokerClient::shutdown()` on every removed `Slot::Resolved`.
+    client.replace_metadata_for_test(BrokerId(0), vec![]);
+    assert!(!client.has_connection_slot(bootstrap_id));
+
+    // shutdown() is synchronous but read/write/reauth exit asynchronously.
+    // Poll the captured logs instead of guessing a sleep duration.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while std::time::Instant::now() < deadline {
+        if logs_contain("read task exiting")
+            && logs_contain("write task exiting")
+            && logs_contain("reauth task observed shutdown, exiting")
+        {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+
+    assert!(
+        logs_contain("client requested shutdown"),
+        "read_task never observed the shutdown notify after the prune"
+    );
+    assert!(
+        logs_contain("read task exiting"),
+        "read_task did not exit after the prune"
+    );
+    assert!(
+        logs_contain("write task exiting"),
+        "write_task did not exit after the prune"
+    );
+    assert!(
+        logs_contain("reauth task observed shutdown, exiting"),
+        "reauth_task did not exit after the prune"
+    );
+}
+
 /// When a broker connection silently dies, `read_task` flips the shutdown
 /// flag on the cached `BrokerClient`. The fast path used to keep handing
 /// that corpse out forever, so every subsequent request would fail with
