@@ -9,6 +9,7 @@ use tokio::net::TcpStream;
 use tokio::time::timeout;
 use tokio_rustls::TlsConnector;
 
+use kafka_protocol::ResponseError;
 use kafka_protocol::messages::api_versions_response::ApiVersion;
 use kafka_protocol::messages::{
     ApiVersionsRequest, ApiVersionsResponse, RequestHeader, ResponseHeader,
@@ -58,10 +59,7 @@ impl Connection {
                     tracing::debug!(host = %config.host, "starting TLS handshake");
                     let server_name = rustls::pki_types::ServerName::try_from(config.host.as_str())
                         .map_err(|_| {
-                            Error::ProtocolError(format!(
-                                "invalid TLS server name: {}",
-                                config.host
-                            ))
+                            Error::Config(format!("invalid TLS server name: {}", config.host))
                         })?
                         .to_owned();
                     let connector = TlsConnector::from(tls_config);
@@ -118,10 +116,8 @@ impl Connection {
         decode_response_header(&mut response_bytes, resp_header_version, *correlation_id)?;
         let versions_response = ApiVersionsResponse::decode(&mut response_bytes, api_version)?;
 
-        if versions_response.error_code != 0 {
-            return Err(Error::ApiError {
-                error_code: versions_response.error_code,
-            });
+        if let Some(error) = ResponseError::try_from_code(versions_response.error_code) {
+            return Err(Error::Broker { error });
         }
 
         let api_versions = versions_response.api_keys;
@@ -198,7 +194,7 @@ fn encode_request<R: Encodable + HeaderVersion>(
 
     let mut buf = BytesMut::with_capacity(4 + size);
     let Ok(size) = i32::try_from(size) else {
-        return Err(Error::ProtocolError(format!(
+        return Err(Error::Protocol(format!(
             "Request too large for a i32 sized request: {size}"
         )));
     };
@@ -215,7 +211,7 @@ async fn read_response(stream: &mut Stream, max_response_size: usize) -> Result<
     let response_size = i32::from_be_bytes(size_buf);
 
     if response_size <= 0 || response_size as usize > max_response_size {
-        return Err(Error::ProtocolError(format!(
+        return Err(Error::Protocol(format!(
             "invalid response size: {response_size}"
         )));
     }
@@ -233,7 +229,7 @@ fn decode_response_header(
 ) -> Result<()> {
     let resp_header = ResponseHeader::decode(buf, header_version)?;
     if resp_header.correlation_id != expected_correlation_id {
-        return Err(Error::ProtocolError(format!(
+        return Err(Error::Protocol(format!(
             "correlation id mismatch: expected {expected_correlation_id}, got {}",
             resp_header.correlation_id
         )));

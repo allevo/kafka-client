@@ -153,8 +153,7 @@ impl Client {
             }
         }
 
-        Err(last_err
-            .unwrap_or_else(|| Error::ProtocolError("no bootstrap brokers provided".into())))
+        Err(last_err.unwrap_or_else(|| Error::Config("no bootstrap brokers provided".into())))
     }
 
     pub async fn controller(&self) -> Result<BrokerClient> {
@@ -206,7 +205,7 @@ impl Client {
         let (host, port) = {
             let snap = self.inner.metadata.load();
             let info = snap.brokers.get(&node_id).ok_or_else(|| {
-                Error::ProtocolError(format!("unknown broker node_id: {}", node_id.0))
+                Error::NoBrokerAvailable(format!("unknown broker node_id: {}", node_id.0))
             })?;
             (info.host.clone(), info.port)
         };
@@ -268,7 +267,7 @@ impl Client {
         // cycles.
         match rx.await {
             Ok(client) => Ok(client),
-            Err(_) => Err(Error::ProtocolError("broker dial cancelled".into())),
+            Err(_) => Err(Error::NoBrokerAvailable("broker dial cancelled".into())),
         }
     }
 
@@ -297,7 +296,7 @@ impl Client {
             snap.brokers.keys().copied().collect()
         };
         if ids.is_empty() {
-            return Err(Error::ProtocolError("no known brokers".into()));
+            return Err(Error::NoBrokerAvailable("no known brokers".into()));
         }
 
         let mut last_err = None;
@@ -317,7 +316,7 @@ impl Client {
                 Err(e) => last_err = Some(e),
             }
         }
-        Err(last_err.unwrap_or_else(|| Error::ProtocolError("no reachable brokers".into())))
+        Err(last_err.unwrap_or_else(|| Error::NoBrokerAvailable("no reachable brokers".into())))
     }
 
     pub async fn refresh_metadata(&self) -> Result<MetadataResponse> {
@@ -433,7 +432,7 @@ fn resolve_address(
         Some(f) => f(node_id, host, port),
         None => {
             let Ok(port) = u16::try_from(port) else {
-                return Err(Error::ProtocolError(format!(
+                return Err(Error::Config(format!(
                     "Cannot convert {port} port number to u16"
                 )));
             };

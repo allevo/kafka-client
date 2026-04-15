@@ -197,7 +197,7 @@ async fn test_broker_unknown_id_does_not_pollute_connections() {
 
     let before = client.connection_slot_count();
     let result = client.broker(BrokerId(9999)).await;
-    assert!(matches!(result, Err(Error::ProtocolError(_))));
+    assert!(matches!(result, Err(Error::NoBrokerAvailable(_))));
     let after = client.connection_slot_count();
     assert_eq!(
         before, after,
@@ -236,7 +236,7 @@ async fn test_broker_removed_from_metadata_is_pruned() {
 
     // Subsequent dials for the departed id must fail metadata validation.
     let result = client.broker(BrokerId(2)).await;
-    assert!(matches!(result, Err(Error::ProtocolError(_))));
+    assert!(matches!(result, Err(Error::NoBrokerAvailable(_))));
 }
 
 /// When a broker connection silently dies, `read_task` flips the shutdown

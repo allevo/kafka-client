@@ -34,5 +34,5 @@ async fn test_standalone_sasl_plaintext_bad_credentials() {
         .await
         .unwrap();
     let result = crate::BrokerClient::new(conn, auth).await;
-    assert!(matches!(result, Err(crate::Error::AuthenticationError(_))));
+    assert!(matches!(result, Err(crate::Error::Authentication(_))));
 }

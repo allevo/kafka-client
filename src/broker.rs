@@ -359,7 +359,7 @@ impl BrokerClient {
             .iter()
             .any(|v| v.api_key == ApiKey::SaslAuthenticate as i16);
         if !has_handshake || !has_authenticate {
-            return Err(Error::AuthenticationError(
+            return Err(Error::Authentication(
                 "broker does not support SASL authentication (missing API key 17 or 36)".into(),
             ));
         }
@@ -373,7 +373,7 @@ impl BrokerClient {
             )
             .await?;
         if handshake_resp.error_code != 0 {
-            return Err(Error::AuthenticationError(format!(
+            return Err(Error::Authentication(format!(
                 "SASL handshake failed with error code: {}",
                 handshake_resp.error_code
             )));
@@ -397,7 +397,7 @@ impl BrokerClient {
                 .error_message
                 .map(|s| s.to_string())
                 .unwrap_or_else(|| format!("error code: {}", auth_resp.error_code));
-            return Err(Error::AuthenticationError(msg));
+            return Err(Error::Authentication(msg));
         }
 
         let session_lifetime_ms = auth_resp.session_lifetime_ms;
@@ -423,14 +423,14 @@ fn negotiate_version(api_versions: &[ApiVersion], api_key: ApiKey, desired: i16)
         .iter()
         .find(|v| v.api_key == api_key as i16)
         .ok_or_else(|| {
-            Error::ProtocolError(format!(
+            Error::Protocol(format!(
                 "broker does not support API {:?} (key {})",
                 api_key, api_key as i16,
             ))
         })?;
     let version = desired.min(range.max_version);
     if version < range.min_version {
-        return Err(Error::ProtocolError(format!(
+        return Err(Error::Protocol(format!(
             "API {:?}: broker supports versions {}..={}, but client needs version {}",
             api_key, range.min_version, range.max_version, desired,
         )));
