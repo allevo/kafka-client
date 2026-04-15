@@ -7,7 +7,6 @@ use arc_swap::ArcSwap;
 use kafka_protocol::messages::{BrokerId, MetadataResponse};
 use tokio::sync::oneshot;
 use tokio::task::AbortHandle;
-use tracing::warn;
 
 use crate::admin::AdminClient;
 use crate::broker::{Auth, BrokerClient};
@@ -33,8 +32,9 @@ struct MetadataSnapshot {
     brokers: HashMap<BrokerId, BrokerInfo>,
 }
 
-/// Accumulator for keep track which callers will be awaked for 
-/// a given broker id. On success, all senders are notified.
+/// Accumulator to track which callers will be awakened for a given
+/// broker id. On success, all senders are notified; on dial failure,
+/// senders stay parked.
 type Inbox = Arc<Mutex<Vec<oneshot::Sender<BrokerClient>>>>;
 
 /// Kills the wrapped task when this value is dropped.
@@ -46,14 +46,15 @@ impl Drop for AbortOnDrop {
     }
 }
 
-/// Describe the status per-broker:
+/// Describes the status per broker:
 ///
-/// - `Resolved` — living `BrokerClient`. The happy path
-///   in `Client::broker` finds it here and clones.
-///   NB: It may be shut down.
-/// - `Dialing` — a background task is already running to create a valid connection
-///   A new caller wants to push own `oneshot::Sender` onto
-///   `inbox` and await it.
+/// - `Resolved` — living `BrokerClient`. The happy path in
+///   `Client::broker` finds it here and clones. NB: it may be shut
+///   down; in that case the next `broker(id)` call evicts and respawns
+///   a dialer.
+/// - `Dialing` — a background task is already running to establish a
+///   connection. A new caller pushes its own `oneshot::Sender` onto
+///   `inbox` and awaits it.
 enum Slot {
     Resolved(BrokerClient),
     Dialing {
@@ -212,11 +213,13 @@ impl Client {
             }
 
             // Cold path:
-            // - absent slot: spawn dialer with the oneshot sender
-            // - an existing `Dialing`: add the oneshot sender to the list
-            // - an existing `Resolver`: it is dead, so (almost) the same as the "absent slot" case
-            // In case a new dialer is spawn, a background tokio task is spawn
-            // in which there's implemented the retry loop logic.
+            // - absent slot: spawn dialer with the oneshot sender.
+            // - an existing `Dialing`: add the oneshot sender to the list.
+            // - an existing `Resolved`: it is shut down, so we evict and
+            //   respawn a dialer — almost like the absent-slot case.
+            // Both spawn branches call `spawn_dialer` while still holding
+            // the map mutex — see the `spawn_dialer` doc for the race
+            // this closes.
             let (tx, rx) = oneshot::channel();
             match map.entry(node_id) {
                 Entry::Occupied(mut e) => match e.get_mut() {
@@ -224,7 +227,7 @@ impl Client {
                         inbox.lock().unwrap().push(tx);
                     }
                     Slot::Resolved(s) => {
-                        assert!(s.is_shutdown(), "Broker Client is shot down");
+                        assert!(s.is_shutdown(), "BrokerClient is shut down");
 
                         let inbox: Inbox = Arc::new(Mutex::new(vec![tx]));
                         let abort =
@@ -248,6 +251,12 @@ impl Client {
             rx
         };
 
+        // The dialer only sends on success. `Err` here means the
+        // oneshot sender was dropped without a value — the dialer task
+        // was aborted (via `close()` or metadata pruning) or the slot
+        // was replaced out from under us. Permanent dial failures do
+        // NOT surface here; they keep the waiter parked across retry
+        // cycles.
         match rx.await {
             Ok(client) => Ok(client),
             Err(_) => Err(Error::ProtocolError("broker dial cancelled".into())),
@@ -404,10 +413,16 @@ impl Client {
     }
 }
 
-/// Spawn a `perform_backoff_retry` task for `node_id`.
+/// Spawn a `perform_backoff_retry` task for `node_id` and return an
+/// `AbortOnDrop` handle that cancels it when dropped.
 ///
-/// Returns a structure to abort the spawned task when dropped.
-/// NB: be sure to call this function holding the connections-map mutex.
+/// NB: caller must hold the connections-map mutex.
+/// Without it, this function opens a double-spawn race:
+/// two concurrent callers each observe "no slot",
+/// each spawn a dialer, and each try to install `Slot::Dialing` —
+/// whichever insert lands second orphans the first dialer's
+/// `AbortOnDrop` inside the clobbered slot, so nothing aborts the
+/// orphan until `close()`.
 fn spawn_dialer(
     inner: &ClientInner,
     node_id: BrokerId,
@@ -446,7 +461,29 @@ fn spawn_dialer(
     AbortOnDrop(handle.abort_handle())
 }
 
-/// Background dialer loop for the given broker id.
+/// Background dialer loop for a single broker id.
+///
+/// Owns the entire retry state machine: sleep, dial, success
+/// notify. Runs until one of:
+///
+/// - **Success.** Notify every waiter a new the `BrokerClient` is connected,
+///   overwrites the slot with `Slot::Resolved`, returns.
+/// - **No waiters left.** After a sleep cycle, the inbox contains
+///   only closed senders (every caller gave up) — remove the slot and
+///   return. A subsequent `broker(id)` call respawns a fresh dialer.
+/// - **Slot replaced.** `slot_is_ours` is false (metadata pruning +
+///   respawn installed a fresh dialer for this id). Abandon silently.
+/// - **Client gone.** `Weak::upgrade` fails — the entire `Client` has
+///   been dropped.
+/// - **Abort.** `close()` or metadata pruning drops the
+///   `Slot::Dialing`, firing `AbortOnDrop` and cancelling this task at
+///   its next await.
+///
+/// A failed dial simply logs, bumps `times`, and loops. The oneshot
+/// senders in the inbox are untouched, so parked callers stay
+/// `Pending` across any number of failed cycles. The only way a caller
+/// observes failure is if they cancel their own future, or if the
+/// dialer is aborted.
 #[allow(clippy::too_many_arguments)]
 async fn perform_backoff_retry(
     inbox: Inbox,
@@ -464,14 +501,13 @@ async fn perform_backoff_retry(
     let mut times: u32 = initial_times;
 
 
-    // The loop:
-    // - success: lock the map and replace the slot with `Slot::Reesolved`.
-    //             Notify all the waiters.
-    // - fails: retry with a backoff
-    // 
-    // NB: if the waiters list is empty, the loop exited because no one is asking
-    // for this broker anymore.
-    //
+    // Loop outcomes per iteration:
+    // - success: under the map mutex, fan out the client to all
+    //   waiters and replace the slot with `Slot::Resolved`.
+    // - failure: log, bump `times`, loop back into the sleep.
+    //   Waiters stay parked (Java semantics).
+    // - no waiters: after a sleep cycle, if every sender in the
+    //   inbox is closed (callers gave up), remove the slot and exit.
     loop {
         if times > 0 {
             tokio::time::sleep(next_backoff(times, base, max)).await;
@@ -481,15 +517,14 @@ async fn perform_backoff_retry(
             };
             let mut map = map_arc.lock().unwrap();
 
-            // If metadata changed, we stop to deal with this broker
+            // Metadata pruning + respawn may have replaced our slot
+            // while we slept.
             if !slot_is_ours(&map, node_id, &inbox) {
                 return;
             }
             {
+                // NB: still keep map lock; it is important
                 let mut guard = inbox.lock().unwrap();
-                // Remove all "old" waiters. They may go await after waiting a while
-                // If the vec is empty, it means no waiters are there.
-                // Therefore, we can exit.
                 guard.retain(|tx| !tx.is_closed());
                 if guard.is_empty() {
                     map.remove(&node_id);
