@@ -12,7 +12,7 @@ use crate::admin::AdminClient;
 use crate::broker::{Auth, BrokerClient};
 use crate::config::{Config, Security};
 use crate::connection::Connection;
-use crate::error::{Error, Result};
+use crate::error::{Error, Result, RetryAction};
 
 /// Which broker `Client::send` should route a request to.
 ///
@@ -26,7 +26,6 @@ pub enum NodeTarget {
 
 mod retry;
 
-#[cfg(test)]
 pub(crate) use retry::next_backoff;
 use retry::{ConnectionMap, Inbox, Slot, spawn_dialer};
 
@@ -60,6 +59,12 @@ struct ClientInner {
 
     reconnect_backoff: Duration,
     reconnect_backoff_max: Duration,
+
+    request_timeout: Duration,
+    api_timeout: Duration,
+    retries: u32,
+    retry_backoff: Duration,
+    retry_backoff_max: Duration,
 
     metadata: ArcSwap<MetadataSnapshot>,
 
@@ -133,6 +138,11 @@ impl Client {
                         address_resolver,
                         reconnect_backoff: config.reconnect_backoff,
                         reconnect_backoff_max: config.reconnect_backoff_max,
+                        request_timeout: config.request_timeout,
+                        api_timeout: config.api_timeout,
+                        retries: config.retries,
+                        retry_backoff: config.retry_backoff,
+                        retry_backoff_max: config.retry_backoff_max,
                         metadata: ArcSwap::new(Arc::new(MetadataSnapshot {
                             controller_id: metadata.controller_id,
                             brokers,
@@ -180,14 +190,104 @@ impl Client {
         Req: Encodable + HeaderVersion + Send + 'static,
         Resp: Decodable + HeaderVersion,
     {
-        let broker = match target {
-            NodeTarget::Controller => self.controller().await?,
-            NodeTarget::AnyBroker => self.any_broker().await?,
-            NodeTarget::Broker(id) => self.broker(id).await?,
+        let api_deadline = tokio::time::Instant::now() + self.inner.api_timeout;
+        let mut attempt: u32 = 0;
+
+        loop {
+            let now = tokio::time::Instant::now();
+            if now >= api_deadline {
+                return Err(Error::RequestTimeout("api_timeout exhausted".into()));
+            }
+
+            let per_attempt = (now + self.inner.request_timeout).min(api_deadline);
+
+            match self
+                .send_once(per_attempt, &target, api_key, max_version, &build)
+                .await
+            {
+                Ok(resp) => return Ok(resp),
+                Err(e) => {
+                    if attempt >= self.inner.retries {
+                        return Err(e);
+                    }
+                    match e.classify() {
+                        RetryAction::Fatal | RetryAction::Abortable => return Err(e),
+                        RetryAction::RefreshMetadata => {
+                            // Refresh metadata almost ignoring errors
+                            match tokio::time::timeout_at(api_deadline, self.refresh_metadata())
+                                .await
+                            {
+                                Ok(Ok(_)) => {}
+                                Ok(Err(refresh_err)) if refresh_err.is_fatal() => {
+                                    return Err(refresh_err);
+                                }
+                                Ok(Err(_)) => {}
+                                // timeout
+                                Err(_) => {}
+                            }
+                        }
+                        RetryAction::Retry => {}
+                    }
+                    attempt = attempt.saturating_add(1);
+
+                    let backoff = next_backoff(
+                        attempt,
+                        self.inner.retry_backoff,
+                        self.inner.retry_backoff_max,
+                    );
+                    let sleep_until = (tokio::time::Instant::now() + backoff).min(api_deadline);
+                    tokio::time::sleep_until(sleep_until).await;
+                }
+            }
+        }
+    }
+
+    /// Single attempt of `send`.
+    async fn send_once<Req, Resp>(
+        &self,
+        deadline: tokio::time::Instant,
+        target: &NodeTarget,
+        api_key: ApiKey,
+        max_version: i16,
+        build: impl Fn(i16) -> Req,
+    ) -> Result<Resp>
+    where
+        Req: Encodable + HeaderVersion + Send + 'static,
+        Resp: Decodable + HeaderVersion,
+    {
+        // Acquisition phase — covers controller()/any_broker()/broker(id).
+        let broker = match tokio::time::timeout_at(deadline, async {
+            match target {
+                NodeTarget::Controller => self.controller().await,
+                NodeTarget::AnyBroker => self.any_broker().await,
+                NodeTarget::Broker(id) => self.broker(*id).await,
+            }
+        })
+        .await
+        {
+            Ok(r) => r?,
+            Err(_) => {
+                return Err(Error::RequestTimeout(
+                    "broker acquisition exceeded request_timeout".into(),
+                ));
+            }
         };
+
         let version = broker.negotiate_version(api_key, max_version)?;
         let request = build(version);
-        broker.send(api_key, version, request).await
+
+        // Wire phase.
+        match tokio::time::timeout_at(deadline, broker.send(api_key, version, request)).await {
+            Ok(r) => r,
+            Err(_) => {
+                // Intentionally do NOT manually evict the slot:
+                // `Client::broker` will auto-evict it next retry
+                broker.shutdown();
+                Err(Error::RequestTimeout(
+                    "in-flight request exceeded request_timeout".into(),
+                ))
+            }
+        }
     }
 
     /// Return a usable `BrokerClient` for `node_id`.

@@ -9,7 +9,17 @@ pub enum Error {
     Config(String),
     NoBrokerAvailable(String),
     Authentication(String),
-    Broker { error: ResponseError },
+    Broker {
+        error: ResponseError,
+    },
+    /// The per-request budget (`Config::request_timeout`) or the wrapping
+    /// retry loop's `api_timeout` elapsed while the request was in flight.
+    /// Classified as `RefreshMetadata`: a stalled node is treated like a
+    /// disconnect, matching Java's `NetworkException` routing. We do not
+    /// reuse `io::ErrorKind::TimedOut` here because that kind is `Retry`
+    /// for generic I/O, while a request-budget expiry specifically implies
+    /// "topology is suspect, re-resolve before retrying".
+    RequestTimeout(String),
 }
 
 /// How a failed request should be handled by a retry loop.
@@ -48,6 +58,7 @@ impl Error {
             Error::NoBrokerAvailable(_) => RetryAction::RefreshMetadata,
             Error::Authentication(_) => RetryAction::Fatal,
             Error::Broker { error } => classify_response_error(*error),
+            Error::RequestTimeout(_) => RetryAction::RefreshMetadata,
         }
     }
 
@@ -163,6 +174,7 @@ impl fmt::Display for Error {
             Error::NoBrokerAvailable(msg) => write!(f, "no broker available: {msg}"),
             Error::Authentication(msg) => write!(f, "authentication error: {msg}"),
             Error::Broker { error } => write!(f, "broker error: {error}"),
+            Error::RequestTimeout(msg) => write!(f, "request timeout: {msg}"),
         }
     }
 }
@@ -240,6 +252,14 @@ mod tests {
     #[test]
     fn authentication_is_fatal() {
         assert!(Error::Authentication("nope".into()).is_fatal());
+    }
+
+    #[test]
+    fn request_timeout_requests_metadata_refresh() {
+        assert_eq!(
+            Error::RequestTimeout("budget elapsed".into()).classify(),
+            RetryAction::RefreshMetadata,
+        );
     }
 
     #[test]
@@ -340,6 +360,7 @@ mod tests {
             Error::Config("x".into()),
             Error::NoBrokerAvailable("x".into()),
             Error::Authentication("x".into()),
+            Error::RequestTimeout("x".into()),
             broker(ResponseError::NotLeaderOrFollower),
             broker(ResponseError::RequestTimedOut),
             broker(ResponseError::TransactionAbortable),
