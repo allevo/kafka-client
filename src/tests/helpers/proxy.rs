@@ -63,6 +63,9 @@ pub enum Fault {
     CorruptByte { offset: usize, value: u8 },
 }
 
+pub type RequestHook = Arc<dyn Fn(&RequestView<'_>) -> Option<Fault> + Send + Sync>;
+pub type ResponseHook = Arc<dyn Fn(&ResponseView<'_>) -> Option<Fault> + Send + Sync>;
+
 /// Hooks invoked for each frame in each direction. Returning `Some(Fault)`
 /// short-circuits forwarding; returning `None` lets the frame through.
 ///
@@ -70,8 +73,8 @@ pub enum Fault {
 /// without re-parameterizing the `Proxy` type.
 #[derive(Clone, Default)]
 pub struct FaultPlan {
-    pub on_request: Option<Arc<dyn Fn(&RequestView<'_>) -> Option<Fault> + Send + Sync>>,
-    pub on_response: Option<Arc<dyn Fn(&ResponseView<'_>) -> Option<Fault> + Send + Sync>>,
+    pub on_request: Option<RequestHook>,
+    pub on_response: Option<ResponseHook>,
 }
 
 impl FaultPlan {

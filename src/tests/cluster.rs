@@ -40,7 +40,7 @@ async fn connected_3node_client() -> (crate::Client, HashMap<BrokerId, (String, 
 async fn test_cluster_plaintext() {
     let cluster = helpers::plaintext_cluster().await;
 
-    for (_node_id, (host, port)) in &cluster.addr_map {
+    for (host, port) in cluster.addr_map.values() {
         helpers::assert_tcp_reachable(host, *port).await;
     }
 }
