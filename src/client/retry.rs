@@ -6,10 +6,10 @@ use kafka_protocol::messages::BrokerId;
 use tokio::sync::oneshot;
 use tokio::task::AbortHandle;
 
+use crate::broker::Auth;
 use crate::broker::BrokerClient;
 use crate::config::{Config, Security};
 use crate::connection::Connection;
-use crate::broker::Auth;
 use crate::error::Result;
 
 use super::ClientInner;
@@ -134,7 +134,6 @@ async fn perform_backoff_retry(
     initial_times: u32,
 ) {
     let mut times: u32 = initial_times;
-
 
     // Loop outcomes per iteration:
     // - success: under the map mutex, fan out the client to all

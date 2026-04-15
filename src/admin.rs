@@ -29,16 +29,11 @@ impl AdminClient {
         // controller, but targeting the controller directly is still canonical in
         // the other clients.
         self.client
-            .send(
-                NodeTarget::Controller,
-                ApiKey::CreateTopics,
-                2,
-                move |_| {
-                    CreateTopicsRequest::default()
-                        .with_topics(topics.clone())
-                        .with_timeout_ms(timeout_ms)
-                },
-            )
+            .send(NodeTarget::Controller, ApiKey::CreateTopics, 2, move |_| {
+                CreateTopicsRequest::default()
+                    .with_topics(topics.clone())
+                    .with_timeout_ms(timeout_ms)
+            })
             .await
     }
 }

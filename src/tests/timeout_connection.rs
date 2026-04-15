@@ -40,7 +40,8 @@ async fn timeout_setup_expires_on_plain_tcp_stall() {
     .await;
     let elapsed = started.elapsed();
 
-    let inner = result.expect("Connection::connect hung past the outer guard — setup timeout is not wired");
+    let inner =
+        result.expect("Connection::connect hung past the outer guard — setup timeout is not wired");
     // `Connection` doesn't implement Debug, so we can't use `expect_err`.
     let err = match inner {
         Ok(_) => panic!("expected Connection::connect to time out, got Ok"),

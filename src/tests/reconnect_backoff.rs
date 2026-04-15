@@ -74,19 +74,14 @@ fn timing_drop_plan(times: Arc<Mutex<Vec<Instant>>>) -> FaultPlan {
 /// still work if the test needs them.
 const SYNTH_ID: BrokerId = BrokerId(9999);
 
-async fn client_through_proxy(
-    proxy: &ProxyHandle,
-    base: Duration,
-    max: Duration,
-) -> crate::Client {
+async fn client_through_proxy(proxy: &ProxyHandle, base: Duration, max: Duration) -> crate::Client {
     let broker = helpers::plaintext_broker().await;
     let bootstrap = [crate::Config::new(&broker.host, broker.port)
         .with_reconnect_backoff(base)
         .with_reconnect_backoff_max(max)];
-    let client =
-        crate::Client::connect(&bootstrap, crate::Security::Plaintext, crate::Auth::None)
-            .await
-            .unwrap();
+    let client = crate::Client::connect(&bootstrap, crate::Security::Plaintext, crate::Auth::None)
+        .await
+        .unwrap();
 
     // Publish the synthetic id alongside the real broker. Keep the real
     // broker in metadata so `any_broker` / `refresh_metadata` remain
@@ -140,12 +135,8 @@ async fn backoff_formula_stays_within_jitter_bounds() {
 async fn gate_arms_after_first_failure() {
     let broker = helpers::plaintext_broker().await;
     let times = Arc::new(Mutex::new(Vec::<Instant>::new()));
-    let proxy = helpers::proxy::start(
-        &broker.host,
-        broker.port,
-        timing_drop_plan(times.clone()),
-    )
-    .await;
+    let proxy =
+        helpers::proxy::start(&broker.host, broker.port, timing_drop_plan(times.clone())).await;
 
     let base = Duration::from_millis(500);
     let client = client_through_proxy(&proxy, base, Duration::from_secs(10)).await;
@@ -189,12 +180,8 @@ async fn gate_arms_after_first_failure() {
 async fn exponential_growth_caps_at_max() {
     let broker = helpers::plaintext_broker().await;
     let times = Arc::new(Mutex::new(Vec::<Instant>::new()));
-    let proxy = helpers::proxy::start(
-        &broker.host,
-        broker.port,
-        timing_drop_plan(times.clone()),
-    )
-    .await;
+    let proxy =
+        helpers::proxy::start(&broker.host, broker.port, timing_drop_plan(times.clone())).await;
 
     let base = Duration::from_millis(100);
     let max = Duration::from_millis(1_000);
@@ -245,12 +232,8 @@ async fn exponential_growth_caps_at_max() {
 async fn success_resets_backoff_state() {
     let broker = helpers::plaintext_broker().await;
     let times = Arc::new(Mutex::new(Vec::<Instant>::new()));
-    let proxy = helpers::proxy::start(
-        &broker.host,
-        broker.port,
-        timing_drop_plan(times.clone()),
-    )
-    .await;
+    let proxy =
+        helpers::proxy::start(&broker.host, broker.port, timing_drop_plan(times.clone())).await;
 
     let base = Duration::from_millis(300);
     let client = client_through_proxy(&proxy, base, Duration::from_secs(10)).await;

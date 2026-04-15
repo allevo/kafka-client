@@ -26,9 +26,9 @@ pub enum NodeTarget {
 
 mod retry;
 
-use retry::{ConnectionMap, Inbox, Slot, spawn_dialer};
 #[cfg(test)]
 pub(crate) use retry::next_backoff;
+use retry::{ConnectionMap, Inbox, Slot, spawn_dialer};
 
 /// Translates broker addresses from metadata into actual connectable addresses.
 ///
@@ -212,15 +212,13 @@ impl Client {
         };
 
         let rx = {
-            let mut map = self.inner.connections
-                .lock()
-                .unwrap();
+            let mut map = self.inner.connections.lock().unwrap();
 
             // Fast path: live cached client.
-            if let Some(Slot::Resolved(c)) = map.get(&node_id) {
-                if !c.is_shutdown() {
-                    return Ok(c.clone());
-                }
+            if let Some(Slot::Resolved(c)) = map.get(&node_id)
+                && !c.is_shutdown()
+            {
+                return Ok(c.clone());
             }
 
             // Cold path:
@@ -280,10 +278,11 @@ impl Client {
             let metadata = self.inner.metadata.load();
             let map = self.inner.connections.lock().unwrap();
             for (broker_id, slot) in map.iter() {
-                if let Slot::Resolved(broker) = slot {
-                    if !broker.is_shutdown() && metadata.brokers.contains_key(broker_id) {
-                        return Ok(broker.clone());
-                    }
+                if let Slot::Resolved(broker) = slot
+                    && !broker.is_shutdown()
+                    && metadata.brokers.contains_key(broker_id)
+                {
+                    return Ok(broker.clone());
                 }
             }
         }
@@ -411,7 +410,7 @@ impl Client {
                 Slot::Dialing { abort_on_drop, .. } => {
                     // The following drop will drop the background retry task.
                     drop(abort_on_drop);
-                },
+                }
             }
         }
     }

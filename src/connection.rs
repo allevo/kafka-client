@@ -56,15 +56,14 @@ impl Connection {
                 }
                 Security::Ssl(tls_config) => {
                     tracing::debug!(host = %config.host, "starting TLS handshake");
-                    let server_name =
-                        rustls::pki_types::ServerName::try_from(config.host.as_str())
-                            .map_err(|_| {
-                                Error::ProtocolError(format!(
-                                    "invalid TLS server name: {}",
-                                    config.host
-                                ))
-                            })?
-                            .to_owned();
+                    let server_name = rustls::pki_types::ServerName::try_from(config.host.as_str())
+                        .map_err(|_| {
+                            Error::ProtocolError(format!(
+                                "invalid TLS server name: {}",
+                                config.host
+                            ))
+                        })?
+                        .to_owned();
                     let connector = TlsConnector::from(tls_config);
                     let tls_stream = connector.connect(server_name, tcp).await?;
                     tracing::debug!(host = %config.host, "TLS handshake complete");

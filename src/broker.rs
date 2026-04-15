@@ -57,12 +57,19 @@ struct RequestMsg {
     response_tx: oneshot::Sender<Result<zeropool::PooledBuffer>>,
 }
 
-type InFlight =
-    Arc<Mutex<VecDeque<(CorrelationId, oneshot::Sender<Result<zeropool::PooledBuffer>>)>>>;
+type InFlight = Arc<
+    Mutex<
+        VecDeque<(
+            CorrelationId,
+            oneshot::Sender<Result<zeropool::PooledBuffer>>,
+        )>,
+    >,
+>;
 
 #[derive(Clone)]
 pub struct BrokerClient {
     // Stable per-instance identity assigned at construction.
+    #[cfg(test)]
     id: u64,
     request_tx: mpsc::Sender<RequestMsg>,
     next_correlation_id: Arc<AtomicI32>,
@@ -140,6 +147,7 @@ impl BrokerClient {
         ));
 
         let client = BrokerClient {
+            #[cfg(test)]
             id: fastrand::u64(..),
             request_tx,
             pool,
@@ -319,6 +327,7 @@ impl BrokerClient {
     }
 
     /// Stable per-instance identity assigned at construction.
+    #[cfg(test)]
     pub(crate) fn id(&self) -> u64 {
         self.id
     }
@@ -574,6 +583,7 @@ async fn write_task(
 /// Read task: reads framed responses from the broker and dispatches them directly to the
 /// waiting caller via the shared `in_flight` map. Drains any remaining in-flight requests
 /// on exit.
+#[allow(clippy::too_many_arguments)]
 async fn read_task(
     mut reader: tokio::io::ReadHalf<crate::connection::Stream>,
     in_flight: InFlight,
@@ -699,13 +709,16 @@ async fn read_task(
             match q.front() {
                 Some((id, _)) if *id == correlation_id => q.pop_front().map(|(_, tx)| tx),
                 Some((id, _)) => {
-                    debug_assert_eq!(*id, correlation_id, "Kafka in-order responses guarantee is broken");
+                    debug_assert_eq!(
+                        *id, correlation_id,
+                        "Kafka in-order responses guarantee is broken"
+                    );
                     None
-                },
+                }
                 None => {
                     debug_assert!(false, "Unexpected response. No request is performed");
                     None
-                },
+                }
             }
         };
 

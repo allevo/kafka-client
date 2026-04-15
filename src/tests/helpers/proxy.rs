@@ -154,13 +154,11 @@ async fn handle_conn(
     let (mut b_read, mut b_write) = broker.into_split();
 
     let plan_req = plan.clone();
-    let mut req_task = tokio::spawn(async move {
-        forward_requests(&mut c_read, &mut b_write, plan_req).await
-    });
+    let mut req_task =
+        tokio::spawn(async move { forward_requests(&mut c_read, &mut b_write, plan_req).await });
     let plan_resp = plan.clone();
-    let mut resp_task = tokio::spawn(async move {
-        forward_responses(&mut b_read, &mut c_write, plan_resp).await
-    });
+    let mut resp_task =
+        tokio::spawn(async move { forward_responses(&mut b_read, &mut c_write, plan_resp).await });
 
     // First half to finish wins; abort the other so we don't leak it past
     // the lifetime of the TCP pair.
@@ -191,20 +189,19 @@ async fn forward_requests(
         // Peek the fixed-offset prefix of RequestHeader. These three fields
         // are at the same byte offsets regardless of header flexibility, so
         // we don't need to know header_version to dispatch on api_key.
-        let fault = if let Some((api_key, api_version, correlation_id)) =
-            peek_request_header(payload)
-        {
-            let view = RequestView {
-                api_key,
-                api_version,
-                correlation_id,
-                raw: payload,
+        let fault =
+            if let Some((api_key, api_version, correlation_id)) = peek_request_header(payload) {
+                let view = RequestView {
+                    api_key,
+                    api_version,
+                    correlation_id,
+                    raw: payload,
+                };
+                let hook = plan.lock().unwrap().on_request.clone();
+                hook.and_then(|f| f(&view))
+            } else {
+                None
             };
-            let hook = plan.lock().unwrap().on_request.clone();
-            hook.and_then(|f| f(&view))
-        } else {
-            None
-        };
 
         if !apply_fault(broker_write, &frame, fault).await? {
             return Ok(());
@@ -226,7 +223,8 @@ async fn forward_responses(
         // The response correlation_id is always the first 4 bytes of the
         // payload — `broker.rs::read_task` relies on the same property.
         let fault = if payload.len() >= 4 {
-            let correlation_id = i32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
+            let correlation_id =
+                i32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
             let view = ResponseView {
                 correlation_id,
                 raw: payload,
