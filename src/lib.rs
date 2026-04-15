@@ -8,7 +8,7 @@ pub mod secret;
 
 pub use admin::AdminClient;
 pub use broker::{Auth, BrokerClient};
-pub use client::Client;
+pub use client::{Client, NodeTarget};
 pub use config::{Config, Security};
 pub use connection::Connection;
 pub use error::Error;

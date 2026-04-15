@@ -1,7 +1,7 @@
 use kafka_protocol::messages::create_topics_request::CreatableTopic;
 use kafka_protocol::messages::{ApiKey, CreateTopicsRequest, CreateTopicsResponse};
 
-use crate::client::Client;
+use crate::client::{Client, NodeTarget};
 use crate::error::Result;
 
 /// Admin surface for cluster-management RPCs.
@@ -28,13 +28,17 @@ impl AdminClient {
         // Since Kafka 2.4 (KIP-590) any broker will forward admin requests to the
         // controller, but targeting the controller directly is still canonical in
         // the other clients.
-        let controller = self.client.controller().await?;
-        let version = controller.negotiate_version(ApiKey::CreateTopics, 2)?;
-        let request = CreateTopicsRequest::default()
-            .with_topics(topics)
-            .with_timeout_ms(timeout_ms);
-        controller
-            .send(ApiKey::CreateTopics, version, request)
+        self.client
+            .send(
+                NodeTarget::Controller,
+                ApiKey::CreateTopics,
+                2,
+                move |_| {
+                    CreateTopicsRequest::default()
+                        .with_topics(topics.clone())
+                        .with_timeout_ms(timeout_ms)
+                },
+            )
             .await
     }
 }

@@ -4,7 +4,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
-use kafka_protocol::messages::{BrokerId, MetadataResponse};
+use kafka_protocol::messages::{ApiKey, BrokerId, MetadataResponse};
+use kafka_protocol::protocol::{Decodable, Encodable, HeaderVersion};
 use tokio::sync::oneshot;
 
 use crate::admin::AdminClient;
@@ -12,6 +13,16 @@ use crate::broker::{Auth, BrokerClient};
 use crate::config::{Config, Security};
 use crate::connection::Connection;
 use crate::error::{Error, Result};
+
+/// Which broker `Client::send` should route a request to.
+///
+/// Mirrors Java's `NodeProvider` abstraction: admin/control-plane RPCs
+/// describe the kind of node they need, and the dispatcher picks one.
+pub enum NodeTarget {
+    Controller,
+    AnyBroker,
+    Broker(BrokerId),
+}
 
 mod retry;
 
@@ -149,6 +160,35 @@ impl Client {
     pub async fn controller(&self) -> Result<BrokerClient> {
         let id = self.inner.metadata.load().controller_id;
         self.broker(id).await
+    }
+
+    /// Dispatch a typed Kafka request: pick a broker for `target`,
+    /// negotiate the wire version against that broker, build the request,
+    /// send it, and decode the response.
+    ///
+    /// `build` takes the negotiated version because some requests embed
+    /// version-gated fields, and because the retry follow-up (TIMEOUT.md §3)
+    /// will reinvoke it after retargeting to a different broker whose
+    /// negotiated version may differ — hence `Fn`, not `FnOnce`.
+    pub async fn send<Req, Resp>(
+        &self,
+        target: NodeTarget,
+        api_key: ApiKey,
+        max_version: i16,
+        build: impl Fn(i16) -> Req,
+    ) -> Result<Resp>
+    where
+        Req: Encodable + HeaderVersion + Send + 'static,
+        Resp: Decodable + HeaderVersion,
+    {
+        let broker = match target {
+            NodeTarget::Controller => self.controller().await?,
+            NodeTarget::AnyBroker => self.any_broker().await?,
+            NodeTarget::Broker(id) => self.broker(id).await?,
+        };
+        let version = broker.negotiate_version(api_key, max_version)?;
+        let request = build(version);
+        broker.send(api_key, version, request).await
     }
 
     /// Return a usable `BrokerClient` for `node_id`.
