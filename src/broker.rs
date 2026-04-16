@@ -551,16 +551,19 @@ async fn write_task(
             }
         }
 
-        for (correlation_id, data) in data_batch.drain(0..count) {
+        for (i, (correlation_id, data)) in data_batch.drain(0..count).enumerate() {
             if let Err(e) = writer.write_all(&data).await {
                 tracing::error!(correlation_id = ?correlation_id, error = %e, "write failed");
 
+                // Pop the failed entry and every entry after it (never written).
+                // They sit at the tail of the queue: count - i entries total.
                 {
                     let mut q = in_flight.lock().unwrap();
-                    // The failed entry is always the last one we pushed.
-                    if let Some((_, tx)) = q.pop_back() {
-                        let _ =
-                            tx.send(Err(Error::Io(std::io::Error::new(e.kind(), e.to_string()))));
+                    for _ in 0..count - i {
+                        if let Some((_, tx)) = q.pop_back() {
+                            let _ = tx
+                                .send(Err(Error::Io(std::io::Error::new(e.kind(), e.to_string()))));
+                        }
                     }
                 }
 
