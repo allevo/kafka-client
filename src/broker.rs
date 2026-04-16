@@ -728,6 +728,11 @@ async fn read_task(
             match q.front() {
                 Some((id, _)) if *id == correlation_id => q.pop_front().map(|(_, tx)| tx),
                 Some((id, _)) => {
+                    tracing::error!(
+                        expected = ?id,
+                        actual = ?correlation_id,
+                        "out-of-order response: Kafka in-order guarantee is broken"
+                    );
                     debug_assert_eq!(
                         *id, correlation_id,
                         "Kafka in-order responses guarantee is broken"
@@ -735,6 +740,10 @@ async fn read_task(
                     None
                 }
                 None => {
+                    tracing::error!(
+                        ?correlation_id,
+                        "unexpected response with no in-flight requests"
+                    );
                     debug_assert!(false, "Unexpected response. No request is performed");
                     None
                 }
