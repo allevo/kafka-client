@@ -1,4 +1,5 @@
 mod close;
+mod close_dial_race;
 mod cluster;
 mod fatal_dial;
 mod helpers;

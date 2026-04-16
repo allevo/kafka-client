@@ -216,20 +216,33 @@ async fn perform_backoff_retry(
             }
         };
 
+        // Test hook: pause here so a test can remove the slot before we
+        // acquire the lock, deterministically exercising the slot-gone path.
+        #[cfg(test)]
+        if test_hooks::should_pause(node_id) {
+            test_hooks::DIAL_COMPLETE.notify_one();
+            test_hooks::PROCEED_TO_LOCK.notified().await;
+        }
+
         let Some(map_arc) = connections.upgrade() else {
             return;
         };
         let mut map = map_arc.lock().unwrap();
+
+        if !slot_is_ours(&map, node_id, &inbox) {
+            tracing::debug!(
+                node_id = node_id.0,
+                "slot replaced or removed during dial; shutting down orphaned connection",
+            );
+            client.shutdown();
+            return;
+        }
 
         {
             let mut guard = inbox.lock().unwrap();
             for tx in guard.drain(..) {
                 let _ = tx.send(client.clone());
             }
-        }
-
-        if !slot_is_ours(&map, node_id, &inbox) {
-            return;
         }
 
         map.insert(node_id, Slot::Resolved(client));
@@ -279,4 +292,42 @@ pub(crate) fn next_backoff(attempts: u32, base: Duration, max: Duration) -> Dura
     // Cap at u64::MAX nanos — Duration::from_nanos expects u64.
     let nanos_u64 = result.min(u64::MAX as u128) as u64;
     Duration::from_nanos(nanos_u64)
+}
+
+/// Test-only hooks to pause the dialer between a successful dial and the
+/// map-lock acquisition. This lets a test remove the slot (simulating
+/// close() or metadata pruning) and verify the dialer handles the
+/// slot-gone case correctly — a race that is sub-microsecond in
+/// production and impossible to trigger reliably through timing alone.
+#[cfg(test)]
+pub(crate) mod test_hooks {
+    use std::sync::Mutex;
+
+    use kafka_protocol::messages::BrokerId;
+    use tokio::sync::Notify;
+
+    /// When set, the dialer for this specific broker id pauses after
+    /// a successful dial but before acquiring the map lock. `None`
+    /// means no dialer is paused — other tests' dialers pass through.
+    static PAUSE_NODE: Mutex<Option<BrokerId>> = Mutex::new(None);
+
+    /// Dialer notifies this when it has completed the dial and is about
+    /// to pause. The test awaits this to know the dialer is ready.
+    pub static DIAL_COMPLETE: Notify = Notify::const_new();
+
+    /// Dialer awaits this before proceeding to the map lock. The test
+    /// notifies after manipulating the slot.
+    pub static PROCEED_TO_LOCK: Notify = Notify::const_new();
+
+    pub fn arm(node_id: BrokerId) {
+        *PAUSE_NODE.lock().unwrap() = Some(node_id);
+    }
+
+    pub fn disarm() {
+        *PAUSE_NODE.lock().unwrap() = None;
+    }
+
+    pub(super) fn should_pause(node_id: BrokerId) -> bool {
+        *PAUSE_NODE.lock().unwrap() == Some(node_id)
+    }
 }

@@ -27,6 +27,8 @@ pub enum NodeTarget {
 mod retry;
 
 pub(crate) use retry::next_backoff;
+#[cfg(test)]
+pub(crate) use retry::test_hooks;
 use retry::{ConnectionMap, Inbox, Slot, spawn_dialer};
 
 /// Translates broker addresses from metadata into actual connectable addresses.
@@ -503,6 +505,20 @@ impl Client {
             .lock()
             .unwrap()
             .contains_key(&node_id)
+    }
+
+    /// Test-only: remove a `Slot::Dialing` entry from the map without
+    /// aborting its background dialer task. Simulates the effect of
+    /// `close()` on the map while keeping the dialer alive so a test can
+    /// verify it handles the slot-gone case.
+    #[cfg(test)]
+    pub(crate) fn remove_slot_without_abort(&self, node_id: BrokerId) {
+        let mut map = self.inner.connections.lock().unwrap();
+        if let Some(Slot::Dialing { abort_on_drop, .. }) = map.remove(&node_id) {
+            // Intentionally leak the AbortOnDrop so the dialer task is
+            // NOT cancelled — we want it to reach the slot_is_ours check.
+            std::mem::forget(abort_on_drop);
+        }
     }
 
     pub fn controller_id(&self) -> BrokerId {
