@@ -86,6 +86,8 @@ pub struct BrokerClient {
     close: Arc<Notify>,
     // The reauth_task-shutdown notify.
     reauth_close: Arc<Notify>,
+    // Prevent shut down for idle during re-auth
+    reauth_pending: Arc<AtomicBool>,
     // Holds the reauth-shutdown sender alive when no reauth task is running
     _reauth_shutdown_tx: Arc<Mutex<Option<oneshot::Sender<()>>>>,
 }
@@ -126,6 +128,7 @@ impl BrokerClient {
         let shutdown = Arc::new(AtomicBool::new(false));
         let close = Arc::new(Notify::new());
         let reauth_close = Arc::new(Notify::new());
+        let reauth_pending = Arc::new(AtomicBool::new(false));
 
         tracing::info!("spawning write/read tasks");
         tokio::spawn(write_task(
@@ -144,6 +147,7 @@ impl BrokerClient {
             close.clone(),
             pool.clone(),
             connections_max_idle,
+            reauth_pending.clone(),
         ));
 
         let client = BrokerClient {
@@ -156,6 +160,7 @@ impl BrokerClient {
             shutdown,
             close,
             reauth_close,
+            reauth_pending: reauth_pending.clone(),
             // Keep the sender alive so the oneshot in read_task stays pending.
             // Moved into reauth_task below if reauth is needed.
             _reauth_shutdown_tx: Arc::new(Mutex::new(None)),
@@ -480,7 +485,12 @@ async fn reauth_task(
         }
 
         tracing::info!("re-auth timer fired, starting re-authentication");
-        match client.authenticate(&auth).await {
+        // Signal read_task that a re-auth is imminent so it doesn't idle-close
+        // the connection before our requests hit in_flight.
+        client.reauth_pending.store(true, Ordering::Release);
+        let result = client.authenticate(&auth).await;
+        client.reauth_pending.store(false, Ordering::Release);
+        match result {
             Ok(Some(new_lifetime)) => {
                 tracing::info!(?new_lifetime, "re-authentication successful");
                 session_lifetime = new_lifetime;
@@ -600,6 +610,7 @@ async fn read_task(
     close: Arc<Notify>,
     pool: BufferPool,
     connections_max_idle: Option<Duration>,
+    reauth_pending: Arc<AtomicBool>,
 ) {
     let mut size_buf = [0u8; 4];
     let mut reauth_shutdown = std::pin::pin!(reauth_shutdown_rx);
@@ -630,10 +641,12 @@ async fn read_task(
                     None => std::future::pending::<()>().await,
                 }
             } => {
-                // If any request is still pending, we reset the counter,
-                // so we can wait the response.
-                // NB: SASL re-auth exchange counts
-                if !in_flight.lock().unwrap().is_empty() {
+                // If any request is still pending or a re-auth is about to
+                // start, reset the counter so we don't tear down the connection.
+                // NB: SASL re-auth exchange counts as in-flight activity.
+                if !in_flight.lock().unwrap().is_empty()
+                    || reauth_pending.load(Ordering::Acquire)
+                {
                     last_activity = tokio::time::Instant::now();
                     continue;
                 }
