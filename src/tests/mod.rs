@@ -1,5 +1,6 @@
 mod close;
 mod cluster;
+mod fatal_dial;
 mod helpers;
 mod reauth;
 mod reconnect_backoff;

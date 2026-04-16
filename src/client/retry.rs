@@ -113,12 +113,15 @@ pub(super) fn spawn_dialer(
 /// - **Abort.** `close()` or metadata pruning drops the
 ///   `Slot::Dialing`, firing `AbortOnDrop` and cancelling this task at
 ///   its next await.
+/// - **Fatal error.** `e.is_fatal()` is true — authentication, config,
+///   or protocol errors that cannot recover via retry. Removes the slot
+///   and returns; waiters see `NoBrokerAvailable`.
 ///
-/// A failed dial simply logs, bumps `times`, and loops. The oneshot
+/// A transient dial failure logs, bumps `times`, and loops. The oneshot
 /// senders in the inbox are untouched, so parked callers stay
-/// `Pending` across any number of failed cycles. The only way a caller
-/// observes failure is if they cancel their own future, or if the
-/// dialer is aborted.
+/// `Pending` across any number of transient cycles. Fatal errors short-
+/// circuit: the slot is removed and the inbox is dropped, waking all
+/// waiters immediately.
 #[allow(clippy::too_many_arguments)]
 async fn perform_backoff_retry(
     inbox: Inbox,
@@ -178,6 +181,28 @@ async fn perform_backoff_retry(
 
         let client = match dial_result {
             Ok(client) => client,
+            Err(e) if e.is_fatal() => {
+                tracing::error!(
+                    node_id = node_id.0,
+                    %host,
+                    port,
+                    error = %e,
+                    "fatal broker dial error; giving up",
+                );
+                // Remove the slot so a future broker(id) call can
+                // respawn a fresh dialer (e.g. after credentials are
+                // fixed and metadata refreshes).
+                if let Some(map_arc) = connections.upgrade() {
+                    let mut map = map_arc.lock().unwrap();
+                    if slot_is_ours(&map, node_id, &inbox) {
+                        map.remove(&node_id);
+                    }
+                }
+                // Dropping `inbox` senders wakes all waiters with
+                // RecvError, which broker() maps to
+                // NoBrokerAvailable("broker dial cancelled").
+                return;
+            }
             Err(e) => {
                 tracing::warn!(
                     node_id = node_id.0,
