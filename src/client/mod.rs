@@ -451,23 +451,22 @@ impl Client {
     /// drop their `AbortOnDrop`, which aborts the background dialer so
     /// callers parked on its inbox wake with a closed-channel error.
     fn apply_metadata_snapshot(&self, snap: MetadataSnapshot) {
-        {
-            let mut conns = self.inner.connections.lock().unwrap();
-            conns.retain(|id, slot| {
-                if snap.brokers.contains_key(id) {
-                    return true;
-                }
-                match slot {
-                    Slot::Resolved(broker) => broker.shutdown(),
-                    // AbortOnDrop fires when the slot is dropped below.
-                    Slot::Dialing { .. } => {}
-                }
-                false
-            });
-        }
-        // Atomic publish: concurrent readers either see the old or the new
-        // snapshot, never a torn view.
+        let mut conns = self.inner.connections.lock().unwrap();
+        conns.retain(|id, slot| {
+            if snap.brokers.contains_key(id) {
+                return true;
+            }
+            match slot {
+                Slot::Resolved(broker) => broker.shutdown(),
+                // AbortOnDrop fires when the slot is dropped below.
+                Slot::Dialing { .. } => {}
+            }
+            false
+        });
+        // NB: Publish inside the lock
         self.inner.metadata.store(Arc::new(snap));
+
+        drop(conns);
     }
 
     /// Test-only: number of slots currently held in the connection cache.
