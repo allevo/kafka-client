@@ -458,8 +458,8 @@ fn build_plain_token(username: &str, password: &str) -> Bytes {
 
 /// Compute the re-auth delay: 85–95% of `session_lifetime`, with random jitter.
 fn reauth_delay(session_lifetime: Duration) -> Duration {
-    let pct = 85 + fastrand::u64(0..=10); // 85–95%
-    Duration::from_millis(session_lifetime.as_millis() as u64 * pct / 100)
+    let pct = 85 + fastrand::u32(0..=10); // 85–95%
+    session_lifetime * pct / 100
 }
 
 /// Background task: periodically re-authenticate the connection to keep it alive past the
