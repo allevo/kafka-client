@@ -233,7 +233,10 @@ impl BrokerClient {
         debug_assert_eq!(buf.len(), 4 + size);
         // We want to start from position 0, discarding dirty (and old) values
         buf.clear();
-        buf.put_i32(size as i32);
+        let size = i32::try_from(size).map_err(|_| {
+            Error::Protocol(format!("request too large for i32 frame size: {size}"))
+        })?;
+        buf.put_i32(size);
         header.encode(&mut *buf, header_version)?;
         request.encode(&mut *buf, api_version)?;
         let data = buf;
