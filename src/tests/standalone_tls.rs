@@ -1,8 +1,8 @@
 use super::helpers;
 
 #[tokio::test]
+#[tracing_test::traced_test]
 async fn test_standalone_tls_api_versions() {
-    let _ = tracing_subscriber::fmt::try_init();
     let broker = helpers::tls_broker().await;
 
     let tls_config = helpers::tls::build_tls_config();

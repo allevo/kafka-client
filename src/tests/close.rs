@@ -3,8 +3,8 @@ use std::time::Duration;
 use super::helpers;
 
 #[tokio::test]
+#[tracing_test::traced_test]
 async fn test_client_close_shuts_down_held_broker() {
-    let _ = tracing_subscriber::fmt::try_init();
     let broker = helpers::plaintext_broker().await;
 
     let bootstrap = [crate::Config::new(&broker.host, broker.port)];

@@ -1026,7 +1026,6 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tracing",
- "tracing-subscriber",
  "tracing-test",
  "zeroize",
  "zeropool",

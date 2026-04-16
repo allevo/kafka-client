@@ -71,8 +71,8 @@ fn metadata_request_build(_version: i16) -> MetadataRequest {
 /// slot must end up torn down, and a subsequent `send` must redial and
 /// succeed (exercises the `Client::broker` self-heal fast path).
 #[tokio::test]
+#[tracing_test::traced_test]
 async fn request_timeout_wire_phase_stall() {
-    let _ = tracing_subscriber::fmt::try_init();
     let upstream = helpers::plaintext_broker().await;
 
     // Count Metadata responses. Delay the first one past the budget;
@@ -161,8 +161,8 @@ async fn request_timeout_wire_phase_stall() {
 /// without the acquisition-side `timeout_at`, `Client::send` would hang
 /// indefinitely on a parked dialer.
 #[tokio::test]
+#[tracing_test::traced_test]
 async fn request_timeout_acquisition_phase_stall() {
-    let _ = tracing_subscriber::fmt::try_init();
     let listener = start_stall_listener().await;
 
     let request_timeout = Duration::from_millis(400);
@@ -200,8 +200,8 @@ async fn request_timeout_acquisition_phase_stall() {
 /// classifies as `RefreshMetadata`, validating the "cancel all
 /// in-flight for that node" semantics.
 #[tokio::test]
+#[tracing_test::traced_test]
 async fn request_timeout_tears_down_concurrent_callers() {
-    let _ = tracing_subscriber::fmt::try_init();
     let upstream = helpers::plaintext_broker().await;
 
     // After the handshake, delay every subsequent Metadata response.
@@ -328,8 +328,8 @@ async fn client_via_proxy_resolver(
 /// succeeds. Validates `RequestTimeout → RefreshMetadata → retry`
 /// end-to-end.
 #[tokio::test]
+#[tracing_test::traced_test]
 async fn retry_loop_recovers_after_request_timeout() {
-    let _ = tracing_subscriber::fmt::try_init();
     let upstream = helpers::plaintext_broker().await;
 
     // Delay only the first Metadata request; pass every request after
@@ -395,8 +395,8 @@ async fn retry_loop_recovers_after_request_timeout() {
 /// clamp, this would overshoot by up to one `request_timeout` on the
 /// last attempt.
 #[tokio::test]
+#[tracing_test::traced_test]
 async fn retry_loop_respects_api_timeout_cap() {
-    let _ = tracing_subscriber::fmt::try_init();
     let upstream = helpers::plaintext_broker().await;
 
     // Start the proxy with a transparent plan so bootstrap's Metadata

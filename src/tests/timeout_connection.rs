@@ -22,8 +22,8 @@ use super::helpers::stall_listener::start_stall_listener;
 const OUTER_GUARD: Duration = Duration::from_secs(2);
 
 #[tokio::test]
+#[tracing_test::traced_test]
 async fn timeout_setup_expires_on_plain_tcp_stall() {
-    let _ = tracing_subscriber::fmt::try_init();
     // Peer accepts TCP but never sends the TLS ServerHello, so a working
     // implementation must trip the configured setup bound rather than hang
     // on the rustls handshake.
@@ -65,8 +65,8 @@ async fn timeout_setup_expires_on_plain_tcp_stall() {
 }
 
 #[tokio::test]
+#[tracing_test::traced_test]
 async fn timeout_setup_expires_when_peer_never_acks_tls() {
-    let _ = tracing_subscriber::fmt::try_init();
     // Plaintext sibling of the previous test. With `Security::Plaintext`
     // there is no application-level handshake after TCP, so a stall
     // listener accepts and `Connection::connect` is expected to RETURN
@@ -98,8 +98,8 @@ async fn timeout_setup_expires_when_peer_never_acks_tls() {
 }
 
 #[tokio::test]
+#[tracing_test::traced_test]
 async fn timeout_setup_happy_path() {
-    let _ = tracing_subscriber::fmt::try_init();
     // Sanity: a generous setup timeout against a real broker must not
     // trip. Guards against an implementation that spuriously fires on the
     // fast path.
@@ -128,8 +128,8 @@ async fn timeout_setup_happy_path() {
 }
 
 #[tokio::test]
+#[tracing_test::traced_test]
 async fn timeout_setup_unset_preserves_legacy_behavior() {
-    let _ = tracing_subscriber::fmt::try_init();
     // Pin the "default = None = off" semantics. With no setup timeout
     // configured, `Connection::connect` against a stall listener using TLS
     // must hang indefinitely (matching today's behavior) — the test

@@ -336,7 +336,6 @@ mod tests {
 
     #[tokio::test]
     async fn proxy_forwards_metadata_transparently() {
-        let _ = tracing_subscriber::fmt::try_init();
         let broker = helpers::plaintext_broker().await;
         let proxy = start(&broker.host, broker.port, FaultPlan::new()).await;
 
@@ -354,7 +353,6 @@ mod tests {
 
     #[tokio::test]
     async fn proxy_drop_connection_fault_surfaces_to_client() {
-        let _ = tracing_subscriber::fmt::try_init();
         let broker = helpers::plaintext_broker().await;
 
         // Drop only on Metadata so the initial ApiVersions handshake (which
