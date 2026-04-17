@@ -464,3 +464,110 @@ async fn failing_dial_does_not_wake_waiters() {
         "expected Err after close(), got Ok from permanently-dead broker"
     );
 }
+
+// ---------------------------------------------------------------------------
+// 10. `any_broker()` parks on a dialer when ALL brokers are `Dialing`.
+// ---------------------------------------------------------------------------
+
+/// Regression test for Bug 3: when every known broker is mid-dial,
+/// `any_broker()` must wait on one in-progress dialer rather than
+/// returning `NoBrokerAvailable` immediately.
+#[tokio::test]
+#[tracing_test::traced_test]
+async fn any_broker_parks_when_all_brokers_dialing() {
+    const SYNTH_A: BrokerId = BrokerId(9990);
+    const SYNTH_B: BrokerId = BrokerId(9991);
+
+    let broker = helpers::plaintext_broker().await;
+    let counter = Arc::new(AtomicUsize::new(0));
+
+    // Both proxies drop every connection initially.
+    let proxy_a =
+        helpers::proxy::start(&broker.host, broker.port, drop_all_plan(counter.clone())).await;
+    let proxy_b =
+        helpers::proxy::start(&broker.host, broker.port, drop_all_plan(counter.clone())).await;
+
+    let base = Duration::from_millis(200);
+    let max = Duration::from_millis(1_000);
+
+    let bootstrap = [crate::Config::new(&broker.host, broker.port)
+        .with_reconnect_backoff(base)
+        .with_reconnect_backoff_max(max)];
+    let client = crate::Client::connect(&bootstrap, crate::Security::Plaintext, crate::Auth::None)
+        .await
+        .unwrap();
+
+    // Replace metadata with ONLY synthetic IDs. The bootstrap
+    // connection is pruned — no Resolved slot survives.
+    client.replace_metadata_for_test(
+        SYNTH_A,
+        vec![
+            (SYNTH_A, proxy_a.host.clone(), proxy_a.port),
+            (SYNTH_B, proxy_b.host.clone(), proxy_b.port),
+        ],
+    );
+
+    // Install Slot::Dialing for both synthetic brokers. The drop-all
+    // proxies ensure the dialers fail and enter backoff, keeping the
+    // slots in Dialing state.
+    let client_a = client.clone();
+    let task_a = tokio::spawn(async move { client_a.broker(SYNTH_A).await });
+    let client_b = client.clone();
+    let task_b = tokio::spawn(async move { client_b.broker(SYNTH_B).await });
+
+    // Wait for both Dialing slots to be installed and the first dial
+    // attempt to fail (putting dialers into their backoff sleep).
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Unblock both proxies so the next retry cycle succeeds.
+    // any_broker() parks on whichever dialer it encounters first
+    // (HashMap iteration order), so both must be healthy.
+    proxy_a.set_plan(FaultPlan::new());
+    proxy_b.set_plan(FaultPlan::new());
+
+    // any_broker() should park on one dialer's inbox rather than
+    // returning NoBrokerAvailable. The dialer succeeds through the
+    // now-healthy proxy within a few backoff cycles.
+    let t0 = Instant::now();
+    let result = tokio::time::timeout(Duration::from_secs(10), client.any_broker()).await;
+    let elapsed = t0.elapsed();
+
+    let broker_client = result
+        .expect("any_broker timed out — did not park on dialer")
+        .expect("any_broker returned error instead of parking on dialer");
+
+    assert!(
+        !broker_client.is_shutdown(),
+        "any_broker returned a shut-down client"
+    );
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "any_broker took too long: {elapsed:?}"
+    );
+
+    // The fix's fallback path must have fired: any_broker() saw all
+    // slots as Dialing and parked on one rather than returning an error.
+    assert!(logs_contain(
+        "all brokers dialing, parking on in-progress dial"
+    ));
+
+    // Both dialers must have failed at least once (the drop-all phase)
+    // before the proxies were switched to pass-through.
+    logs_assert(|lines: &[&str]| {
+        let fail_count = lines
+            .iter()
+            .filter(|l| l.contains("broker dial failed; will retry after backoff"))
+            .count();
+        if fail_count >= 2 {
+            Ok(())
+        } else {
+            Err(format!(
+                "expected at least 2 dial failures (one per broker), got {fail_count}"
+            ))
+        }
+    });
+
+    client.close();
+    let _ = task_a.await;
+    let _ = task_b.await;
+}

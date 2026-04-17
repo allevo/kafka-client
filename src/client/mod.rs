@@ -402,6 +402,8 @@ impl Client {
         }
 
         let mut last_err = None;
+        let mut skipped_dialing: Option<BrokerId> = None;
+
         for id in ids {
             // Skip any broker whose slot is currently `Dialing`: its
             // backoff loop is running and `broker(id)` would park us on
@@ -410,6 +412,7 @@ impl Client {
             {
                 let map = self.inner.connections.lock().unwrap();
                 if matches!(map.get(&id), Some(Slot::Dialing { .. })) {
+                    skipped_dialing.get_or_insert(id);
                     continue;
                 }
             }
@@ -418,6 +421,19 @@ impl Client {
                 Err(e) => last_err = Some(e),
             }
         }
+
+        // Every non-dialing broker failed (or there were none). Rather
+        // than returning an immediate error, park on one in-progress
+        // dialer — this covers the all-brokers-dialing scenario
+        // (cluster startup, full reconnection after partition).
+        if let Some(id) = skipped_dialing {
+            tracing::debug!(broker_id = %id.0, "all brokers dialing, parking on in-progress dial");
+            match self.broker(id).await {
+                Ok(c) => return Ok(c),
+                Err(e) => last_err = Some(e),
+            }
+        }
+
         Err(last_err.unwrap_or_else(|| Error::NoBrokerAvailable("no reachable brokers".into())))
     }
 
