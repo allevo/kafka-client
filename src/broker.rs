@@ -1,7 +1,7 @@
 use std::collections::VecDeque;
 use std::ops::Deref;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
-use std::sync::{Arc, LockResult, Mutex};
+use std::sync::{Arc, LockResult, Mutex, Weak};
 use std::time::Duration;
 
 use bytes::{BufMut, Bytes};
@@ -68,28 +68,42 @@ type InFlight = Arc<
 
 #[derive(Clone)]
 pub struct BrokerClient {
-    // Stable per-instance identity assigned at construction.
+    inner: Arc<BrokerClientInner>,
+}
+
+struct BrokerClientInner {
+    /// Stable per-instance identity assigned at construction.
     #[cfg(test)]
     id: u64,
     request_tx: mpsc::Sender<RequestMsg>,
-    next_correlation_id: Arc<AtomicI32>,
+    next_correlation_id: AtomicI32,
     pool: BufferPool,
-    api_versions: Arc<[ApiVersion]>,
+    api_versions: Box<[ApiVersion]>,
     // Flipped by `read_task` the moment it decides to exit, so `send` can
     // reject new requests immediately instead of letting them sit in the mpsc
     // channel until `write_task` notices the shutdown signal and drops `request_rx`.
     shutdown: Arc<AtomicBool>,
     // User-initiated shutdown signal. `read_task` selects on `close.notified()`;
-    // waking it tears down the connection through the existing read→write shutdown
-    // chain, regardless of how many `BrokerClient` clones are still holding
-    // `request_tx`. See `shutdown()` below.
+    // waking it tears down the connection through the existing read→write
+    // shutdown chain.
     close: Arc<Notify>,
     // The reauth_task-shutdown notify.
     reauth_close: Arc<Notify>,
-    // Prevent shut down for idle during re-auth
+    // Prevent shut down for idle during re-auth.
     reauth_pending: Arc<AtomicBool>,
-    // Holds the reauth-shutdown sender alive when no reauth task is running
-    _reauth_shutdown_tx: Arc<Mutex<Option<oneshot::Sender<()>>>>,
+    // Holds the reauth-shutdown sender alive when no reauth task is running.
+    // Dropped alongside this struct, which closes the oneshot and is a no-op
+    // for `read_task` (the branch is dormant).
+    _reauth_shutdown_tx: Mutex<Option<oneshot::Sender<()>>>,
+}
+
+impl Drop for BrokerClientInner {
+    fn drop(&mut self) {
+        // Fired when the last external `BrokerClient` clone has been dropped.
+        self.shutdown.store(true, Ordering::Release);
+        self.close.notify_one();
+        self.reauth_close.notify_one();
+    }
 }
 
 const CLIENT_ID: &str = "kafka-client";
@@ -151,19 +165,21 @@ impl BrokerClient {
         ));
 
         let client = BrokerClient {
-            #[cfg(test)]
-            id: fastrand::u64(..),
-            request_tx,
-            pool,
-            next_correlation_id: Arc::new(AtomicI32::new(correlation_id + 1)),
-            api_versions: api_versions.into(),
-            shutdown,
-            close,
-            reauth_close,
-            reauth_pending: reauth_pending.clone(),
-            // Keep the sender alive so the oneshot in read_task stays pending.
-            // Moved into reauth_task below if reauth is needed.
-            _reauth_shutdown_tx: Arc::new(Mutex::new(None)),
+            inner: Arc::new(BrokerClientInner {
+                #[cfg(test)]
+                id: fastrand::u64(..),
+                request_tx,
+                pool,
+                next_correlation_id: AtomicI32::new(correlation_id + 1),
+                api_versions: api_versions.into(),
+                shutdown,
+                close,
+                reauth_close,
+                reauth_pending,
+                // Keep the sender alive so the oneshot in read_task stays pending.
+                // Moved into reauth_task below if reauth is needed.
+                _reauth_shutdown_tx: Mutex::new(None),
+            }),
         };
 
         let session_lifetime = client.authenticate(&auth).await?;
@@ -173,8 +189,12 @@ impl BrokerClient {
         // sleeps and re-authenticates periodically.
         if let Some(lifetime) = session_lifetime {
             tracing::info!(?lifetime, "spawning re-auth task");
+
+            // NB: Weak so, it doesn't count as strong reference
+            let reauth_close = client.inner.reauth_close.clone();
             tokio::spawn(reauth_task(
-                client.clone(),
+                Arc::downgrade(&client.inner),
+                reauth_close,
                 auth,
                 lifetime,
                 reauth_shutdown_tx,
@@ -183,7 +203,7 @@ impl BrokerClient {
             tracing::info!("Broker doesn't require re-auth task");
             // Store reauth_shutdown_tx, so the `read_task` can poll it even if it will never be resolved
             // This make the code easier at a little cost of a `tokio::sync::oneshot::Receiver::poll`
-            let mut guard = client._reauth_shutdown_tx.lock().unwrap();
+            let mut guard = client.inner._reauth_shutdown_tx.lock().unwrap();
             *guard = Some(reauth_shutdown_tx);
         }
 
@@ -206,7 +226,7 @@ impl BrokerClient {
         //     But it is temporary.
         // So this flag is a best-effort fast path; In the TOCTOU window
         // there's a safety net.
-        if self.shutdown.load(Ordering::Acquire) {
+        if self.inner.shutdown.load(Ordering::Acquire) {
             return Err(Error::Io(std::io::Error::new(
                 std::io::ErrorKind::ConnectionAborted,
                 "broker connection closed",
@@ -215,8 +235,11 @@ impl BrokerClient {
 
         // correlation_id is a client side parameter. There is not guarantees of the values
         // No lock is needed.
-        let correlation_id =
-            CorrelationId(self.next_correlation_id.fetch_add(1, Ordering::Relaxed));
+        let correlation_id = CorrelationId(
+            self.inner
+                .next_correlation_id
+                .fetch_add(1, Ordering::Relaxed),
+        );
 
         // Below:
         // - Serialize the request
@@ -234,7 +257,7 @@ impl BrokerClient {
 
         let header_version = Req::header_version(api_version);
         let size = header.compute_size(header_version)? + request.compute_size(api_version)?;
-        let mut buf = self.pool.get(4 + size);
+        let mut buf = self.inner.pool.get(4 + size);
         debug_assert_eq!(buf.len(), 4 + size);
         // We want to start from position 0, discarding dirty (and old) values
         buf.clear();
@@ -256,7 +279,7 @@ impl BrokerClient {
             response_tx,
         };
 
-        self.request_tx.send(request_msg).await.map_err(|_| {
+        self.inner.request_tx.send(request_msg).await.map_err(|_| {
             tracing::error!("connection task has shut down");
             Error::Io(std::io::Error::new(
                 std::io::ErrorKind::ConnectionAborted,
@@ -300,20 +323,20 @@ impl BrokerClient {
     }
 
     pub async fn fetch_metadata(&self) -> Result<MetadataResponse> {
-        let version = negotiate_version(&self.api_versions, ApiKey::Metadata, 1)?;
+        let version = negotiate_version(&self.inner.api_versions, ApiKey::Metadata, 1)?;
         let request = MetadataRequest::default().with_topics(None);
         self.send(ApiKey::Metadata, version, request).await
     }
 
     pub fn api_versions(&self) -> &[ApiVersion] {
-        &self.api_versions
+        &self.inner.api_versions
     }
 
     /// Resolve the wire version to use for `api_key`: picks
     /// `min(desired, broker_max)` after confirming the broker advertises
     /// the API at all before calling [`BrokerClient::send`].
     pub fn negotiate_version(&self, api_key: ApiKey, desired: i16) -> Result<i16> {
-        negotiate_version(&self.api_versions, api_key, desired)
+        negotiate_version(&self.inner.api_versions, api_key, desired)
     }
 
     /// Signal this broker connection to tear down. After calling this, the
@@ -321,23 +344,23 @@ impl BrokerClient {
     /// in-flight requests will complete with `ConnectionAborted`. Idempotent:
     /// safe to call on an already-shut-down broker.
     pub fn shutdown(&self) {
-        self.shutdown.store(true, Ordering::Release);
+        self.inner.shutdown.store(true, Ordering::Release);
 
-        self.close.notify_one();
-        self.reauth_close.notify_one();
+        self.inner.close.notify_one();
+        self.inner.reauth_close.notify_one();
     }
 
     /// Returns `true` if the broker shut down
     pub(crate) fn is_shutdown(&self) -> bool {
         // Acquire pairs with read_task's Release store at the bottom of read_task,
         // matching the ordering send already uses.
-        self.shutdown.load(Ordering::Acquire)
+        self.inner.shutdown.load(Ordering::Acquire)
     }
 
     /// Stable per-instance identity assigned at construction.
     #[cfg(test)]
     pub(crate) fn id(&self) -> u64 {
-        self.id
+        self.inner.id
     }
 
     /// Test-only: flip the shutdown flag without actually killing the socket.
@@ -345,7 +368,7 @@ impl BrokerClient {
     /// a real broker disconnect.
     #[cfg(test)]
     pub(crate) fn force_shutdown_for_test(&self) {
-        self.shutdown.store(true, Ordering::Release);
+        self.inner.shutdown.store(true, Ordering::Release);
     }
 
     /// Run a SASL/PLAIN handshake + authenticate against the broker. Used both for initial
@@ -359,10 +382,12 @@ impl BrokerClient {
         tracing::info!(username = %username, "starting SASL/PLAIN authentication");
 
         let has_handshake = self
+            .inner
             .api_versions
             .iter()
             .any(|v| v.api_key == ApiKey::SaslHandshake as i16);
         let has_authenticate = self
+            .inner
             .api_versions
             .iter()
             .any(|v| v.api_key == ApiKey::SaslAuthenticate as i16);
@@ -389,7 +414,8 @@ impl BrokerClient {
 
         // Negotiate SaslAuthenticate version: min(2, broker_max). v1+ is required to receive
         // session_lifetime_ms (KIP-368), so we cap at 2 to avoid asking for fields we don't parse.
-        let auth_version = negotiate_version(&self.api_versions, ApiKey::SaslAuthenticate, 2)?;
+        let auth_version =
+            negotiate_version(&self.inner.api_versions, ApiKey::SaslAuthenticate, 2)?;
         tracing::debug!(auth_version, "negotiated SaslAuthenticate version");
 
         let token = build_plain_token(username, password.expose_secret());
@@ -464,9 +490,11 @@ fn reauth_delay(session_lifetime: Duration) -> Duration {
 
 /// Background task: periodically re-authenticate the connection to keep it alive past the
 /// broker's `connections.max.reauth.ms` (KIP-368). Exits when the connection dies, when
-/// re-auth fails, or when the broker stops returning a session lifetime.
+/// re-auth fails, when the broker stops returning a session lifetime, or when the user
+/// drops the last external `BrokerClient` handle (`Weak::upgrade` will return None).
 async fn reauth_task(
-    client: BrokerClient,
+    inner: Weak<BrokerClientInner>,
+    reauth_close: Arc<Notify>,
     auth: Auth,
     mut session_lifetime: Duration,
     reauth_shutdown_tx: oneshot::Sender<()>,
@@ -478,18 +506,30 @@ async fn reauth_task(
         // waiting the next cicle.
         tokio::select! {
             _ = tokio::time::sleep(delay) => {}
-            _ = client.reauth_close.notified() => {
+            _ = reauth_close.notified() => {
                 tracing::info!("reauth task observed shutdown, exiting");
                 return;
             }
         }
 
+        // None means inner is freed.
+        let Some(inner) = inner.upgrade() else {
+            tracing::info!("reauth task: client dropped, exiting");
+            return;
+        };
+        let client = BrokerClient { inner };
+
         tracing::info!("re-auth timer fired, starting re-authentication");
         // Signal read_task that a re-auth is imminent so it doesn't idle-close
         // the connection before our requests hit in_flight.
-        client.reauth_pending.store(true, Ordering::Release);
+        client.inner.reauth_pending.store(true, Ordering::Release);
         let result = client.authenticate(&auth).await;
-        client.reauth_pending.store(false, Ordering::Release);
+        client.inner.reauth_pending.store(false, Ordering::Release);
+        // Release our strong ref *before* the next sleep so dropping the
+        // user's last external handle in the meantime triggers
+        // `BrokerClientInner::drop`, whose `reauth_close.notify_one()` then
+        // unblocks the next `select!` iteration.
+        drop(client);
         match result {
             Ok(Some(new_lifetime)) => {
                 tracing::info!(?new_lifetime, "re-authentication successful");
