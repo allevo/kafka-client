@@ -248,7 +248,16 @@ async fn success_resets_backoff_state() {
     let task = tokio::spawn(async move { client_bg.broker(SYNTH_ID).await });
 
     // Wait for the first failed attempt to land, then flip to healthy.
-    tokio::time::sleep(Duration::from_millis(150)).await;
+    // The dialer's failure log is the exact signal we're fencing on —
+    // a raw sleep is both flaky (150ms is too short on a loaded CI host)
+    // and wasteful (fast hosts would already be deep into the backoff
+    // sleep). Log-wait fires within a ms of the actual failure.
+    helpers::wait_for_log(
+        || logs_contain("broker dial failed; will retry after backoff"),
+        Duration::from_secs(2),
+        "first dial attempt never failed",
+    )
+    .await;
     proxy.set_plan(FaultPlan::new());
 
     // The next attempt is gated by `base` (~300 ms) and should succeed.
@@ -263,8 +272,15 @@ async fn success_resets_backoff_state() {
     let cached = client.broker(SYNTH_ID).await.expect("still cached");
     let _ = cached.fetch_metadata().await;
     drop(cached);
-    // Grace so `read_task` flips the shutdown flag.
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    // Wait for read_task to actually observe the drop and exit before
+    // the next broker() call — otherwise the fast path can still return
+    // the stale Slot::Resolved and we never exercise the eviction path.
+    helpers::wait_for_log(
+        || logs_contain("read task exiting"),
+        Duration::from_secs(2),
+        "read_task did not exit after cached client was dropped/failed",
+    )
+    .await;
 
     // Next `broker()` call observes shutdown, evicts, and schedules a
     // dial gated by `base` (initial_times = 1 respawn path). If the
@@ -336,6 +352,28 @@ async fn concurrent_callers_single_flight() {
             .expect("join");
         assert!(r.is_ok(), "waiter {i} should see Ok after dial succeeds");
     }
+
+    // The whole point of the test: 10 concurrent callers must collapse
+    // into a single dialer. `spawn_dialer` logs once per task, so exactly
+    // one spawn line for SYNTH_ID proves every follow-up caller parked on
+    // the shared inbox. Without this assertion the test passes even if
+    // each caller spun up its own dialer.
+    logs_assert(|lines: &[&str]| {
+        let spawns = lines
+            .iter()
+            .filter(|l| {
+                l.contains("spawning broker dialer task")
+                    && l.contains(&format!("node_id={}", SYNTH_ID.0))
+            })
+            .count();
+        if spawns == 1 {
+            Ok(())
+        } else {
+            Err(format!(
+                "expected exactly 1 dialer spawn for SYNTH_ID, got {spawns}"
+            ))
+        }
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -360,8 +398,19 @@ async fn dead_broker_does_not_starve_any_broker() {
     let client_bg = client.clone();
     let dead_task = tokio::spawn(async move { client_bg.broker(SYNTH_ID).await });
 
-    // Brief wait so the dialer has definitely installed `Slot::Dialing`.
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    // The spawn log fires from inside `spawn_dialer`, called under the
+    // same map mutex that installs `Slot::Dialing` — so by the time
+    // this log is visible, the Dialing slot is guaranteed in place.
+    // Replaces the old `sleep(100ms)` that was both flaky under load
+    // and wasteful on fast hosts. SYNTH_ID is the only cold dial in
+    // this test (bootstrap went directly to `Slot::Resolved`), so a
+    // bare message match is unambiguous.
+    helpers::wait_for_log(
+        || logs_contain("spawning broker dialer task"),
+        Duration::from_secs(2),
+        "dialer for SYNTH_ID never spawned",
+    )
+    .await;
 
     // 100 tight-loop any_broker calls should all return the bootstrap
     // broker and complete well under `max`.
@@ -404,9 +453,18 @@ async fn close_does_not_block_on_sleeping_gate() {
         let _ = client_a.broker(SYNTH_ID).await;
     });
 
-    // Long enough for the first dial to fail and the dialer to enter
-    // its gate sleep, but much less than `base`.
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    // Wait until the dialer has actually entered its gate sleep. The
+    // failure log fires right before the backoff sleep on the next
+    // iteration, so this is a tight lower bound: by the time the log is
+    // visible, the dialer is either already parked in `sleep(base)` or
+    // about to be on the next poll. `base` is 5 s so there is no risk of
+    // the dialer waking and firing a second attempt before `close()`.
+    helpers::wait_for_log(
+        || logs_contain("broker dial failed; will retry after backoff"),
+        Duration::from_secs(2),
+        "dialer never reached its gate sleep",
+    )
+    .await;
 
     let t0 = Instant::now();
     client.close();
@@ -516,8 +574,24 @@ async fn any_broker_parks_when_all_brokers_dialing() {
     let task_b = tokio::spawn(async move { client_b.broker(SYNTH_B).await });
 
     // Wait for both Dialing slots to be installed and the first dial
-    // attempt to fail (putting dialers into their backoff sleep).
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    // attempt of each to fail — so both are parked in their backoff
+    // sleeps when we flip the proxies below. Two failures (one per
+    // broker) is what "all brokers dialing" means in the fix's fallback
+    // branch; if we flip before the second one has failed, any_broker
+    // could find a `Slot::Dialing` that hasn't issued its first dial yet
+    // and the assertion on "parked on dialer" still passes but for the
+    // wrong reason. The shared proxy counter is bumped once per
+    // ApiVersions seen (see `drop_all_plan`), so counter >= 2 means
+    // each dialer has issued at least one attempt (with base=200ms, the
+    // 9990/9991 dialers start near-simultaneously and the second
+    // dialer's first attempt is almost always interleaved before the
+    // first dialer's second attempt).
+    helpers::wait_for_log(
+        || counter.load(Ordering::SeqCst) >= 2,
+        Duration::from_secs(3),
+        "both dialers did not reach their first failure",
+    )
+    .await;
 
     // Unblock both proxies so the next retry cycle succeeds.
     // any_broker() parks on whichever dialer it encounters first

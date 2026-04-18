@@ -80,6 +80,13 @@ pub(super) fn spawn_dialer(
     let max_response_size = inner.max_response_size;
     let base = inner.reconnect_backoff;
     let max = inner.reconnect_backoff_max;
+    tracing::debug!(
+        node_id = node_id.0,
+        %host,
+        port,
+        initial_times,
+        "spawning broker dialer task",
+    );
     let handle = tokio::spawn(perform_backoff_retry(
         inbox,
         connections,

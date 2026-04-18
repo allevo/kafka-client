@@ -188,6 +188,28 @@ async fn test_cluster_client_concurrent_access() {
     for h in handles {
         h.await.unwrap();
     }
+
+    // The whole reason to test concurrency: the single-flight guard in
+    // `broker()` must collapse the 16 racing callers on `target_id` into
+    // exactly one dialer task. A broken guard would spawn a dialer per
+    // caller, which silently passes every other assertion in this test.
+    logs_assert(move |lines: &[&str]| {
+        let spawns = lines
+            .iter()
+            .filter(|l| {
+                l.contains("spawning broker dialer task")
+                    && l.contains(&format!("node_id={}", target_id.0))
+            })
+            .count();
+        if spawns == 1 {
+            Ok(())
+        } else {
+            Err(format!(
+                "expected exactly 1 dialer spawn for target_id={}, got {spawns}",
+                target_id.0
+            ))
+        }
+    });
 }
 
 /// `broker(bogus_id)` used to seed an empty `Arc<OnceCell>` slot before the

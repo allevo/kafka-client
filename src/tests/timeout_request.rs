@@ -206,11 +206,20 @@ async fn request_timeout_tears_down_concurrent_callers() {
 
     // After the handshake, delay every subsequent Metadata response.
     // The first two `send` calls both land on the same broker handle;
-    // both get torn down when the first times out.
+    // both get torn down when the first times out. Also count Metadata
+    // *requests* on the request side so the test can fence the second
+    // send on "first has reached the wire phase" without a sleep.
     let handshake_passed = Arc::new(AtomicUsize::new(0));
     let gate = handshake_passed.clone();
+    let metadata_reqs = Arc::new(AtomicUsize::new(0));
+    let reqs_hook = metadata_reqs.clone();
     let plan = FaultPlan {
-        on_request: None,
+        on_request: Some(Arc::new(move |view: &RequestView<'_>| {
+            if view.api_key == ApiKey::Metadata {
+                reqs_hook.fetch_add(1, Ordering::SeqCst);
+            }
+            None
+        })),
         on_response: Some(Arc::new(move |_view: &ResponseView<'_>| {
             // Pass the first response (ApiVersions during handshake),
             // delay every response after that.
@@ -242,9 +251,17 @@ async fn request_timeout_tears_down_concurrent_callers() {
         .await
     });
 
-    // Give the first call time to enter the wire phase on the shared
-    // broker connection before the second joins.
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    // Wait until the first call's Metadata request actually reaches the
+    // proxy (wire phase) before launching the second. A raw sleep could
+    // be too short on a loaded host (second call races past the first)
+    // or too long (wasted budget); polling the counter fires within a
+    // couple of ms of the real event.
+    helpers::wait_for_log(
+        || metadata_reqs.load(Ordering::SeqCst) >= 1,
+        Duration::from_secs(2),
+        "first call never reached the wire phase",
+    )
+    .await;
 
     let c2 = client.clone();
     let second = tokio::spawn(async move {

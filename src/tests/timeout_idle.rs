@@ -28,6 +28,15 @@ async fn idle_happy_path_under_load() {
             .expect("metadata under load should succeed");
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+
+    // The requests *did* succeed, but on their own that's not proof the
+    // idle arm stayed dormant — a bug that closed the connection between
+    // requests would be hidden by the reconnect in the next iteration.
+    // Pin down that the idle-close log never fired.
+    assert!(
+        !logs_contain("connections.max.idle exceeded"),
+        "idle arm fired despite continuous activity"
+    );
 }
 
 #[tokio::test]
@@ -64,6 +73,14 @@ async fn idle_close_fires_when_connection_is_idle() {
         ),
         other => panic!("expected Io(ConnectionAborted), got {other:?}"),
     }
+
+    // `ConnectionAborted` can originate from several paths in read_task;
+    // pin down that it was specifically the idle arm that fired, not a
+    // broker-side disconnect or some other error path.
+    assert!(
+        logs_contain("connections.max.idle exceeded"),
+        "connection was aborted, but not via the idle-close arm"
+    );
 }
 
 #[tokio::test]
@@ -86,4 +103,13 @@ async fn idle_disabled_never_closes() {
         .fetch_metadata()
         .await
         .expect("metadata must succeed when idle-close is disabled");
+
+    // The request succeeded, but that alone doesn't prove the idle arm
+    // stayed parked on `pending()` — a bug that fired it anyway could be
+    // masked if the follow-up request silently reconnected. Assert the
+    // log never fired.
+    assert!(
+        !logs_contain("connections.max.idle exceeded"),
+        "idle arm fired despite being disabled"
+    );
 }

@@ -2,7 +2,11 @@ use std::time::Duration;
 
 use super::helpers;
 
-/// Verify that BrokerClient::connect succeeds against a broker that enforces re-auth.
+/// Verify that when the broker advertises `connections.max.reauth.ms`, the
+/// handshake parses the session lifetime from `SaslAuthenticateResponse` and
+/// spawns the background re-auth task. A silent regression here would let
+/// the broker kill the connection at session expiry without the client ever
+/// re-authenticating.
 #[tokio::test]
 #[tracing_test::traced_test]
 async fn test_session_lifetime_ms_parsed() {
@@ -20,6 +24,18 @@ async fn test_session_lifetime_ms_parsed() {
 
     let versions = client.api_versions();
     assert!(!versions.is_empty());
+
+    // The reauth broker advertises a 5 s session lifetime, so the handshake
+    // must have parsed it and spawned the re-auth task. Without this the
+    // test would pass against a non-reauth broker too, missing the point.
+    assert!(
+        logs_contain("spawning re-auth task"),
+        "session lifetime was not parsed; re-auth task never spawned"
+    );
+    assert!(
+        !logs_contain("Broker doesn't require re-auth task"),
+        "broker did not advertise a session lifetime; test fixture is wrong"
+    );
 }
 
 /// Verify that the connection survives past the session lifetime by periodically sending
