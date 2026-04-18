@@ -697,6 +697,7 @@ async fn read_task(
                 );
                 break;
             }
+            // NB: `read_exact` is not cancellation safe!
             result = reader.read_exact(&mut size_buf) => result,
         };
 
