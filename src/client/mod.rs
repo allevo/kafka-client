@@ -174,19 +174,21 @@ impl Client {
     }
 
     /// Dispatch a typed Kafka request: pick a broker for `target`,
-    /// negotiate the wire version against that broker, build the request,
-    /// send it, and decode the response.
+    /// negotiate the wire version against that broker, send the request,
+    /// and decode the response.
     ///
-    /// `build` takes the negotiated version because some requests embed
-    /// version-gated fields, and because the retry follow-up (TIMEOUT.md §3)
-    /// will reinvoke it after retargeting to a different broker whose
-    /// negotiated version may differ — hence `Fn`, not `FnOnce`.
+    /// `request` is owned by the retry loop and encoded by reference, so
+    /// retries reuse the same value without cloning. Per-attempt version
+    /// negotiation is applied at encode time. Callers that need to rebuild
+    /// version-gated fields against each attempt's negotiated version are
+    /// not served by this entry point; add a separate builder-based method
+    /// when such a caller appears.
     pub async fn send<Req, Resp>(
         &self,
         target: NodeTarget,
         api_key: ApiKey,
         max_version: i16,
-        build: impl Fn(i16) -> Req,
+        request: Req,
     ) -> Result<Resp>
     where
         Req: Encodable + HeaderVersion + Send + 'static,
@@ -204,7 +206,7 @@ impl Client {
             let per_attempt = (now + self.inner.request_timeout).min(api_deadline);
 
             match self
-                .send_once(per_attempt, &target, api_key, max_version, &build)
+                .send_once(per_attempt, &target, api_key, max_version, &request)
                 .await
             {
                 Ok(resp) => return Ok(resp),
@@ -251,7 +253,7 @@ impl Client {
         target: &NodeTarget,
         api_key: ApiKey,
         max_version: i16,
-        build: impl Fn(i16) -> Req,
+        request: &Req,
     ) -> Result<Resp>
     where
         Req: Encodable + HeaderVersion + Send + 'static,
@@ -276,7 +278,6 @@ impl Client {
         };
 
         let version = broker.negotiate_version(api_key, max_version)?;
-        let request = build(version);
 
         // Wire phase.
         match tokio::time::timeout_at(deadline, broker.send(api_key, version, request)).await {

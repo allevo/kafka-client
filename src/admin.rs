@@ -24,16 +24,15 @@ impl AdminClient {
         topics: Vec<CreatableTopic>,
         timeout_ms: i32,
     ) -> Result<CreateTopicsResponse> {
+        let request = CreateTopicsRequest::default()
+            .with_topics(topics)
+            .with_timeout_ms(timeout_ms);
         // CreateTopics is routed to the controller.
         // Since Kafka 2.4 (KIP-590) any broker will forward admin requests to the
         // controller, but targeting the controller directly is still canonical in
         // the other clients.
         self.client
-            .send(NodeTarget::Controller, ApiKey::CreateTopics, 2, move |_| {
-                CreateTopicsRequest::default()
-                    .with_topics(topics.clone())
-                    .with_timeout_ms(timeout_ms)
-            })
+            .send(NodeTarget::Controller, ApiKey::CreateTopics, 2, request)
             .await
     }
 }

@@ -215,7 +215,7 @@ impl BrokerClient {
         &self,
         api_key: ApiKey,
         api_version: i16,
-        request: Req,
+        request: &Req,
     ) -> Result<Resp>
     where
         Req: Encodable + HeaderVersion + Send + 'static,
@@ -325,7 +325,7 @@ impl BrokerClient {
     pub async fn fetch_metadata(&self) -> Result<MetadataResponse> {
         let version = negotiate_version(&self.inner.api_versions, ApiKey::Metadata, 1)?;
         let request = MetadataRequest::default().with_topics(None);
-        self.send(ApiKey::Metadata, version, request).await
+        self.send(ApiKey::Metadata, version, &request).await
     }
 
     pub fn api_versions(&self) -> &[ApiVersion] {
@@ -402,7 +402,7 @@ impl BrokerClient {
             .send(
                 ApiKey::SaslHandshake,
                 1,
-                SaslHandshakeRequest::default().with_mechanism(StrBytes::from_static_str("PLAIN")),
+                &SaslHandshakeRequest::default().with_mechanism(StrBytes::from_static_str("PLAIN")),
             )
             .await?;
         if handshake_resp.error_code != 0 {
@@ -423,7 +423,7 @@ impl BrokerClient {
             .send(
                 ApiKey::SaslAuthenticate,
                 auth_version,
-                SaslAuthenticateRequest::default().with_auth_bytes(token),
+                &SaslAuthenticateRequest::default().with_auth_bytes(token),
             )
             .await?;
         if auth_resp.error_code != 0 {

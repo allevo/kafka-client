@@ -61,7 +61,7 @@ async fn client_with_synthetic(host: &str, port: u16, request_timeout: Duration)
     client_with_synthetic_full(host, port, request_timeout, request_timeout * 4, 0).await
 }
 
-fn metadata_request_build(_version: i16) -> MetadataRequest {
+fn metadata_request() -> MetadataRequest {
     MetadataRequest::default().with_topics(None)
 }
 
@@ -120,7 +120,7 @@ async fn request_timeout_wire_phase_stall() {
             crate::NodeTarget::Broker(SYNTH_ID),
             ApiKey::Metadata,
             1,
-            metadata_request_build,
+            metadata_request(),
         )
         .await
         .unwrap_err();
@@ -145,7 +145,7 @@ async fn request_timeout_wire_phase_stall() {
             crate::NodeTarget::Broker(SYNTH_ID),
             ApiKey::Metadata,
             1,
-            metadata_request_build,
+            metadata_request(),
         ),
     )
     .await
@@ -175,7 +175,7 @@ async fn request_timeout_acquisition_phase_stall() {
             crate::NodeTarget::Broker(SYNTH_ID),
             ApiKey::Metadata,
             1,
-            metadata_request_build,
+            metadata_request(),
         ),
     )
     .await
@@ -246,7 +246,7 @@ async fn request_timeout_tears_down_concurrent_callers() {
             crate::NodeTarget::Broker(SYNTH_ID),
             ApiKey::Metadata,
             1,
-            metadata_request_build,
+            metadata_request(),
         )
         .await
     });
@@ -269,7 +269,7 @@ async fn request_timeout_tears_down_concurrent_callers() {
             crate::NodeTarget::Broker(SYNTH_ID),
             ApiKey::Metadata,
             1,
-            metadata_request_build,
+            metadata_request(),
         )
         .await
     });
@@ -392,7 +392,7 @@ async fn retry_loop_recovers_after_request_timeout() {
             crate::NodeTarget::AnyBroker,
             ApiKey::Metadata,
             1,
-            metadata_request_build,
+            metadata_request(),
         ),
     )
     .await
@@ -448,7 +448,7 @@ async fn retry_loop_respects_api_timeout_cap() {
             crate::NodeTarget::AnyBroker,
             ApiKey::Metadata,
             1,
-            metadata_request_build,
+            metadata_request(),
         )
         .await
         .unwrap_err();
