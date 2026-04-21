@@ -653,6 +653,11 @@ async fn read_task(
     reauth_pending: Arc<AtomicBool>,
 ) {
     let mut size_buf = [0u8; 4];
+    // Persistent offset into `size_buf` across loop iterations. The read arm
+    // of the `select!` below uses `read` (cancel-safe) rather than `read_exact`
+    // (not cancel-safe), so a partial header survives when another arm wins —
+    // notably the idle-timer `continue` path with in-flight activity.
+    let mut size_bytes_read = 0usize;
     let mut reauth_shutdown = std::pin::pin!(reauth_shutdown_rx);
     let mut last_activity = tokio::time::Instant::now();
 
@@ -697,23 +702,43 @@ async fn read_task(
                 );
                 break;
             }
-            // NB: `read_exact` is not cancellation safe!
-            result = reader.read_exact(&mut size_buf) => result,
+            // `read` is cancel-safe (unlike `read_exact`): if another arm wins,
+            // no bytes have been consumed from the stream. We assemble the
+            // 4-byte size header across iterations via `size_bytes_read`.
+            result = reader.read(&mut size_buf[size_bytes_read..]) => result,
         };
 
-        if let Err(e) = read_result {
-            // UnexpectedEof on a frame boundary means the peer closed cleanly between
-            // responses — typically the user dropping the client. Anything else is a
-            // genuine surprise (mid-frame disconnect, reset, etc.) and worth a warning.
-            if is_connection_closed(&e) {
-                tracing::info!(error = %e, "connection closed while waiting for next response");
+        let n = match read_result {
+            Ok(n) => n,
+            Err(e) => {
+                if is_connection_closed(&e) {
+                    tracing::info!(error = %e, "connection closed while waiting for next response");
+                } else {
+                    tracing::warn!(error = %e, "connection lost while reading response size");
+                }
+                break;
+            }
+        };
+        if n == 0 {
+            // EOF. Clean if we're at a frame boundary; mid-header otherwise.
+            if size_bytes_read == 0 {
+                tracing::info!("connection closed while waiting for next response");
             } else {
-                tracing::warn!(error = %e, "connection lost while reading response size");
+                tracing::warn!(
+                    size_bytes_read,
+                    "connection closed mid-frame while reading response size"
+                );
             }
             break;
         }
+        size_bytes_read += n;
+        if size_bytes_read < 4 {
+            // Partial size header; loop to read the remainder.
+            continue;
+        }
 
         let response_size = i32::from_be_bytes(size_buf);
+        size_bytes_read = 0;
         let Ok(response_size) = usize::try_from(response_size) else {
             tracing::error!(response_size, "invalid response size, closing read task");
             break;
