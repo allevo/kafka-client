@@ -59,6 +59,9 @@ struct ClientInner {
     max_response_size: usize,
     address_resolver: Option<AddressResolver>,
 
+    connection_setup_timeout: Option<Duration>,
+    connections_max_idle: Option<Duration>,
+
     reconnect_backoff: Duration,
     reconnect_backoff_max: Duration,
 
@@ -138,6 +141,8 @@ impl Client {
                         auth,
                         max_response_size: config.max_response_size,
                         address_resolver,
+                        connection_setup_timeout: config.connection_setup_timeout,
+                        connections_max_idle: config.connections_max_idle,
                         reconnect_backoff: config.reconnect_backoff,
                         reconnect_backoff_max: config.reconnect_backoff_max,
                         request_timeout: config.request_timeout,

@@ -78,6 +78,8 @@ pub(super) fn spawn_dialer(
     let security = inner.security.clone();
     let auth = inner.auth.clone();
     let max_response_size = inner.max_response_size;
+    let connection_setup_timeout = inner.connection_setup_timeout;
+    let connections_max_idle = inner.connections_max_idle;
     let base = inner.reconnect_backoff;
     let max = inner.reconnect_backoff_max;
     tracing::debug!(
@@ -96,6 +98,8 @@ pub(super) fn spawn_dialer(
         security,
         auth,
         max_response_size,
+        connection_setup_timeout,
+        connections_max_idle,
         base,
         max,
         initial_times,
@@ -139,6 +143,8 @@ async fn perform_backoff_retry(
     security: Security,
     auth: Auth,
     max_response_size: usize,
+    connection_setup_timeout: Option<Duration>,
+    connections_max_idle: Option<Duration>,
     base: Duration,
     max: Duration,
     initial_times: u32,
@@ -180,7 +186,13 @@ async fn perform_backoff_retry(
         }
 
         let dial_result: Result<BrokerClient> = async {
-            let config = Config::new(&host, port).with_max_response_size(max_response_size);
+            let mut config = Config::new(&host, port).with_max_response_size(max_response_size);
+            if let Some(d) = connection_setup_timeout {
+                config = config.with_connection_setup_timeout(d);
+            }
+            if let Some(d) = connections_max_idle {
+                config = config.with_connections_max_idle(d);
+            }
             let conn = Connection::connect(&config, security.clone()).await?;
             BrokerClient::new(conn, auth.clone()).await
         }
