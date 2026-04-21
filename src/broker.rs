@@ -671,9 +671,18 @@ async fn read_task(
     loop {
         let read_result = tokio::select! {
             biased;
-            // This branch is fired only if auth fails.
+            // Fires on `Ok(())` when `reauth_task` signals auth failure, or on
+            // `Err(RecvError)` when the sender is dropped — which happens during
+            // user-initiated shutdown (`BrokerClientInner::drop`). Because the
+            // select is `biased`, this arm wins over `close.notified()` when both
+            // are simultaneously ready on shutdown, so disambiguate via the
+            // `shutdown` flag to avoid a spurious ERROR on clean close.
             _ = &mut reauth_shutdown => {
-                tracing::error!("re-authentication failed, shutting down connection");
+                if shutdown.load(Ordering::Acquire) {
+                    tracing::info!("reauth sender dropped during client shutdown");
+                } else {
+                    tracing::error!("re-authentication failed, shutting down connection");
+                }
                 break;
             }
             // User-initiated shutdown via `BrokerClient::shutdown()`.

@@ -48,3 +48,57 @@ async fn test_client_close_shuts_down_held_broker() {
     // Idempotency: second close must not panic.
     client.close();
 }
+
+/// Regression test for the spurious `"re-authentication failed"` ERROR log
+/// on a clean, user-initiated shutdown.
+///
+/// With `Auth::None` the handshake stores `reauth_shutdown_tx` in
+/// `_reauth_shutdown_tx` on the inner (no reauth task is spawned). When the
+/// user drops the only external `BrokerClient` handle, `BrokerClientInner::drop`
+/// notifies `close` and the parked sender is dropped as a struct field right
+/// after. Both the `close.notified()` arm and the `reauth_shutdown` arm of
+/// `read_task`'s biased `select!` become ready on the same poll, and the
+/// biased ordering picks `reauth_shutdown` — producing an ERROR-level
+/// `"re-authentication failed, shutting down connection"` log for what was
+/// a clean close. Monitoring alerts watching for that message fire a false
+/// positive on every normal shutdown.
+#[tokio::test]
+#[tracing_test::traced_test]
+async fn test_clean_shutdown_does_not_log_reauth_error() {
+    let broker = helpers::plaintext_broker().await;
+
+    let config = crate::Config::new(&broker.host, broker.port);
+    let conn = crate::Connection::connect(&config, crate::Security::Plaintext)
+        .await
+        .unwrap();
+    let client = crate::BrokerClient::new(conn, crate::Auth::None)
+        .await
+        .unwrap();
+
+    // Sanity: the connection is live.
+    client.fetch_metadata().await.unwrap();
+
+    // Drop the only external handle → `BrokerClientInner::drop` runs.
+    drop(client);
+
+    // Wait until `read_task` has exited so all tear-down log lines have landed.
+    helpers::wait_for_log(
+        || logs_contain("read task exiting"),
+        Duration::from_secs(2),
+        "read_task never exited after BrokerClient drop",
+    )
+    .await;
+
+    logs_assert(|lines: &[&str]| {
+        let saw_spurious_error = lines
+            .iter()
+            .any(|l| l.contains("re-authentication failed, shutting down connection"));
+        if saw_spurious_error {
+            return Err(
+                "clean shutdown emitted spurious ERROR \"re-authentication failed, shutting down connection\" (Bug 4 regression)"
+                    .into(),
+            );
+        }
+        Ok(())
+    });
+}
