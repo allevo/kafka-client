@@ -513,11 +513,11 @@ async fn reauth_task(
         }
 
         // None means inner is freed.
-        let Some(inner) = inner.upgrade() else {
+        let Some(strong) = inner.upgrade() else {
             tracing::info!("reauth task: client dropped, exiting");
             return;
         };
-        let client = BrokerClient { inner };
+        let client = BrokerClient { inner: strong };
 
         tracing::info!("re-auth timer fired, starting re-authentication");
         // Signal read_task that a re-auth is imminent so it doesn't idle-close
@@ -537,7 +537,14 @@ async fn reauth_task(
             }
             Ok(None) => {
                 tracing::info!("re-auth returned no session lifetime, stopping reauth task");
-                break; // drops sender → read_task sees Err(Closed), ignores it
+                // Broker no longer enforces KIP-368 on this session. Park the
+                // sender back on the inner so read_task's `reauth_shutdown`
+                // arm stays pending forever. Mirrors the init-time no-reauth path
+                // at `BrokerClient::new`.
+                if let Some(inner) = inner.upgrade() {
+                    *inner._reauth_shutdown_tx.lock().unwrap() = Some(reauth_shutdown_tx);
+                }
+                break;
             }
             Err(e) => {
                 tracing::error!(error = %e, "re-authentication failed, shutting down connection");
@@ -664,9 +671,7 @@ async fn read_task(
     loop {
         let read_result = tokio::select! {
             biased;
-            // The sender is either held alive inside `BrokerClient` (no reauth
-            // needed — stays pending forever) or owned by `reauth_task` (only
-            // sends on failure). Either way this branch only fires on failure.
+            // This branch is fired only if auth fails.
             _ = &mut reauth_shutdown => {
                 tracing::error!("re-authentication failed, shutting down connection");
                 break;
