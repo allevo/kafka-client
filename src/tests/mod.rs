@@ -1,3 +1,4 @@
+mod admin;
 mod close;
 mod close_dial_race;
 mod cluster;

@@ -90,7 +90,7 @@ async fn test_standalone_create_topic() {
 
     let response = client
         .admin()
-        .create_topics(vec![topic], 5000)
+        .create_topics(vec![topic], Some(std::time::Duration::from_secs(5)))
         .await
         .unwrap();
     assert_eq!(response.topics.len(), 1);
