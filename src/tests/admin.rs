@@ -10,6 +10,8 @@ use kafka_protocol::messages::incremental_alter_configs_request::{
 use kafka_protocol::messages::metadata_request::MetadataRequestTopic;
 use kafka_protocol::protocol::StrBytes;
 
+use crate::AdminOptions;
+
 use super::helpers;
 
 // Kafka ConfigResource.Type values (org.apache.kafka.common.config.ConfigResource.Type).
@@ -32,7 +34,11 @@ async fn create_topic(client: &crate::Client, name: &'static str, partitions: i3
         .with_replication_factor(1);
     let response = client
         .admin()
-        .create_topics(vec![topic], Some(Duration::from_secs(5)))
+        .create_topics(
+            vec![topic],
+            Some(Duration::from_secs(5)),
+            AdminOptions::default(),
+        )
         .await
         .unwrap();
     let code = response.topics[0].error_code;
@@ -54,7 +60,8 @@ async fn test_admin_delete_topics() {
         .admin()
         .delete_topics(
             vec![TopicName::from(StrBytes::from_static_str(name))],
-            Duration::from_secs(5),
+            Some(Duration::from_secs(5)),
+            AdminOptions::default(),
         )
         .await
         .unwrap();
@@ -86,7 +93,12 @@ async fn test_admin_create_partitions() {
         .with_assignments(None);
     let response = client
         .admin()
-        .create_partitions(vec![topic], Duration::from_secs(5), false)
+        .create_partitions(
+            vec![topic],
+            Some(Duration::from_secs(5)),
+            false,
+            AdminOptions::default(),
+        )
         .await
         .unwrap();
     assert_eq!(response.results.len(), 1);
@@ -99,10 +111,13 @@ async fn test_admin_create_partitions() {
 
     let describe = client
         .admin()
-        .describe_topics(vec![
-            MetadataRequestTopic::default()
-                .with_name(Some(TopicName::from(StrBytes::from_static_str(name)))),
-        ])
+        .describe_topics(
+            vec![
+                MetadataRequestTopic::default()
+                    .with_name(Some(TopicName::from(StrBytes::from_static_str(name)))),
+            ],
+            AdminOptions::default(),
+        )
         .await
         .unwrap();
     let topic_md = describe
@@ -120,7 +135,11 @@ async fn test_admin_list_topics() {
     let name = "admin-list-topics";
     create_topic(&client, name, 1).await;
 
-    let response = client.admin().list_topics().await.unwrap();
+    let response = client
+        .admin()
+        .list_topics(AdminOptions::default())
+        .await
+        .unwrap();
     let found = response
         .topics
         .iter()
@@ -137,10 +156,13 @@ async fn test_admin_describe_topics() {
 
     let response = client
         .admin()
-        .describe_topics(vec![
-            MetadataRequestTopic::default()
-                .with_name(Some(TopicName::from(StrBytes::from_static_str(name)))),
-        ])
+        .describe_topics(
+            vec![
+                MetadataRequestTopic::default()
+                    .with_name(Some(TopicName::from(StrBytes::from_static_str(name)))),
+            ],
+            AdminOptions::default(),
+        )
         .await
         .unwrap();
     assert_eq!(response.topics.len(), 1);
@@ -154,7 +176,11 @@ async fn test_admin_describe_topics() {
 async fn test_admin_describe_cluster() {
     let client = connect().await;
 
-    let response = client.admin().describe_cluster(false).await.unwrap();
+    let response = client
+        .admin()
+        .describe_cluster(false, AdminOptions::default())
+        .await
+        .unwrap();
     assert_eq!(response.error_code, 0);
     assert!(
         !response.brokers.is_empty(),
@@ -176,7 +202,7 @@ async fn test_admin_describe_configs() {
         .with_configuration_keys(None);
     let response = client
         .admin()
-        .describe_configs(vec![resource])
+        .describe_configs(vec![resource], AdminOptions::default())
         .await
         .unwrap();
     assert_eq!(response.results.len(), 1);
@@ -205,7 +231,13 @@ async fn test_admin_create_list_delete_list_create_list_flow() {
 
     create_topic(&client, name, 1).await;
     assert!(
-        listed_has(&client.admin().list_topics().await.unwrap()),
+        listed_has(
+            &client
+                .admin()
+                .list_topics(AdminOptions::default())
+                .await
+                .unwrap()
+        ),
         "topic '{name}' missing after first create"
     );
 
@@ -213,20 +245,33 @@ async fn test_admin_create_list_delete_list_create_list_flow() {
         .admin()
         .delete_topics(
             vec![TopicName::from(StrBytes::from_static_str(name))],
-            Duration::from_secs(5),
+            Some(Duration::from_secs(5)),
+            AdminOptions::default(),
         )
         .await
         .unwrap();
     assert_eq!(deleted.responses[0].error_code, 0);
 
     assert!(
-        !listed_has(&client.admin().list_topics().await.unwrap()),
+        !listed_has(
+            &client
+                .admin()
+                .list_topics(AdminOptions::default())
+                .await
+                .unwrap()
+        ),
         "topic '{name}' still present after delete"
     );
 
     create_topic(&client, name, 1).await;
     assert!(
-        listed_has(&client.admin().list_topics().await.unwrap()),
+        listed_has(
+            &client
+                .admin()
+                .list_topics(AdminOptions::default())
+                .await
+                .unwrap()
+        ),
         "topic '{name}' missing after recreate"
     );
 }
@@ -249,7 +294,7 @@ async fn test_admin_incremental_alter_configs() {
         .with_configs(vec![config]);
     let response = client
         .admin()
-        .incremental_alter_configs(vec![resource], false)
+        .incremental_alter_configs(vec![resource], false, AdminOptions::default())
         .await
         .unwrap();
     assert_eq!(response.responses.len(), 1);
@@ -257,12 +302,15 @@ async fn test_admin_incremental_alter_configs() {
 
     let describe = client
         .admin()
-        .describe_configs(vec![
-            DescribeConfigsResource::default()
-                .with_resource_type(RESOURCE_TYPE_TOPIC)
-                .with_resource_name(StrBytes::from_static_str(name))
-                .with_configuration_keys(Some(vec![StrBytes::from_static_str("retention.ms")])),
-        ])
+        .describe_configs(
+            vec![
+                DescribeConfigsResource::default()
+                    .with_resource_type(RESOURCE_TYPE_TOPIC)
+                    .with_resource_name(StrBytes::from_static_str(name))
+                    .with_configuration_keys(Some(vec![StrBytes::from_static_str("retention.ms")])),
+            ],
+            AdminOptions::default(),
+        )
         .await
         .unwrap();
     let retention = describe.results[0]
@@ -273,5 +321,36 @@ async fn test_admin_incremental_alter_configs() {
     assert_eq!(
         retention.value.as_ref().map(|v| v.as_str()),
         Some(new_retention)
+    );
+}
+
+#[tokio::test]
+#[tracing_test::traced_test]
+async fn test_admin_options_timeout_override() {
+    // A 1 ms api_timeout override trips the retry-loop deadline long before any
+    // real RPC can complete; with_retries(0) skips the refresh/retry path so the
+    // first failure returns immediately. Proves AdminOptions reaches Client::send
+    // instead of being silently discarded.
+    let client = connect().await;
+
+    let started = std::time::Instant::now();
+    let result = client
+        .admin()
+        .describe_cluster(
+            false,
+            AdminOptions::new()
+                .with_timeout(Duration::from_millis(1))
+                .with_retries(0),
+        )
+        .await;
+    let elapsed = started.elapsed();
+
+    assert!(
+        matches!(result, Err(crate::Error::RequestTimeout(_))),
+        "expected RequestTimeout, got: {result:?}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(1),
+        "override ignored? call took {elapsed:?}"
     );
 }

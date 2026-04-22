@@ -121,6 +121,7 @@ async fn request_timeout_wire_phase_stall() {
             ApiKey::Metadata,
             1,
             metadata_request(),
+            &crate::AdminOptions::default(),
         )
         .await
         .unwrap_err();
@@ -146,6 +147,7 @@ async fn request_timeout_wire_phase_stall() {
             ApiKey::Metadata,
             1,
             metadata_request(),
+            &crate::AdminOptions::default(),
         ),
     )
     .await
@@ -176,6 +178,7 @@ async fn request_timeout_acquisition_phase_stall() {
             ApiKey::Metadata,
             1,
             metadata_request(),
+            &crate::AdminOptions::default(),
         ),
     )
     .await
@@ -247,6 +250,7 @@ async fn request_timeout_tears_down_concurrent_callers() {
             ApiKey::Metadata,
             1,
             metadata_request(),
+            &crate::AdminOptions::default(),
         )
         .await
     });
@@ -270,6 +274,7 @@ async fn request_timeout_tears_down_concurrent_callers() {
             ApiKey::Metadata,
             1,
             metadata_request(),
+            &crate::AdminOptions::default(),
         )
         .await
     });
@@ -393,6 +398,7 @@ async fn retry_loop_recovers_after_request_timeout() {
             ApiKey::Metadata,
             1,
             metadata_request(),
+            &crate::AdminOptions::default(),
         ),
     )
     .await
@@ -449,6 +455,7 @@ async fn retry_loop_respects_api_timeout_cap() {
             ApiKey::Metadata,
             1,
             metadata_request(),
+            &crate::AdminOptions::default(),
         )
         .await
         .unwrap_err();

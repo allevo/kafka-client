@@ -6,7 +6,7 @@ pub mod connection;
 pub mod error;
 pub mod secret;
 
-pub use admin::AdminClient;
+pub use admin::{AdminClient, AdminOptions};
 pub use broker::{Auth, BrokerClient};
 pub use client::{Client, NodeTarget};
 pub use config::{Config, Security};

@@ -16,6 +16,67 @@ use kafka_protocol::messages::{
 use crate::client::{Client, NodeTarget};
 use crate::error::Result;
 
+/// Per-call overrides for the client-side retry loop that governs every
+/// admin RPC. falls back to [`crate::Config`].
+#[derive(Debug, Default, Clone)]
+pub struct AdminOptions {
+    timeout: Option<Duration>,
+    retries: Option<u32>,
+    retry_backoff: Option<Duration>,
+    retry_backoff_max: Option<Duration>,
+}
+
+impl AdminOptions {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Override the client-side deadline for this call. Corresponds to
+    /// `Config::api_timeout` and caps the total retry-loop duration.
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = Some(timeout);
+        self
+    }
+
+    /// Override the maximum number of retry attempts after the first
+    /// send. `0` disables retries for this call only. Corresponds to
+    /// `Config::retries`.
+    pub fn with_retries(mut self, retries: u32) -> Self {
+        self.retries = Some(retries);
+        self
+    }
+
+    /// Override the base backoff between retry attempts. Corresponds to
+    /// `Config::retry_backoff`.
+    pub fn with_retry_backoff(mut self, base: Duration) -> Self {
+        self.retry_backoff = Some(base);
+        self
+    }
+
+    /// Override the cap on the exponential retry backoff. Corresponds to
+    /// `Config::retry_backoff_max`.
+    pub fn with_retry_backoff_max(mut self, max: Duration) -> Self {
+        self.retry_backoff_max = Some(max);
+        self
+    }
+
+    pub(crate) fn timeout(&self) -> Option<Duration> {
+        self.timeout
+    }
+
+    pub(crate) fn retries(&self) -> Option<u32> {
+        self.retries
+    }
+
+    pub(crate) fn retry_backoff(&self) -> Option<Duration> {
+        self.retry_backoff
+    }
+
+    pub(crate) fn retry_backoff_max(&self) -> Option<Duration> {
+        self.retry_backoff_max
+    }
+}
+
 /// Admin surface for cluster-management RPCs.
 ///
 /// Administrative operations live here.
@@ -33,24 +94,33 @@ impl AdminClient {
 
     /// Create one or more topics. Routed to the controller.
     ///
-    /// `timeout` is the broker-side wait for partition assignment to converge;
-    /// it is independent of the client's own request timeout.
+    /// `broker_operation_timeout` is the broker-side wait for partition
+    /// assignment to converge (wire `timeout_ms`); it is independent of the
+    /// client-side deadline carried by `opts`.
     pub async fn create_topics(
         &self,
         topics: Vec<CreatableTopic>,
-        timeout: Option<Duration>,
+        broker_operation_timeout: Option<Duration>,
+        opts: AdminOptions,
     ) -> Result<CreateTopicsResponse> {
         // Match other client implementations.
-        let timeout = timeout.unwrap_or(DEFAULT_API_TIMEOUT);
+        let broker_operation_timeout =
+            broker_operation_timeout.unwrap_or(DEFAULT_BROKER_OPERATION_TIMEOUT);
         let request = CreateTopicsRequest::default()
             .with_topics(topics)
-            .with_timeout_ms(duration_to_ms(timeout));
+            .with_timeout_ms(duration_to_ms(broker_operation_timeout));
         // CreateTopics is routed to the controller.
         // Since Kafka 2.4 (KIP-590) any broker will forward admin requests to the
         // controller, but targeting the controller directly is still canonical in
         // the other clients.
         self.client
-            .send(NodeTarget::Controller, ApiKey::CreateTopics, 2, request)
+            .send(
+                NodeTarget::Controller,
+                ApiKey::CreateTopics,
+                2,
+                request,
+                &opts,
+            )
             .await
     }
 
@@ -58,13 +128,22 @@ impl AdminClient {
     pub async fn delete_topics(
         &self,
         topic_names: Vec<TopicName>,
-        timeout: Duration,
+        broker_operation_timeout: Option<Duration>,
+        opts: AdminOptions,
     ) -> Result<DeleteTopicsResponse> {
+        let broker_operation_timeout =
+            broker_operation_timeout.unwrap_or(DEFAULT_BROKER_OPERATION_TIMEOUT);
         let request = DeleteTopicsRequest::default()
             .with_topic_names(topic_names)
-            .with_timeout_ms(duration_to_ms(timeout));
+            .with_timeout_ms(duration_to_ms(broker_operation_timeout));
         self.client
-            .send(NodeTarget::Controller, ApiKey::DeleteTopics, 4, request)
+            .send(
+                NodeTarget::Controller,
+                ApiKey::DeleteTopics,
+                4,
+                request,
+                &opts,
+            )
             .await
     }
 
@@ -77,26 +156,35 @@ impl AdminClient {
     pub async fn create_partitions(
         &self,
         topics: Vec<CreatePartitionsTopic>,
-        timeout: Duration,
+        broker_operation_timeout: Option<Duration>,
         validate_only: bool,
+        opts: AdminOptions,
     ) -> Result<CreatePartitionsResponse> {
+        let broker_operation_timeout =
+            broker_operation_timeout.unwrap_or(DEFAULT_BROKER_OPERATION_TIMEOUT);
         let request = CreatePartitionsRequest::default()
             .with_topics(topics)
-            .with_timeout_ms(duration_to_ms(timeout))
+            .with_timeout_ms(duration_to_ms(broker_operation_timeout))
             .with_validate_only(validate_only);
         self.client
-            .send(NodeTarget::Controller, ApiKey::CreatePartitions, 3, request)
+            .send(
+                NodeTarget::Controller,
+                ApiKey::CreatePartitions,
+                3,
+                request,
+                &opts,
+            )
             .await
     }
 
     /// Return metadata for *all* topics in the cluster.
-    pub async fn list_topics(&self) -> Result<MetadataResponse> {
+    pub async fn list_topics(&self, opts: AdminOptions) -> Result<MetadataResponse> {
         // `topics: None` asks the broker for *all* topics.
         // `MetadataRequest::default()` yields `Some(vec![])`, which means *no* topics
         // (see CLAUDE.md), so we override explicitly.
         let request = MetadataRequest::default().with_topics(None);
         self.client
-            .send(NodeTarget::AnyBroker, ApiKey::Metadata, 9, request)
+            .send(NodeTarget::AnyBroker, ApiKey::Metadata, 9, request, &opts)
             .await
     }
 
@@ -104,10 +192,11 @@ impl AdminClient {
     pub async fn describe_topics(
         &self,
         topics: Vec<MetadataRequestTopic>,
+        opts: AdminOptions,
     ) -> Result<MetadataResponse> {
         let request = MetadataRequest::default().with_topics(Some(topics));
         self.client
-            .send(NodeTarget::AnyBroker, ApiKey::Metadata, 9, request)
+            .send(NodeTarget::AnyBroker, ApiKey::Metadata, 9, request, &opts)
             .await
     }
 
@@ -115,11 +204,18 @@ impl AdminClient {
     pub async fn describe_cluster(
         &self,
         include_cluster_authorized_operations: bool,
+        opts: AdminOptions,
     ) -> Result<DescribeClusterResponse> {
         let request = DescribeClusterRequest::default()
             .with_include_cluster_authorized_operations(include_cluster_authorized_operations);
         self.client
-            .send(NodeTarget::AnyBroker, ApiKey::DescribeCluster, 0, request)
+            .send(
+                NodeTarget::AnyBroker,
+                ApiKey::DescribeCluster,
+                0,
+                request,
+                &opts,
+            )
             .await
     }
 
@@ -127,10 +223,17 @@ impl AdminClient {
     pub async fn describe_configs(
         &self,
         resources: Vec<DescribeConfigsResource>,
+        opts: AdminOptions,
     ) -> Result<DescribeConfigsResponse> {
         let request = DescribeConfigsRequest::default().with_resources(resources);
         self.client
-            .send(NodeTarget::AnyBroker, ApiKey::DescribeConfigs, 2, request)
+            .send(
+                NodeTarget::AnyBroker,
+                ApiKey::DescribeConfigs,
+                2,
+                request,
+                &opts,
+            )
             .await
     }
 
@@ -139,6 +242,7 @@ impl AdminClient {
         &self,
         resources: Vec<AlterConfigsResource>,
         validate_only: bool,
+        opts: AdminOptions,
     ) -> Result<IncrementalAlterConfigsResponse> {
         // Routed to the controller: correct for TOPIC resources, and for BROKER
         // resources KIP-590 controller forwarding handles it transparently on
@@ -152,13 +256,14 @@ impl AdminClient {
                 ApiKey::IncrementalAlterConfigs,
                 1,
                 request,
+                &opts,
             )
             .await
     }
 }
 
 // Mirrors the other clients.
-const DEFAULT_API_TIMEOUT: Duration = Duration::from_secs(60);
+const DEFAULT_BROKER_OPERATION_TIMEOUT: Duration = Duration::from_secs(60);
 
 fn duration_to_ms(timeout: Duration) -> i32 {
     // Kafka admin RPCs carry timeouts as i32 milliseconds on the wire. Saturate at

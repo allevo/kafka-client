@@ -8,7 +8,7 @@ use kafka_protocol::messages::{ApiKey, BrokerId, MetadataResponse};
 use kafka_protocol::protocol::{Decodable, Encodable, HeaderVersion};
 use tokio::sync::oneshot;
 
-use crate::admin::AdminClient;
+use crate::admin::{AdminClient, AdminOptions};
 use crate::broker::{Auth, BrokerClient};
 use crate::config::{Config, Security};
 use crate::connection::Connection;
@@ -194,12 +194,20 @@ impl Client {
         api_key: ApiKey,
         max_version: i16,
         request: Req,
+        opts: &AdminOptions,
     ) -> Result<Resp>
     where
         Req: Encodable + HeaderVersion + Send + 'static,
         Resp: Decodable + HeaderVersion,
     {
-        let api_deadline = tokio::time::Instant::now() + self.inner.api_timeout;
+        let api_timeout = opts.timeout().unwrap_or(self.inner.api_timeout);
+        let max_retries = opts.retries().unwrap_or(self.inner.retries);
+        let retry_backoff = opts.retry_backoff().unwrap_or(self.inner.retry_backoff);
+        let retry_backoff_max = opts
+            .retry_backoff_max()
+            .unwrap_or(self.inner.retry_backoff_max);
+
+        let api_deadline = tokio::time::Instant::now() + api_timeout;
         let mut attempt: u32 = 0;
 
         loop {
@@ -216,7 +224,7 @@ impl Client {
             {
                 Ok(resp) => return Ok(resp),
                 Err(e) => {
-                    if attempt >= self.inner.retries {
+                    if attempt >= max_retries {
                         return Err(e);
                     }
                     match e.classify() {
@@ -239,11 +247,7 @@ impl Client {
                     }
                     attempt = attempt.saturating_add(1);
 
-                    let backoff = next_backoff(
-                        attempt,
-                        self.inner.retry_backoff,
-                        self.inner.retry_backoff_max,
-                    );
+                    let backoff = next_backoff(attempt, retry_backoff, retry_backoff_max);
                     let sleep_until = (tokio::time::Instant::now() + backoff).min(api_deadline);
                     tokio::time::sleep_until(sleep_until).await;
                 }
