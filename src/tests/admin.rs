@@ -327,10 +327,14 @@ async fn test_admin_incremental_alter_configs() {
 #[tokio::test]
 #[tracing_test::traced_test]
 async fn test_admin_options_timeout_override() {
-    // A 1 ms api_timeout override trips the retry-loop deadline long before any
-    // real RPC can complete; with_retries(0) skips the refresh/retry path so the
-    // first failure returns immediately. Proves AdminOptions reaches Client::send
-    // instead of being silently discarded.
+    // A zero api_timeout override trips the retry-loop deadline check on the
+    // very first iteration, before any RPC can fire; with_retries(0) skips the
+    // refresh/retry path so the first failure returns immediately. Proves
+    // AdminOptions reaches Client::send instead of being silently discarded —
+    // the default api_timeout is never zero, so a successful response here
+    // would mean the override was dropped. A non-zero value (e.g. 1 ms) is
+    // racy: a warm local broker can answer DescribeCluster within that window
+    // on a fast runner.
     let client = connect().await;
 
     let started = std::time::Instant::now();
@@ -339,7 +343,7 @@ async fn test_admin_options_timeout_override() {
         .describe_cluster(
             false,
             AdminOptions::new()
-                .with_timeout(Duration::from_millis(1))
+                .with_timeout(Duration::ZERO)
                 .with_retries(0),
         )
         .await;
