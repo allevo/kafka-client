@@ -1,6 +1,9 @@
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
@@ -9,7 +12,7 @@ use kafka_protocol::protocol::{Decodable, Encodable, HeaderVersion};
 use tokio::sync::oneshot;
 
 use crate::admin::AdminClient;
-use crate::broker::{Auth, BrokerClient};
+use crate::broker::{Auth, BrokerClient, ResponseFuture};
 use crate::config::{Config, Security};
 use crate::connection::Connection;
 use crate::error::{Error, Result, RetryAction};
@@ -82,6 +85,71 @@ impl CallOptions {
 
     pub(crate) fn retry_backoff_max(&self) -> Option<Duration> {
         self.retry_backoff_max
+    }
+}
+
+/// Handle for an in-flight `Client::send`-layer request whose response
+/// has not yet arrived, bound to the `api_timeout` / `request_timeout`
+/// deadline of the call that produced it.
+///
+/// Wraps a [`ResponseFuture`] so the underlying oneshot and decoding stay
+/// on the caller's task (pipelining-friendly), and polls a `Sleep` on the
+/// same deadline so the response-wait half stays bounded even when the
+/// caller holds this future across task boundaries.
+///
+/// On deadline expiry the broker connection is torn down via
+/// [`BrokerClient::shutdown`], matching the retry-loop contract: the next
+/// `Client::send` attempt sees a dead `Slot::Resolved` and redials.
+pub struct ClientResponseFuture<Resp> {
+    inner: ResponseFuture<Resp>,
+    // `Pin<Box<Sleep>>` so the whole struct stays `Unpin` — `Sleep` is
+    // `!Unpin` on its own, which would force manual pin projection here.
+    sleep: Pin<Box<tokio::time::Sleep>>,
+    broker: BrokerClient,
+}
+
+impl<Resp> ClientResponseFuture<Resp>
+where
+    Resp: Decodable + HeaderVersion,
+{
+    pub fn new(
+        inner: ResponseFuture<Resp>,
+        deadline: tokio::time::Instant,
+        broker: BrokerClient,
+    ) -> Self {
+        Self {
+            inner,
+            sleep: Box::pin(tokio::time::sleep_until(deadline)),
+            broker,
+        }
+    }
+}
+
+impl<Resp> Future for ClientResponseFuture<Resp>
+where
+    Resp: Decodable + HeaderVersion,
+{
+    type Output = Result<Resp>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+
+        // Poll the response first: if it's ready at the same tick as the
+        // deadline, the response wins.
+        if let Poll::Ready(r) = Pin::new(&mut this.inner).poll(cx) {
+            return Poll::Ready(r);
+        }
+
+        if this.sleep.as_mut().poll(cx).is_ready() {
+            // Tear down the broker connection so the retry loop's next
+            // `Client::broker(id)` call evicts this slot and redials.
+            this.broker.shutdown();
+            return Poll::Ready(Err(Error::RequestTimeout(
+                "in-flight request exceeded request_timeout".into(),
+            )));
+        }
+
+        Poll::Pending
     }
 }
 
@@ -349,18 +417,26 @@ impl Client {
 
         let version = broker.negotiate_version(api_key, max_version)?;
 
-        // Wire phase.
-        match tokio::time::timeout_at(deadline, broker.send(api_key, version, request)).await {
-            Ok(r) => r,
+        // This timeout takes only the half side: it consider only the "write",
+        // moving the "read" part to the `ClientResponseFuture::poll`.
+        let response_fut = match tokio::time::timeout_at(
+            deadline,
+            broker.send_request(api_key, version, request),
+        )
+        .await
+        {
+            Ok(r) => r?,
             Err(_) => {
                 // Intentionally do NOT manually evict the slot:
                 // `Client::broker` will auto-evict it next retry
                 broker.shutdown();
-                Err(Error::RequestTimeout(
+                return Err(Error::RequestTimeout(
                     "in-flight request exceeded request_timeout".into(),
-                ))
+                ));
             }
-        }
+        };
+
+        ClientResponseFuture::new(response_fut, deadline, broker).await
     }
 
     /// Return a usable `BrokerClient` for `node_id`.

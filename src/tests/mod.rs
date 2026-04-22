@@ -6,6 +6,7 @@ mod fatal_dial;
 mod helpers;
 mod reauth;
 mod reconnect_backoff;
+mod send_request;
 mod standalone;
 mod standalone_sasl;
 mod standalone_tls;

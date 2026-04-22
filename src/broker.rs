@@ -1,7 +1,11 @@
 use std::collections::VecDeque;
+use std::future::Future;
+use std::marker::PhantomData;
 use std::ops::Deref;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::{Arc, LockResult, Mutex, Weak};
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use bytes::{BufMut, Bytes};
@@ -79,8 +83,8 @@ struct BrokerClientInner {
     next_correlation_id: AtomicI32,
     pool: BufferPool,
     api_versions: Box<[ApiVersion]>,
-    // Flipped by `read_task` the moment it decides to exit, so `send` can
-    // reject new requests immediately instead of letting them sit in the mpsc
+    // Flipped by `read_task` the moment it decides to exit, so `send_request`
+    // can reject new requests immediately instead of letting them sit in the mpsc
     // channel until `write_task` notices the shutdown signal and drops `request_rx`.
     shutdown: Arc<AtomicBool>,
     // User-initiated shutdown signal. `read_task` selects on `close.notified()`;
@@ -210,13 +214,13 @@ impl BrokerClient {
         Ok(client)
     }
 
-    /// Send a typed Kafka request and decode the response.
-    pub async fn send<Req, Resp>(
+    /// Queue a typed Kafka request and return a handle for its response.
+    pub async fn send_request<Req, Resp>(
         &self,
         api_key: ApiKey,
         api_version: i16,
         request: &Req,
-    ) -> Result<Resp>
+    ) -> Result<ResponseFuture<Resp>>
     where
         Req: Encodable + HeaderVersion + Send + 'static,
         Resp: Decodable + HeaderVersion,
@@ -241,13 +245,10 @@ impl BrokerClient {
                 .fetch_add(1, Ordering::Relaxed),
         );
 
-        // Below:
-        // - Serialize the request
-        //   It is made here to not pay the serialization cost "globally"
-        // - Send the request to the background task `write_task`
-        // - Wait for the response
-        // - Deserialize the respone
-        //   It is made here to not pay the cost "globally"
+        // Serialize here (not in `write_task`) so encoding cost is paid on
+        // the caller's task rather than serialised through the single
+        // writer; decoding lives in `ResponseFuture::poll` for the same
+        // reason.
 
         let header = RequestHeader::default()
             .with_request_api_key(api_key as i16)
@@ -287,45 +288,21 @@ impl BrokerClient {
             ))
         })?;
 
-        let result = response_rx.await.map_err(|_| {
-            tracing::error!(
-                ?correlation_id,
-                "connection task dropped without responding"
-            );
-            Error::Io(std::io::Error::new(
-                std::io::ErrorKind::ConnectionAborted,
-                "connection task dropped without responding",
-            ))
-        })?;
-
-        let response_data = match result {
-            Ok(buf) => {
-                tracing::debug!(?correlation_id, bytes = buf.len(), "received response");
-                buf
-            }
-            Err(e) => {
-                tracing::warn!(?correlation_id, error = %e, "request failed");
-                return Err(e);
-            }
-        };
-
-        let mut buf = Bytes::from_owner(response_data);
-        let resp_header_version = api_key.response_header_version(api_version);
-        let _resp_header = ResponseHeader::decode(&mut buf, resp_header_version)?;
-
-        debug_assert_eq!(
-            _resp_header.correlation_id, *correlation_id,
-            "Correlation ids doesn't match. (Req, Res) pair is wrong"
-        );
-
-        let response = Resp::decode(&mut buf, api_version)?;
-        Ok(response)
+        Ok(ResponseFuture {
+            correlation_id,
+            response_rx,
+            api_key,
+            api_version,
+            _marker: PhantomData,
+        })
     }
 
     pub async fn fetch_metadata(&self) -> Result<MetadataResponse> {
         let version = negotiate_version(&self.inner.api_versions, ApiKey::Metadata, 1)?;
         let request = MetadataRequest::default().with_topics(None);
-        self.send(ApiKey::Metadata, version, &request).await
+        self.send_request(ApiKey::Metadata, version, &request)
+            .await?
+            .await
     }
 
     pub fn api_versions(&self) -> &[ApiVersion] {
@@ -334,7 +311,7 @@ impl BrokerClient {
 
     /// Resolve the wire version to use for `api_key`: picks
     /// `min(desired, broker_max)` after confirming the broker advertises
-    /// the API at all before calling [`BrokerClient::send`].
+    /// the API at all before calling [`BrokerClient::send_request`].
     pub fn negotiate_version(&self, api_key: ApiKey, desired: i16) -> Result<i16> {
         negotiate_version(&self.inner.api_versions, api_key, desired)
     }
@@ -353,7 +330,7 @@ impl BrokerClient {
     /// Returns `true` if the broker shut down
     pub(crate) fn is_shutdown(&self) -> bool {
         // Acquire pairs with read_task's Release store at the bottom of read_task,
-        // matching the ordering send already uses.
+        // matching the ordering send_request already uses.
         self.inner.shutdown.load(Ordering::Acquire)
     }
 
@@ -399,11 +376,12 @@ impl BrokerClient {
 
         // SaslHandshake v1
         let handshake_resp: SaslHandshakeResponse = self
-            .send(
+            .send_request(
                 ApiKey::SaslHandshake,
                 1,
                 &SaslHandshakeRequest::default().with_mechanism(StrBytes::from_static_str("PLAIN")),
             )
+            .await?
             .await?;
         if handshake_resp.error_code != 0 {
             return Err(Error::Authentication(format!(
@@ -420,11 +398,12 @@ impl BrokerClient {
 
         let token = build_plain_token(username, password.expose_secret());
         let auth_resp: SaslAuthenticateResponse = self
-            .send(
+            .send_request(
                 ApiKey::SaslAuthenticate,
                 auth_version,
                 &SaslAuthenticateRequest::default().with_auth_bytes(token),
             )
+            .await?
             .await?;
         if auth_resp.error_code != 0 {
             let msg = auth_resp
@@ -448,6 +427,78 @@ impl BrokerClient {
         };
 
         Ok(duration)
+    }
+}
+
+/// Handle for an in-flight request whose response has not yet arrived.
+///
+/// Await it to receive the decoded response, or drop it to discard the response.
+/// Dropping is safe: the correlation queue stays aligned.
+pub struct ResponseFuture<Resp> {
+    correlation_id: CorrelationId,
+    response_rx: oneshot::Receiver<Result<zeropool::PooledBuffer>>,
+    api_key: ApiKey,
+    api_version: i16,
+    // `fn() -> Resp` keeps the future Send/Sync regardless of Resp.
+    _marker: PhantomData<fn() -> Resp>,
+}
+
+impl<Resp> ResponseFuture<Resp>
+where
+    Resp: Decodable + HeaderVersion,
+{
+    fn decode(&self, response_data: zeropool::PooledBuffer) -> Result<Resp> {
+        let mut buf = Bytes::from_owner(response_data);
+        let resp_header_version = self.api_key.response_header_version(self.api_version);
+        let _resp_header = ResponseHeader::decode(&mut buf, resp_header_version)?;
+
+        debug_assert_eq!(
+            _resp_header.correlation_id, *self.correlation_id,
+            "Correlation ids doesn't match. (Req, Res) pair is wrong"
+        );
+
+        let response = Resp::decode(&mut buf, self.api_version)?;
+        Ok(response)
+    }
+}
+
+impl<Resp> Future for ResponseFuture<Resp>
+where
+    Resp: Decodable + HeaderVersion,
+{
+    type Output = Result<Resp>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        match Pin::new(&mut this.response_rx).poll(cx) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Err(_)) => {
+                tracing::error!(
+                    correlation_id = ?this.correlation_id,
+                    "connection task dropped without responding"
+                );
+                Poll::Ready(Err(Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionAborted,
+                    "connection task dropped without responding",
+                ))))
+            }
+            Poll::Ready(Ok(Err(e))) => {
+                tracing::warn!(
+                    correlation_id = ?this.correlation_id,
+                    error = %e,
+                    "request failed"
+                );
+                Poll::Ready(Err(e))
+            }
+            Poll::Ready(Ok(Ok(buf))) => {
+                tracing::debug!(
+                    correlation_id = ?this.correlation_id,
+                    bytes = buf.len(),
+                    "received response"
+                );
+                Poll::Ready(this.decode(buf))
+            }
+        }
     }
 }
 
@@ -844,11 +895,11 @@ async fn read_task(
         }
     }
 
-    // Flip the shared flag *before* draining so any caller currently in send
-    // sees it as early as possible. This is a best-effort fast path: there is
-    // still a TOCTOU window between the flag check in send and the channel
-    // send, which is documented at the check site and handled by the
-    // dropped-oneshot safety net.
+    // Flip the shared flag *before* draining so any caller currently in
+    // send_request sees it as early as possible. This is a best-effort fast
+    // path: there is still a TOCTOU window between the flag check in
+    // send_request and the channel send, which is documented at the check
+    // site and handled by the dropped-oneshot safety net.
     shutdown.store(true, Ordering::Release);
 
     drain_in_flight(&in_flight, "read task exited");

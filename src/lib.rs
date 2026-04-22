@@ -7,8 +7,8 @@ pub mod error;
 pub mod secret;
 
 pub use admin::AdminClient;
-pub use broker::{Auth, BrokerClient};
-pub use client::{CallOptions, Client, NodeTarget};
+pub use broker::{Auth, BrokerClient, ResponseFuture};
+pub use client::{CallOptions, Client, ClientResponseFuture, NodeTarget};
 pub use config::{Config, Security};
 pub use connection::Connection;
 pub use error::Error;
