@@ -8,7 +8,7 @@ use kafka_protocol::messages::{ApiKey, BrokerId, MetadataResponse};
 use kafka_protocol::protocol::{Decodable, Encodable, HeaderVersion};
 use tokio::sync::oneshot;
 
-use crate::admin::{AdminClient, AdminOptions};
+use crate::admin::AdminClient;
 use crate::broker::{Auth, BrokerClient};
 use crate::config::{Config, Security};
 use crate::connection::Connection;
@@ -22,6 +22,67 @@ pub enum NodeTarget {
     Controller,
     AnyBroker,
     Broker(BrokerId),
+}
+
+/// Per-call overrides for the client-side retry loop that governs every
+/// RPC. Falls back to [`crate::Config`].
+#[derive(Debug, Default, Clone)]
+pub struct CallOptions {
+    timeout: Option<Duration>,
+    retries: Option<u32>,
+    retry_backoff: Option<Duration>,
+    retry_backoff_max: Option<Duration>,
+}
+
+impl CallOptions {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Override the client-side deadline for this call. Corresponds to
+    /// `Config::api_timeout` and caps the total retry-loop duration.
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = Some(timeout);
+        self
+    }
+
+    /// Override the maximum number of retry attempts after the first
+    /// send. `0` disables retries for this call only. Corresponds to
+    /// `Config::retries`.
+    pub fn with_retries(mut self, retries: u32) -> Self {
+        self.retries = Some(retries);
+        self
+    }
+
+    /// Override the base backoff between retry attempts. Corresponds to
+    /// `Config::retry_backoff`.
+    pub fn with_retry_backoff(mut self, base: Duration) -> Self {
+        self.retry_backoff = Some(base);
+        self
+    }
+
+    /// Override the cap on the exponential retry backoff. Corresponds to
+    /// `Config::retry_backoff_max`.
+    pub fn with_retry_backoff_max(mut self, max: Duration) -> Self {
+        self.retry_backoff_max = Some(max);
+        self
+    }
+
+    pub(crate) fn timeout(&self) -> Option<Duration> {
+        self.timeout
+    }
+
+    pub(crate) fn retries(&self) -> Option<u32> {
+        self.retries
+    }
+
+    pub(crate) fn retry_backoff(&self) -> Option<Duration> {
+        self.retry_backoff
+    }
+
+    pub(crate) fn retry_backoff_max(&self) -> Option<Duration> {
+        self.retry_backoff_max
+    }
 }
 
 mod retry;
@@ -194,7 +255,7 @@ impl Client {
         api_key: ApiKey,
         max_version: i16,
         request: Req,
-        opts: &AdminOptions,
+        opts: &CallOptions,
     ) -> Result<Resp>
     where
         Req: Encodable + HeaderVersion + Send + 'static,

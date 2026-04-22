@@ -10,7 +10,7 @@ use kafka_protocol::messages::incremental_alter_configs_request::{
 use kafka_protocol::messages::metadata_request::MetadataRequestTopic;
 use kafka_protocol::protocol::StrBytes;
 
-use crate::AdminOptions;
+use crate::CallOptions;
 
 use super::helpers;
 
@@ -37,7 +37,7 @@ async fn create_topic(client: &crate::Client, name: &'static str, partitions: i3
         .create_topics(
             vec![topic],
             Some(Duration::from_secs(5)),
-            AdminOptions::default(),
+            CallOptions::default(),
         )
         .await
         .unwrap();
@@ -61,7 +61,7 @@ async fn test_admin_delete_topics() {
         .delete_topics(
             vec![TopicName::from(StrBytes::from_static_str(name))],
             Some(Duration::from_secs(5)),
-            AdminOptions::default(),
+            CallOptions::default(),
         )
         .await
         .unwrap();
@@ -97,7 +97,7 @@ async fn test_admin_create_partitions() {
             vec![topic],
             Some(Duration::from_secs(5)),
             false,
-            AdminOptions::default(),
+            CallOptions::default(),
         )
         .await
         .unwrap();
@@ -116,7 +116,7 @@ async fn test_admin_create_partitions() {
                 MetadataRequestTopic::default()
                     .with_name(Some(TopicName::from(StrBytes::from_static_str(name)))),
             ],
-            AdminOptions::default(),
+            CallOptions::default(),
         )
         .await
         .unwrap();
@@ -137,7 +137,7 @@ async fn test_admin_list_topics() {
 
     let response = client
         .admin()
-        .list_topics(AdminOptions::default())
+        .list_topics(CallOptions::default())
         .await
         .unwrap();
     let found = response
@@ -161,7 +161,7 @@ async fn test_admin_describe_topics() {
                 MetadataRequestTopic::default()
                     .with_name(Some(TopicName::from(StrBytes::from_static_str(name)))),
             ],
-            AdminOptions::default(),
+            CallOptions::default(),
         )
         .await
         .unwrap();
@@ -178,7 +178,7 @@ async fn test_admin_describe_cluster() {
 
     let response = client
         .admin()
-        .describe_cluster(false, AdminOptions::default())
+        .describe_cluster(false, CallOptions::default())
         .await
         .unwrap();
     assert_eq!(response.error_code, 0);
@@ -202,7 +202,7 @@ async fn test_admin_describe_configs() {
         .with_configuration_keys(None);
     let response = client
         .admin()
-        .describe_configs(vec![resource], AdminOptions::default())
+        .describe_configs(vec![resource], CallOptions::default())
         .await
         .unwrap();
     assert_eq!(response.results.len(), 1);
@@ -234,7 +234,7 @@ async fn test_admin_create_list_delete_list_create_list_flow() {
         listed_has(
             &client
                 .admin()
-                .list_topics(AdminOptions::default())
+                .list_topics(CallOptions::default())
                 .await
                 .unwrap()
         ),
@@ -246,7 +246,7 @@ async fn test_admin_create_list_delete_list_create_list_flow() {
         .delete_topics(
             vec![TopicName::from(StrBytes::from_static_str(name))],
             Some(Duration::from_secs(5)),
-            AdminOptions::default(),
+            CallOptions::default(),
         )
         .await
         .unwrap();
@@ -256,7 +256,7 @@ async fn test_admin_create_list_delete_list_create_list_flow() {
         !listed_has(
             &client
                 .admin()
-                .list_topics(AdminOptions::default())
+                .list_topics(CallOptions::default())
                 .await
                 .unwrap()
         ),
@@ -268,7 +268,7 @@ async fn test_admin_create_list_delete_list_create_list_flow() {
         listed_has(
             &client
                 .admin()
-                .list_topics(AdminOptions::default())
+                .list_topics(CallOptions::default())
                 .await
                 .unwrap()
         ),
@@ -294,7 +294,7 @@ async fn test_admin_incremental_alter_configs() {
         .with_configs(vec![config]);
     let response = client
         .admin()
-        .incremental_alter_configs(vec![resource], false, AdminOptions::default())
+        .incremental_alter_configs(vec![resource], false, CallOptions::default())
         .await
         .unwrap();
     assert_eq!(response.responses.len(), 1);
@@ -309,7 +309,7 @@ async fn test_admin_incremental_alter_configs() {
                     .with_resource_name(StrBytes::from_static_str(name))
                     .with_configuration_keys(Some(vec![StrBytes::from_static_str("retention.ms")])),
             ],
-            AdminOptions::default(),
+            CallOptions::default(),
         )
         .await
         .unwrap();
@@ -326,11 +326,11 @@ async fn test_admin_incremental_alter_configs() {
 
 #[tokio::test]
 #[tracing_test::traced_test]
-async fn test_admin_options_timeout_override() {
+async fn test_call_options_timeout_override() {
     // A zero api_timeout override trips the retry-loop deadline check on the
     // very first iteration, before any RPC can fire; with_retries(0) skips the
     // refresh/retry path so the first failure returns immediately. Proves
-    // AdminOptions reaches Client::send instead of being silently discarded —
+    // CallOptions reaches Client::send instead of being silently discarded —
     // the default api_timeout is never zero, so a successful response here
     // would mean the override was dropped. A non-zero value (e.g. 1 ms) is
     // racy: a warm local broker can answer DescribeCluster within that window
@@ -342,7 +342,7 @@ async fn test_admin_options_timeout_override() {
         .admin()
         .describe_cluster(
             false,
-            AdminOptions::new()
+            CallOptions::new()
                 .with_timeout(Duration::ZERO)
                 .with_retries(0),
         )

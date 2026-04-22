@@ -6,9 +6,9 @@ pub mod connection;
 pub mod error;
 pub mod secret;
 
-pub use admin::{AdminClient, AdminOptions};
+pub use admin::AdminClient;
 pub use broker::{Auth, BrokerClient};
-pub use client::{Client, NodeTarget};
+pub use client::{CallOptions, Client, NodeTarget};
 pub use config::{Config, Security};
 pub use connection::Connection;
 pub use error::Error;

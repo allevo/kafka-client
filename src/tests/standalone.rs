@@ -93,7 +93,7 @@ async fn test_standalone_create_topic() {
         .create_topics(
             vec![topic],
             Some(std::time::Duration::from_secs(5)),
-            crate::AdminOptions::default(),
+            crate::CallOptions::default(),
         )
         .await
         .unwrap();

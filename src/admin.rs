@@ -13,69 +13,8 @@ use kafka_protocol::messages::{
     MetadataResponse, TopicName,
 };
 
-use crate::client::{Client, NodeTarget};
+use crate::client::{CallOptions, Client, NodeTarget};
 use crate::error::Result;
-
-/// Per-call overrides for the client-side retry loop that governs every
-/// admin RPC. falls back to [`crate::Config`].
-#[derive(Debug, Default, Clone)]
-pub struct AdminOptions {
-    timeout: Option<Duration>,
-    retries: Option<u32>,
-    retry_backoff: Option<Duration>,
-    retry_backoff_max: Option<Duration>,
-}
-
-impl AdminOptions {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Override the client-side deadline for this call. Corresponds to
-    /// `Config::api_timeout` and caps the total retry-loop duration.
-    pub fn with_timeout(mut self, timeout: Duration) -> Self {
-        self.timeout = Some(timeout);
-        self
-    }
-
-    /// Override the maximum number of retry attempts after the first
-    /// send. `0` disables retries for this call only. Corresponds to
-    /// `Config::retries`.
-    pub fn with_retries(mut self, retries: u32) -> Self {
-        self.retries = Some(retries);
-        self
-    }
-
-    /// Override the base backoff between retry attempts. Corresponds to
-    /// `Config::retry_backoff`.
-    pub fn with_retry_backoff(mut self, base: Duration) -> Self {
-        self.retry_backoff = Some(base);
-        self
-    }
-
-    /// Override the cap on the exponential retry backoff. Corresponds to
-    /// `Config::retry_backoff_max`.
-    pub fn with_retry_backoff_max(mut self, max: Duration) -> Self {
-        self.retry_backoff_max = Some(max);
-        self
-    }
-
-    pub(crate) fn timeout(&self) -> Option<Duration> {
-        self.timeout
-    }
-
-    pub(crate) fn retries(&self) -> Option<u32> {
-        self.retries
-    }
-
-    pub(crate) fn retry_backoff(&self) -> Option<Duration> {
-        self.retry_backoff
-    }
-
-    pub(crate) fn retry_backoff_max(&self) -> Option<Duration> {
-        self.retry_backoff_max
-    }
-}
 
 /// Admin surface for cluster-management RPCs.
 ///
@@ -101,7 +40,7 @@ impl AdminClient {
         &self,
         topics: Vec<CreatableTopic>,
         broker_operation_timeout: Option<Duration>,
-        opts: AdminOptions,
+        opts: CallOptions,
     ) -> Result<CreateTopicsResponse> {
         // Match other client implementations.
         let broker_operation_timeout =
@@ -129,7 +68,7 @@ impl AdminClient {
         &self,
         topic_names: Vec<TopicName>,
         broker_operation_timeout: Option<Duration>,
-        opts: AdminOptions,
+        opts: CallOptions,
     ) -> Result<DeleteTopicsResponse> {
         let broker_operation_timeout =
             broker_operation_timeout.unwrap_or(DEFAULT_BROKER_OPERATION_TIMEOUT);
@@ -158,7 +97,7 @@ impl AdminClient {
         topics: Vec<CreatePartitionsTopic>,
         broker_operation_timeout: Option<Duration>,
         validate_only: bool,
-        opts: AdminOptions,
+        opts: CallOptions,
     ) -> Result<CreatePartitionsResponse> {
         let broker_operation_timeout =
             broker_operation_timeout.unwrap_or(DEFAULT_BROKER_OPERATION_TIMEOUT);
@@ -178,7 +117,7 @@ impl AdminClient {
     }
 
     /// Return metadata for *all* topics in the cluster.
-    pub async fn list_topics(&self, opts: AdminOptions) -> Result<MetadataResponse> {
+    pub async fn list_topics(&self, opts: CallOptions) -> Result<MetadataResponse> {
         // `topics: None` asks the broker for *all* topics.
         // `MetadataRequest::default()` yields `Some(vec![])`, which means *no* topics
         // (see CLAUDE.md), so we override explicitly.
@@ -192,7 +131,7 @@ impl AdminClient {
     pub async fn describe_topics(
         &self,
         topics: Vec<MetadataRequestTopic>,
-        opts: AdminOptions,
+        opts: CallOptions,
     ) -> Result<MetadataResponse> {
         let request = MetadataRequest::default().with_topics(Some(topics));
         self.client
@@ -204,7 +143,7 @@ impl AdminClient {
     pub async fn describe_cluster(
         &self,
         include_cluster_authorized_operations: bool,
-        opts: AdminOptions,
+        opts: CallOptions,
     ) -> Result<DescribeClusterResponse> {
         let request = DescribeClusterRequest::default()
             .with_include_cluster_authorized_operations(include_cluster_authorized_operations);
@@ -223,7 +162,7 @@ impl AdminClient {
     pub async fn describe_configs(
         &self,
         resources: Vec<DescribeConfigsResource>,
-        opts: AdminOptions,
+        opts: CallOptions,
     ) -> Result<DescribeConfigsResponse> {
         let request = DescribeConfigsRequest::default().with_resources(resources);
         self.client
@@ -242,7 +181,7 @@ impl AdminClient {
         &self,
         resources: Vec<AlterConfigsResource>,
         validate_only: bool,
-        opts: AdminOptions,
+        opts: CallOptions,
     ) -> Result<IncrementalAlterConfigsResponse> {
         // Routed to the controller: correct for TOPIC resources, and for BROKER
         // resources KIP-590 controller forwarding handles it transparently on
