@@ -177,7 +177,7 @@ struct BrokerInfo {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub(crate) struct PartitionId(pub i32);
+pub struct PartitionId(pub i32);
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct PartitionMetadata {
