@@ -7,7 +7,10 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
-use kafka_protocol::messages::{ApiKey, BrokerId, MetadataResponse};
+use kafka_protocol::ResponseError;
+use kafka_protocol::messages::metadata_request::MetadataRequestTopic;
+use kafka_protocol::messages::metadata_response::MetadataResponseTopic;
+use kafka_protocol::messages::{ApiKey, BrokerId, MetadataRequest, MetadataResponse, TopicName};
 use kafka_protocol::protocol::{Decodable, Encodable, HeaderVersion};
 use tokio::sync::oneshot;
 
@@ -167,15 +170,40 @@ use retry::{ConnectionMap, Inbox, Slot, spawn_dialer};
 /// Docker port mapping, or a proxy.
 type AddressResolver = Arc<dyn Fn(BrokerId, &str, i32) -> Result<(String, u16)> + Send + Sync>;
 
+#[derive(Clone)]
 struct BrokerInfo {
     host: String,
     port: u16,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) struct PartitionId(pub i32);
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PartitionMetadata {
+    pub leader: BrokerId,
+    pub leader_epoch: i32,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct TopicMetadata {
+    /// Sorted ascending by partition id.
+    pub partitions: Vec<(PartitionId, PartitionMetadata)>,
+    /// `Some` when the broker returned a topic-level error code.
+    /// NB: Callers distinguish "not cached" (None from `topic_metadata`) from
+    /// "known but errored" (Some(TopicMetadata { error: Some(_), .. })).
+    pub error: Option<ResponseError>,
 }
 
 /// Immutable view of the cluster. This is the cached metadata response.
 struct MetadataSnapshot {
     controller_id: BrokerId,
     brokers: HashMap<BrokerId, BrokerInfo>,
+    /// Known TopicMetadata per name.
+    ///
+    ///
+    /// NB: Absence of a key means "not fetched yet", not "doesn't exist".
+    topics: HashMap<TopicName, TopicMetadata>,
 }
 
 /// Shared state behind every `Client` clone. Held inside an `Arc` so the
@@ -238,29 +266,15 @@ impl Client {
                     let broker = BrokerClient::new(conn, auth.clone()).await?;
                     let metadata = broker.fetch_metadata().await?;
 
-                    let mut brokers = HashMap::with_capacity(metadata.brokers.len());
-                    let mut bootstrap_node_id = None;
+                    let brokers = resolve_brokers(&address_resolver, &metadata.brokers)?;
+                    let topics = build_topic_map(&metadata.topics);
 
-                    for broker in &metadata.brokers {
-                        let (host, port) = resolve_address(
-                            &address_resolver,
-                            broker.node_id,
-                            broker.host.as_str(),
-                            broker.port,
-                        )?;
-                        if bootstrap_node_id.is_none() && host == config.host && port == config.port
-                        {
-                            bootstrap_node_id = Some(broker.node_id);
-                        }
-                        brokers.insert(broker.node_id, BrokerInfo { host, port });
-                    }
-
-                    // Seed the connection map with the bootstrap broker only when we
-                    // can match its wire address to a metadata entry — otherwise we'd
-                    // be inserting a connection-to-host-X under broker-id-Y, which
-                    // gives later callers the wrong broker. If unmatched, we drop the
-                    // bootstrap connection and let the next `broker(id)` call dial fresh.
                     let mut connections: HashMap<BrokerId, Slot> = HashMap::new();
+
+                    // We already used bootstrap node, so add it to connections
+                    let bootstrap_node_id = brokers.iter().find_map(|(id, info)| {
+                        (info.host == config.host && info.port == config.port).then_some(*id)
+                    });
                     if let Some(node_id) = bootstrap_node_id {
                         connections.insert(node_id, Slot::Resolved(broker));
                     }
@@ -282,6 +296,7 @@ impl Client {
                         metadata: ArcSwap::new(Arc::new(MetadataSnapshot {
                             controller_id: metadata.controller_id,
                             brokers,
+                            topics,
                         })),
                         connections: Arc::new(Mutex::new(connections)),
                     };
@@ -419,22 +434,20 @@ impl Client {
 
         // This timeout takes only the half side: it consider only the "write",
         // moving the "read" part to the `ClientResponseFuture::poll`.
-        let response_fut = match tokio::time::timeout_at(
-            deadline,
-            broker.send_request(api_key, version, request),
-        )
-        .await
-        {
-            Ok(r) => r?,
-            Err(_) => {
-                // Intentionally do NOT manually evict the slot:
-                // `Client::broker` will auto-evict it next retry
-                broker.shutdown();
-                return Err(Error::RequestTimeout(
-                    "in-flight request exceeded request_timeout".into(),
-                ));
-            }
-        };
+        let response_fut =
+            match tokio::time::timeout_at(deadline, broker.send_request(api_key, version, request))
+                .await
+            {
+                Ok(r) => r?,
+                Err(_) => {
+                    // Intentionally do NOT manually evict the slot:
+                    // `Client::broker` will auto-evict it next retry
+                    broker.shutdown();
+                    return Err(Error::RequestTimeout(
+                        "in-flight request exceeded request_timeout".into(),
+                    ));
+                }
+            };
 
         ClientResponseFuture::new(response_fut, deadline, broker).await
     }
@@ -584,51 +597,88 @@ impl Client {
         Err(last_err.unwrap_or_else(|| Error::NoBrokerAvailable("no reachable brokers".into())))
     }
 
+    /// Return `TopicMetadata` or None in case the topic has never been seen.
+    ///
+    /// NB: `TopicMetadata` can contain `error: Some(_)` for topics the broker reported an error for
+    /// (e.g. UnknownTopicOrPartition) so callers can distinguish
+    /// "not cached" from "known but errored".
+    pub(crate) fn topic_metadata(&self, topic: &TopicName) -> Option<TopicMetadata> {
+        self.inner.metadata.load().topics.get(topic).cloned()
+    }
+
+    /// Refresh the metadata for the given topic
+    pub(crate) async fn refresh_topics(&self, topics: &[TopicName]) -> Result<()> {
+        if topics.is_empty() {
+            return Ok(());
+        }
+        let request = MetadataRequest::default().with_topics(Some(
+            topics
+                .iter()
+                .cloned()
+                .map(|name| MetadataRequestTopic::default().with_name(Some(name)))
+                .collect(),
+        ));
+
+        let resp: MetadataResponse = self
+            .send(
+                NodeTarget::AnyBroker,
+                ApiKey::Metadata,
+                1,
+                request,
+                // Disable retry to avoid loops on error
+                &CallOptions::new().with_retries(0),
+            )
+            .await?;
+
+        let new_topics = build_topic_map(&resp.topics);
+        let new_brokers = resolve_brokers(&self.inner.address_resolver, &resp.brokers)?;
+
+        // NB: perform this holding the lock is important
+        // See apply_metadata_snapshot
+        let mut conns = self.inner.connections.lock().unwrap();
+        let current = self.inner.metadata.load();
+        let mut merged_topics = current.topics.clone();
+        for (name, meta) in &new_topics {
+            merged_topics.insert(name.clone(), meta.clone());
+        }
+        let new_snap = Arc::new(MetadataSnapshot {
+            controller_id: resp.controller_id,
+            brokers: new_brokers,
+            topics: merged_topics,
+        });
+        self.inner.metadata.store(new_snap.clone());
+        prune_map(&mut conns, &new_snap);
+        drop(conns);
+
+        Ok(())
+    }
+
     pub async fn refresh_metadata(&self) -> Result<MetadataResponse> {
         let broker = self.any_broker().await?;
         let metadata = broker.fetch_metadata().await?;
 
-        let mut brokers = HashMap::with_capacity(metadata.brokers.len());
-        for b in &metadata.brokers {
-            let (host, port) = resolve_address(
-                &self.inner.address_resolver,
-                b.node_id,
-                b.host.as_str(),
-                b.port,
-            )?;
-            brokers.insert(b.node_id, BrokerInfo { host, port });
-        }
+        let brokers = resolve_brokers(&self.inner.address_resolver, &metadata.brokers)?;
+        let topics = build_topic_map(&metadata.topics);
 
         self.apply_metadata_snapshot(MetadataSnapshot {
             controller_id: metadata.controller_id,
             brokers,
+            topics,
         });
 
         Ok(metadata)
     }
 
-    /// Clean up connections & replace metadata. Pruned `Slot::Resolved`
-    /// entries are signalled via `BrokerClient::shutdown` so their
-    /// read/write/reauth tasks exit instead of running on against a broker
-    /// the cluster no longer recognizes; pruned `Slot::Dialing` entries
-    /// drop their `AbortOnDrop`, which aborts the background dialer so
-    /// callers parked on its inbox wake with a closed-channel error.
+    /// Replace metadata and clean up connections
     fn apply_metadata_snapshot(&self, snap: MetadataSnapshot) {
+        // Concurrent access to connection and metadata can create
+        // inconsistency from the readers point of view.
+        // So, it is important to publish the metadata inside the connections lock
+        // so any observer that takes the lock sees metadata and map consistently
         let mut conns = self.inner.connections.lock().unwrap();
-        conns.retain(|id, slot| {
-            if snap.brokers.contains_key(id) {
-                return true;
-            }
-            match slot {
-                Slot::Resolved(broker) => broker.shutdown(),
-                // AbortOnDrop fires when the slot is dropped below.
-                Slot::Dialing { .. } => {}
-            }
-            false
-        });
-        // NB: Publish inside the lock
-        self.inner.metadata.store(Arc::new(snap));
-
+        let snap = Arc::new(snap);
+        self.inner.metadata.store(snap.clone());
+        prune_map(&mut conns, &snap);
         drop(conns);
     }
 
@@ -648,14 +698,20 @@ impl Client {
         &self,
         controller_id: BrokerId,
         brokers: Vec<(BrokerId, String, u16)>,
+        topics: Vec<(TopicName, TopicMetadata)>,
     ) {
-        let mut map = HashMap::with_capacity(brokers.len());
+        let mut broker_map = HashMap::with_capacity(brokers.len());
         for (id, host, port) in brokers {
-            map.insert(id, BrokerInfo { host, port });
+            broker_map.insert(id, BrokerInfo { host, port });
+        }
+        let mut topic_map = HashMap::with_capacity(topics.len());
+        for (name, meta) in topics {
+            topic_map.insert(name, meta);
         }
         self.apply_metadata_snapshot(MetadataSnapshot {
             controller_id,
-            brokers: map,
+            brokers: broker_map,
+            topics: topic_map,
         });
     }
 
@@ -712,6 +768,28 @@ impl Client {
     }
 }
 
+/// Evict any slot whose broker id is not in `snap.brokers`.
+///
+/// Pruned `Slot::Resolved` entries are signalled via `BrokerClient::shutdown`;
+/// pruned `Slot::Dialing` entries drop their `AbortOnDrop`, cancelling
+/// the background dialer.
+///
+/// NB: Caller has to hold the connections lock.
+/// See `Client::apply_metadata_snapshot`
+fn prune_map(conns: &mut HashMap<BrokerId, Slot>, snap: &MetadataSnapshot) {
+    conns.retain(|id, slot| {
+        if snap.brokers.contains_key(id) {
+            return true;
+        }
+        match slot {
+            Slot::Resolved(broker) => broker.shutdown(),
+            // AbortOnDrop fires when the slot is dropped below.
+            Slot::Dialing { .. } => {}
+        }
+        false
+    });
+}
+
 fn resolve_address(
     resolver: &Option<AddressResolver>,
     node_id: BrokerId,
@@ -728,5 +806,122 @@ fn resolve_address(
             };
             Ok((host.to_owned(), port))
         }
+    }
+}
+
+fn resolve_brokers(
+    resolver: &Option<AddressResolver>,
+    brokers: &[kafka_protocol::messages::metadata_response::MetadataResponseBroker],
+) -> Result<HashMap<BrokerId, BrokerInfo>> {
+    let mut out = HashMap::with_capacity(brokers.len());
+    for b in brokers {
+        let (host, port) = resolve_address(resolver, b.node_id, b.host.as_str(), b.port)?;
+        out.insert(b.node_id, BrokerInfo { host, port });
+    }
+    Ok(out)
+}
+
+fn build_topic_map(topics: &[MetadataResponseTopic]) -> HashMap<TopicName, TopicMetadata> {
+    let mut out = HashMap::with_capacity(topics.len());
+    for t in topics {
+        // Kafka Protocol allows `name == None` ("no name returned")
+        // In this case, we discard them because the client cannot refers to them
+        let Some(name) = t.name.clone() else {
+            continue;
+        };
+
+        let mut partitions: Vec<(PartitionId, PartitionMetadata)> = t
+            .partitions
+            .iter()
+            .map(|p| {
+                (
+                    PartitionId(p.partition_index),
+                    PartitionMetadata {
+                        leader: p.leader_id,
+                        leader_epoch: p.leader_epoch,
+                    },
+                )
+            })
+            .collect();
+        partitions.sort_by_key(|(id, _)| *id);
+
+        let error = ResponseError::try_from_code(t.error_code);
+
+        out.insert(name, TopicMetadata { partitions, error });
+    }
+    out
+}
+
+/// Find `PartitionMetadata` by `PartitionId`.
+pub(crate) fn find_partition(
+    partitions: &[(PartitionId, PartitionMetadata)],
+    id: PartitionId,
+) -> Option<&PartitionMetadata> {
+    debug_assert!(partitions.is_sorted_by_key(|(p_id, _)| *p_id));
+
+    // Accordingly with Kafka Protocol, the partition id is i32
+    // Anyway, all partition ids are >= 0.
+    if id.0 < 0 {
+        return None;
+    }
+
+    let idx = id.0 as usize;
+    if let Some((pid, meta)) = partitions.get(idx)
+        && *pid == id
+    {
+        return Some(meta);
+    }
+    partitions
+        .binary_search_by_key(&id, |(pid, _)| *pid)
+        .ok()
+        .map(|i| &partitions[i].1)
+}
+
+#[cfg(test)]
+mod find_partition_tests {
+    use super::*;
+
+    fn entry(id: i32, leader: i32) -> (PartitionId, PartitionMetadata) {
+        (
+            PartitionId(id),
+            PartitionMetadata {
+                leader: BrokerId(leader),
+                leader_epoch: 0,
+            },
+        )
+    }
+
+    #[test]
+    fn contiguous_hits_positional_fast_path() {
+        let parts = vec![entry(0, 10), entry(1, 11), entry(2, 12)];
+        assert_eq!(
+            find_partition(&parts, PartitionId(0)).unwrap().leader,
+            BrokerId(10)
+        );
+        assert_eq!(
+            find_partition(&parts, PartitionId(2)).unwrap().leader,
+            BrokerId(12)
+        );
+    }
+
+    #[test]
+    fn non_contiguous_falls_back_to_binary_search() {
+        // Partitions 0, 1, 3 — probing position 3 lands on index 3 which
+        // is out of bounds, so the binary search takes over.
+        let parts = vec![entry(0, 10), entry(1, 11), entry(3, 13)];
+        assert_eq!(
+            find_partition(&parts, PartitionId(3)).unwrap().leader,
+            BrokerId(13)
+        );
+        assert!(find_partition(&parts, PartitionId(2)).is_none());
+    }
+
+    #[test]
+    fn out_of_range_and_negative_ids_return_none() {
+        let parts = vec![entry(0, 10), entry(1, 11)];
+        assert!(find_partition(&parts, PartitionId(5)).is_none());
+        // Negative id.0 wraps to a huge usize and misses the fast path;
+        // binary search then reports absence.
+        assert!(find_partition(&parts, PartitionId(-1)).is_none());
     }
 }

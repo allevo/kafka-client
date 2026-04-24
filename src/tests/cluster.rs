@@ -254,7 +254,7 @@ async fn test_broker_removed_from_metadata_is_pruned() {
         .filter(|(id, _)| **id != BrokerId(2))
         .map(|(id, (h, p))| (*id, h.clone(), *p))
         .collect();
-    client.replace_metadata_for_test(BrokerId(1), surviving);
+    client.replace_metadata_for_test(BrokerId(1), surviving, vec![]);
 
     assert!(
         !client.has_connection_slot(BrokerId(2)),
@@ -320,7 +320,7 @@ async fn test_pruned_broker_tasks_are_torn_down() {
     // Prune the cached broker by publishing an empty metadata snapshot. The
     // fix under test is in `apply_metadata_snapshot`, which must call
     // `BrokerClient::shutdown()` on every removed `Slot::Resolved`.
-    client.replace_metadata_for_test(BrokerId(0), vec![]);
+    client.replace_metadata_for_test(BrokerId(0), vec![], vec![]);
     assert!(!client.has_connection_slot(bootstrap_id));
 
     // shutdown() is synchronous but read/write/reauth exit asynchronously.

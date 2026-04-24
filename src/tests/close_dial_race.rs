@@ -35,6 +35,7 @@ async fn dialer_shuts_down_connection_when_slot_removed_during_dial() {
             (controller, broker.host.clone(), broker.port),
             (SYNTH_ID, proxy.host.clone(), proxy.port),
         ],
+        vec![],
     );
 
     // Arm the hook: the dialer will pause after a successful dial but

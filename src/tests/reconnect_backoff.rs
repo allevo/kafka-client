@@ -94,6 +94,7 @@ async fn client_through_proxy(proxy: &ProxyHandle, base: Duration, max: Duration
             (controller, broker.host.clone(), broker.port),
             (SYNTH_ID, proxy.host.clone(), proxy.port),
         ],
+        vec![],
     );
     client
 }
@@ -563,6 +564,7 @@ async fn any_broker_parks_when_all_brokers_dialing() {
             (SYNTH_A, proxy_a.host.clone(), proxy_a.port),
             (SYNTH_B, proxy_b.host.clone(), proxy_b.port),
         ],
+        vec![],
     );
 
     // Install Slot::Dialing for both synthetic brokers. The drop-all

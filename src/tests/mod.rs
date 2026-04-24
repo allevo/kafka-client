@@ -13,3 +13,4 @@ mod standalone_tls;
 mod timeout_connection;
 mod timeout_idle;
 mod timeout_request;
+mod topic_metadata;

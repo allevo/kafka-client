@@ -50,6 +50,7 @@ async fn client_through_proxy(proxy: &helpers::proxy::ProxyHandle) -> crate::Cli
             (controller, broker.host.clone(), broker.port),
             (SYNTH_ID, proxy.host.clone(), proxy.port),
         ],
+        vec![],
     );
     client
 }

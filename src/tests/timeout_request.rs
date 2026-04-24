@@ -50,6 +50,7 @@ async fn client_with_synthetic_full(
             (controller, broker.host.clone(), broker.port),
             (SYNTH_ID, host.to_string(), port),
         ],
+        vec![],
     );
     client
 }
