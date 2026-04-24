@@ -14,7 +14,7 @@ async fn test_standalone_sasl_plaintext_api_versions() {
         .await
         .unwrap();
     // Auth happens inside BrokerClient::new.
-    let client = crate::BrokerClient::new(conn, auth).await.unwrap();
+    let client = crate::BrokerClient::new(conn, auth, None).await.unwrap();
 
     let versions = client.api_versions();
     assert!(!versions.is_empty());
@@ -35,6 +35,6 @@ async fn test_standalone_sasl_plaintext_bad_credentials() {
     let conn = crate::Connection::connect(&config, crate::Security::Plaintext)
         .await
         .unwrap();
-    let result = crate::BrokerClient::new(conn, auth).await;
+    let result = crate::BrokerClient::new(conn, auth, None).await;
     assert!(matches!(result, Err(crate::Error::Authentication(_))));
 }

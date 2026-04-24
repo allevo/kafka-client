@@ -10,7 +10,7 @@ async fn test_standalone_tls_api_versions() {
     let conn = crate::Connection::connect(&config, crate::Security::Ssl(tls_config))
         .await
         .unwrap();
-    let client = crate::BrokerClient::new(conn, crate::Auth::None)
+    let client = crate::BrokerClient::new(conn, crate::Auth::None, None)
         .await
         .unwrap();
 

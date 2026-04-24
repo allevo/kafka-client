@@ -16,7 +16,7 @@ async fn idle_happy_path_under_load() {
     let conn = crate::Connection::connect(&config, crate::Security::Plaintext)
         .await
         .unwrap();
-    let client = crate::BrokerClient::new(conn, crate::Auth::None)
+    let client = crate::BrokerClient::new(conn, crate::Auth::None, None)
         .await
         .unwrap();
 
@@ -49,7 +49,7 @@ async fn idle_close_fires_when_connection_is_idle() {
     let conn = crate::Connection::connect(&config, crate::Security::Plaintext)
         .await
         .unwrap();
-    let client = crate::BrokerClient::new(conn, crate::Auth::None)
+    let client = crate::BrokerClient::new(conn, crate::Auth::None, None)
         .await
         .unwrap();
 
@@ -94,7 +94,7 @@ async fn idle_disabled_never_closes() {
     let conn = crate::Connection::connect(&config, crate::Security::Plaintext)
         .await
         .unwrap();
-    let client = crate::BrokerClient::new(conn, crate::Auth::None)
+    let client = crate::BrokerClient::new(conn, crate::Auth::None, None)
         .await
         .unwrap();
 

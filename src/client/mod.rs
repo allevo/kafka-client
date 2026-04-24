@@ -263,7 +263,7 @@ impl Client {
         for config in bootstrap {
             match Connection::connect(config, security.clone()).await {
                 Ok(conn) => {
-                    let broker = BrokerClient::new(conn, auth.clone()).await?;
+                    let broker = BrokerClient::new(conn, auth.clone(), None).await?;
                     let metadata = broker.fetch_metadata().await?;
 
                     let brokers = resolve_brokers(&address_resolver, &metadata.brokers)?;

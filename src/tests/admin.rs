@@ -2,7 +2,6 @@ use std::time::Duration;
 
 use kafka_protocol::messages::TopicName;
 use kafka_protocol::messages::create_partitions_request::CreatePartitionsTopic;
-use kafka_protocol::messages::create_topics_request::CreatableTopic;
 use kafka_protocol::messages::describe_configs_request::DescribeConfigsResource;
 use kafka_protocol::messages::incremental_alter_configs_request::{
     AlterConfigsResource, AlterableConfig,
@@ -13,6 +12,7 @@ use kafka_protocol::protocol::StrBytes;
 use crate::CallOptions;
 
 use super::helpers;
+use super::helpers::create_topic;
 
 // Kafka ConfigResource.Type values (org.apache.kafka.common.config.ConfigResource.Type).
 const RESOURCE_TYPE_TOPIC: i8 = 2;
@@ -25,28 +25,6 @@ async fn connect() -> crate::Client {
     crate::Client::connect(&bootstrap, crate::Security::Plaintext, crate::Auth::None)
         .await
         .unwrap()
-}
-
-async fn create_topic(client: &crate::Client, name: &'static str, partitions: i32) {
-    let topic = CreatableTopic::default()
-        .with_name(TopicName::from(StrBytes::from_static_str(name)))
-        .with_num_partitions(partitions)
-        .with_replication_factor(1);
-    let response = client
-        .admin()
-        .create_topics(
-            vec![topic],
-            Some(Duration::from_secs(5)),
-            CallOptions::default(),
-        )
-        .await
-        .unwrap();
-    let code = response.topics[0].error_code;
-    // Broker is shared; tolerate TOPIC_ALREADY_EXISTS (36) from earlier test runs.
-    assert!(
-        code == 0 || code == 36,
-        "unexpected create_topics error code: {code}"
-    );
 }
 
 #[tokio::test]
@@ -71,6 +49,10 @@ async fn test_admin_delete_topics() {
         response.responses[0].name.as_ref().map(|n| n.as_str()),
         Some(name)
     );
+
+    // DeleteTopics returns once the controller has committed the deletion;
+    // the broker's MetadataCache replay lags behind. Wait before querying.
+    helpers::wait_for_topic_gone_by_name(&client, name).await;
 
     let metadata = client.refresh_metadata().await.unwrap();
     let found = metadata
@@ -109,23 +91,37 @@ async fn test_admin_create_partitions() {
         "unexpected create_partitions error code: {code}"
     );
 
-    let describe = client
-        .admin()
-        .describe_topics(
-            vec![
-                MetadataRequestTopic::default()
-                    .with_name(Some(TopicName::from(StrBytes::from_static_str(name)))),
-            ],
-            CallOptions::default(),
-        )
-        .await
-        .unwrap();
-    let topic_md = describe
-        .topics
-        .iter()
-        .find(|t| t.name.as_ref().map(|n| n.as_str()) == Some(name))
-        .expect("topic not found in metadata");
-    assert_eq!(topic_md.partitions.len(), 3);
+    // CreatePartitions has the same KRaft MetadataCache-replay lag as
+    // CreateTopics: the new partition count is committed by the controller
+    // before the broker's cache catches up. Poll until it does.
+    let topic_name = TopicName::from(StrBytes::from_static_str(name));
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let mut backoff = Duration::from_millis(20);
+    loop {
+        let describe = client
+            .admin()
+            .describe_topics(
+                vec![MetadataRequestTopic::default().with_name(Some(topic_name.clone()))],
+                CallOptions::default(),
+            )
+            .await
+            .unwrap();
+        let topic_md = describe
+            .topics
+            .iter()
+            .find(|t| t.name.as_ref() == Some(&topic_name))
+            .expect("topic not found in metadata");
+        if topic_md.partitions.len() == 3 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "partition count never caught up within 30s (got {})",
+            topic_md.partitions.len()
+        );
+        tokio::time::sleep(backoff).await;
+        backoff = (backoff * 2).min(Duration::from_millis(200));
+    }
 }
 
 #[tokio::test]
@@ -251,6 +247,7 @@ async fn test_admin_create_list_delete_list_create_list_flow() {
         .await
         .unwrap();
     assert_eq!(deleted.responses[0].error_code, 0);
+    helpers::wait_for_topic_gone_by_name(&client, name).await;
 
     assert!(
         !listed_has(
@@ -300,28 +297,44 @@ async fn test_admin_incremental_alter_configs() {
     assert_eq!(response.responses.len(), 1);
     assert_eq!(response.responses[0].error_code, 0);
 
-    let describe = client
-        .admin()
-        .describe_configs(
-            vec![
-                DescribeConfigsResource::default()
-                    .with_resource_type(RESOURCE_TYPE_TOPIC)
-                    .with_resource_name(StrBytes::from_static_str(name))
-                    .with_configuration_keys(Some(vec![StrBytes::from_static_str("retention.ms")])),
-            ],
-            CallOptions::default(),
-        )
-        .await
-        .unwrap();
-    let retention = describe.results[0]
-        .configs
-        .iter()
-        .find(|c| c.name.as_str() == "retention.ms")
-        .expect("retention.ms missing in describe_configs");
-    assert_eq!(
-        retention.value.as_ref().map(|v| v.as_str()),
-        Some(new_retention)
-    );
+    // IncrementalAlterConfigs has the same KRaft controller-commit-vs-
+    // broker-replay lag as CreateTopics: `describe_configs` can return the
+    // old value for a short window after the alter acknowledges. Poll
+    // until the broker's cache catches up.
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let mut backoff = Duration::from_millis(20);
+    loop {
+        let describe = client
+            .admin()
+            .describe_configs(
+                vec![
+                    DescribeConfigsResource::default()
+                        .with_resource_type(RESOURCE_TYPE_TOPIC)
+                        .with_resource_name(StrBytes::from_static_str(name))
+                        .with_configuration_keys(Some(vec![StrBytes::from_static_str(
+                            "retention.ms",
+                        )])),
+                ],
+                CallOptions::default(),
+            )
+            .await
+            .unwrap();
+        let retention = describe.results[0]
+            .configs
+            .iter()
+            .find(|c| c.name.as_str() == "retention.ms")
+            .expect("retention.ms missing in describe_configs");
+        if retention.value.as_ref().map(|v| v.as_str()) == Some(new_retention) {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "retention.ms never reflected the new value within 30s (got {:?})",
+            retention.value.as_ref().map(|v| v.as_str())
+        );
+        tokio::time::sleep(backoff).await;
+        backoff = (backoff * 2).min(Duration::from_millis(200));
+    }
 }
 
 #[tokio::test]

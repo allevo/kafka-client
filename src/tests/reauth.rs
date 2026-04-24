@@ -1,3 +1,4 @@
+use std::sync::Arc;
 use std::time::Duration;
 
 use super::helpers;
@@ -20,7 +21,7 @@ async fn test_session_lifetime_ms_parsed() {
     let conn = crate::Connection::connect(&config, crate::Security::Plaintext)
         .await
         .unwrap();
-    let client = crate::BrokerClient::new(conn, auth).await.unwrap();
+    let client = crate::BrokerClient::new(conn, auth, None).await.unwrap();
 
     let versions = client.api_versions();
     assert!(!versions.is_empty());
@@ -54,7 +55,16 @@ async fn test_connection_survives_reauth() {
     let conn = crate::Connection::connect(&config, crate::Security::Plaintext)
         .await
         .unwrap();
-    let client = crate::BrokerClient::new(conn, auth).await.unwrap();
+    // Override the default 75–85% window: the broker advertises a 5 s
+    // session, so the default leaves only 750–1250 ms slack — under
+    // concurrent test load the SASL handshake itself can eat that, and
+    // the broker kills the connection before the new auth lands. 25% of
+    // the lifetime (≈1.25 s) gives a comfortable ≈3.75 s margin.
+    let delay_fn: crate::ReauthDelayFn =
+        Arc::new(|session_lifetime: Duration| session_lifetime / 4);
+    let client = crate::BrokerClient::new(conn, auth, Some(delay_fn))
+        .await
+        .unwrap();
 
     // Send requests over 12 seconds — well past the 5-second session lifetime.
     // If re-auth fails the broker kills the connection and fetch_metadata returns an error.
@@ -120,7 +130,7 @@ async fn test_drop_tears_down_reauth_task_and_connection() {
     let conn = crate::Connection::connect(&config, crate::Security::Plaintext)
         .await
         .unwrap();
-    let client = crate::BrokerClient::new(conn, auth).await.unwrap();
+    let client = crate::BrokerClient::new(conn, auth, None).await.unwrap();
 
     // Sanity-check that the connection is live and the reauth task was spawned
     // (the broker advertises a 5 s session lifetime, so reauth must be active).

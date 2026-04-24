@@ -34,6 +34,10 @@ pub enum Auth {
     },
 }
 
+/// Function that, given the broker-advertised session lifetime, returns
+/// when the next re-auth attempt should fire. See [`default_reauth_delay`].
+pub type ReauthDelayFn = Arc<dyn Fn(Duration) -> Duration + Send + Sync>;
+
 #[derive(Debug, Hash, PartialEq, Eq, Clone, Copy)]
 pub struct CorrelationId(i32);
 impl Deref for CorrelationId {
@@ -116,7 +120,13 @@ impl BrokerClient {
     /// Build a `BrokerClient` from an established `Connection`, performing initial SASL auth
     /// (if requested) and spawning a background re-auth task when the broker reports a
     /// non-zero `session_lifetime_ms`.
-    pub async fn new(mut connection: Connection, auth: Auth) -> Result<Self> {
+    ///
+    /// `reauth_delay` is used to calculate the delay for next auth.
+    pub async fn new(
+        mut connection: Connection,
+        auth: Auth,
+        reauth_delay: Option<ReauthDelayFn>,
+    ) -> Result<Self> {
         let mut correlation_id: i32 = 0;
 
         let api_versions = connection.fetch_api_versions(&mut correlation_id).await?;
@@ -196,12 +206,15 @@ impl BrokerClient {
 
             // NB: Weak so, it doesn't count as strong reference
             let reauth_close = client.inner.reauth_close.clone();
+            let delay_fn: ReauthDelayFn =
+                reauth_delay.unwrap_or_else(|| Arc::new(default_reauth_delay));
             tokio::spawn(reauth_task(
                 Arc::downgrade(&client.inner),
                 reauth_close,
                 auth,
                 lifetime,
                 reauth_shutdown_tx,
+                delay_fn,
             ));
         } else {
             tracing::info!("Broker doesn't require re-auth task");
@@ -533,9 +546,13 @@ fn build_plain_token(username: &str, password: &str) -> Bytes {
     Bytes::from(token)
 }
 
-/// Compute the re-auth delay: 85–95% of `session_lifetime`, with random jitter.
-fn reauth_delay(session_lifetime: Duration) -> Duration {
-    let pct = 85 + fastrand::u32(0..=10); // 85–95%
+/// Default re-auth delay: 75–85% of `session_lifetime`, with random jitter.
+///
+/// KIP-368: re-authenticate before the broker enforces
+/// `connections.max.reauth.ms`. The 15–25% margin at the default absorbs
+/// scheduler jitter plus the SASL handshake's own latency.
+pub fn default_reauth_delay(session_lifetime: Duration) -> Duration {
+    let pct = 75 + fastrand::u32(0..=10); // 75–85%
     session_lifetime * pct / 100
 }
 
@@ -549,9 +566,10 @@ async fn reauth_task(
     auth: Auth,
     mut session_lifetime: Duration,
     reauth_shutdown_tx: oneshot::Sender<()>,
+    delay_fn: ReauthDelayFn,
 ) {
     loop {
-        let delay = reauth_delay(session_lifetime);
+        let delay = delay_fn(session_lifetime);
         tracing::debug!(?delay, "re-auth task sleeping");
         // Force to stop the task when a shutdown is requested instead of
         // waiting the next cicle.

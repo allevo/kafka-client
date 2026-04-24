@@ -194,7 +194,7 @@ async fn perform_backoff_retry(
                 config = config.with_connections_max_idle(d);
             }
             let conn = Connection::connect(&config, security.clone()).await?;
-            BrokerClient::new(conn, auth.clone()).await
+            BrokerClient::new(conn, auth.clone(), None).await
         }
         .await;
 

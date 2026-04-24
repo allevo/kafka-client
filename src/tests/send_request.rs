@@ -8,7 +8,7 @@ async fn connect() -> crate::BrokerClient {
     let conn = crate::Connection::connect(&config, crate::Security::Plaintext)
         .await
         .unwrap();
-    crate::BrokerClient::new(conn, crate::Auth::None)
+    crate::BrokerClient::new(conn, crate::Auth::None, None)
         .await
         .unwrap()
 }

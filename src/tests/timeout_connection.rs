@@ -116,7 +116,7 @@ async fn timeout_setup_happy_path() {
 
     // Make sure the connection is actually usable end-to-end and that the
     // setup bound didn't somehow short-circuit a half-built stream.
-    let _client = crate::BrokerClient::new(conn, crate::Auth::None)
+    let _client = crate::BrokerClient::new(conn, crate::Auth::None, None)
         .await
         .expect("broker client handshake against real broker");
 

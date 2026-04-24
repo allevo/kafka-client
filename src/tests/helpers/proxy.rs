@@ -343,7 +343,7 @@ mod tests {
         let conn = crate::Connection::connect(&config, crate::Security::Plaintext)
             .await
             .unwrap();
-        let client = crate::BrokerClient::new(conn, crate::Auth::None)
+        let client = crate::BrokerClient::new(conn, crate::Auth::None, None)
             .await
             .unwrap();
 
@@ -374,7 +374,7 @@ mod tests {
         let conn = crate::Connection::connect(&config, crate::Security::Plaintext)
             .await
             .unwrap();
-        let client = crate::BrokerClient::new(conn, crate::Auth::None)
+        let client = crate::BrokerClient::new(conn, crate::Auth::None, None)
             .await
             .unwrap();
 

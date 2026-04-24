@@ -20,7 +20,7 @@ async fn test_standalone_api_versions() {
     let conn = crate::Connection::connect(&config, crate::Security::Plaintext)
         .await
         .unwrap();
-    let client = crate::BrokerClient::new(conn, crate::Auth::None)
+    let client = crate::BrokerClient::new(conn, crate::Auth::None, None)
         .await
         .unwrap();
 
@@ -39,7 +39,7 @@ async fn test_standalone_fetch_metadata() {
         .await
         .unwrap();
 
-    let client = crate::BrokerClient::new(conn, crate::Auth::None)
+    let client = crate::BrokerClient::new(conn, crate::Auth::None, None)
         .await
         .unwrap();
     let response = client.fetch_metadata().await.unwrap();
@@ -105,6 +105,10 @@ async fn test_standalone_create_topic() {
         "unexpected error code: {}",
         response.topics[0].error_code
     );
+
+    // CreateTopics returns once the controller has committed; the broker's
+    // MetadataCache replay lags. Wait before asking any broker for metadata.
+    helpers::wait_for_topic_visible_by_name(&client, "test-topic-1").await;
 
     let metadata = client.refresh_metadata().await.unwrap();
     let found = metadata

@@ -3,16 +3,12 @@
 //! replace in `refresh_metadata`, the partial merge in `refresh_topics`,
 //! and the topic-level error surface.
 
-use std::time::Duration;
-
 use kafka_protocol::ResponseError;
 use kafka_protocol::messages::TopicName;
-use kafka_protocol::messages::create_topics_request::CreatableTopic;
 use kafka_protocol::protocol::StrBytes;
 
-use crate::CallOptions;
-
 use super::helpers;
+use super::helpers::{create_topic, delete_topic};
 
 async fn connect() -> crate::Client {
     let broker = helpers::plaintext_broker().await;
@@ -20,46 +16,6 @@ async fn connect() -> crate::Client {
     crate::Client::connect(&bootstrap, crate::Security::Plaintext, crate::Auth::None)
         .await
         .unwrap()
-}
-
-async fn create_topic(client: &crate::Client, name: &'static str, partitions: i32) {
-    let topic = CreatableTopic::default()
-        .with_name(TopicName::from(StrBytes::from_static_str(name)))
-        .with_num_partitions(partitions)
-        .with_replication_factor(1);
-    let response = client
-        .admin()
-        .create_topics(
-            vec![topic],
-            Some(Duration::from_secs(5)),
-            CallOptions::default(),
-        )
-        .await
-        .unwrap();
-    let code = response.topics[0].error_code;
-    // Broker is shared; tolerate TOPIC_ALREADY_EXISTS (36) across runs.
-    assert!(
-        code == 0 || code == 36,
-        "unexpected create_topics error code: {code}"
-    );
-}
-
-async fn delete_topic(client: &crate::Client, name: &'static str) {
-    let response = client
-        .admin()
-        .delete_topics(
-            vec![TopicName::from(StrBytes::from_static_str(name))],
-            Some(Duration::from_secs(5)),
-            CallOptions::default(),
-        )
-        .await
-        .unwrap();
-    let code = response.responses[0].error_code;
-    // Tolerate UNKNOWN_TOPIC_OR_PARTITION (3) if already deleted.
-    assert!(
-        code == 0 || code == 3,
-        "unexpected delete_topics error code: {code}"
-    );
 }
 
 #[tokio::test]
