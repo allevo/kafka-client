@@ -10,7 +10,7 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 tokio-rustls = "0.26"
 zeroize = "1"
 tracing = "0.1"
-kafka-protocol = { version = "0.17", default-features = false, features = ["client"] }
+kafka-protocol = { version = "0.17", default-features = false, features = ["client", "gzip"] }
 bytes = "1"
 anyhow = "1"
 fastrand = "2"
@@ -20,7 +20,7 @@ socket2 = "0.6.3"
 murmur2 = "0.1"
 
 [dev-dependencies]
-kafka-protocol = { version = "0.17", default-features = false, features = ["client", "broker"] }
+kafka-protocol = { version = "0.17", default-features = false, features = ["client", "broker", "gzip"] }
 testcontainers = "0.27"
 testcontainers-modules = { version = "0.15", features = ["kafka"] }
 tokio = { version = "1", features = ["full"] }

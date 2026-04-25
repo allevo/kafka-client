@@ -1,12 +1,14 @@
 use std::time::Duration;
 
 use bytes::Bytes;
+use kafka_protocol::indexmap::IndexMap;
 use kafka_protocol::messages::TopicName;
 use kafka_protocol::protocol::StrBytes;
 use kafka_protocol::records::Compression;
 
 use crate::client::PartitionId;
 
+pub(crate) mod batch;
 pub(crate) mod partitioner;
 
 /// A record to be published to a Kafka topic.
@@ -27,8 +29,13 @@ pub struct ProducerRecord {
     /// `None`, the value used depends on the topic's `message.timestamp.type`
     /// (`CreateTime` vs. `LogAppendTime`).
     pub timestamp: Option<i64>,
-    /// Record headers, in insertion order. Names are not required to be unique.
-    pub headers: Vec<(StrBytes, Bytes)>,
+    /// Record headers.
+    ///
+    /// NB: Inserting the same name twice keeps only the last value.
+    /// Even if the Kafka v2 wire format permits repeated header names, the
+    /// `kafka_protocol` crate stores them in an `IndexMap`, which collapses
+    /// them.
+    pub headers: IndexMap<StrBytes, Option<Bytes>>,
 }
 
 impl ProducerRecord {
@@ -40,7 +47,7 @@ impl ProducerRecord {
             key: None,
             value: Some(value),
             timestamp: None,
-            headers: Vec::new(),
+            headers: IndexMap::new(),
         }
     }
 
@@ -62,9 +69,9 @@ impl ProducerRecord {
         self
     }
 
-    /// Append a header. Headers preserve insertion order and may repeat names.
-    pub fn with_header(mut self, name: StrBytes, value: Bytes) -> Self {
-        self.headers.push((name, value));
+    /// Insert a header.
+    pub fn with_header(mut self, name: StrBytes, value: Option<Bytes>) -> Self {
+        self.headers.insert(name, value);
         self
     }
 }
@@ -192,14 +199,15 @@ mod tests {
             .with_key(key.clone())
             .with_partition(PartitionId(7))
             .with_timestamp(42)
-            .with_header(header_name.clone(), header_value.clone());
+            .with_header(header_name.clone(), Some(header_value.clone()));
 
         assert_eq!(rec.topic, topic);
         assert_eq!(rec.key, Some(key));
         assert_eq!(rec.value, Some(value));
         assert_eq!(rec.partition, Some(PartitionId(7)));
         assert_eq!(rec.timestamp, Some(42));
-        assert_eq!(rec.headers, vec![(header_name, header_value)]);
+        assert_eq!(rec.headers.len(), 1);
+        assert_eq!(rec.headers.get(&header_name), Some(&Some(header_value)));
     }
 
     #[test]
