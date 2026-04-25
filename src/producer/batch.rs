@@ -78,6 +78,7 @@ pub(crate) struct PartitionBatch {
     first_send_at: Option<Instant>,
     size_estimator: SizeEstimator,
     attempt: u32,
+    full: bool,
 }
 
 impl PartitionBatch {
@@ -89,6 +90,7 @@ impl PartitionBatch {
             first_send_at: None,
             size_estimator: SizeEstimator::new(),
             attempt: 0,
+            full: false,
         }
     }
 
@@ -124,6 +126,7 @@ impl PartitionBatch {
 
         self.size_estimator.add_record_estimation(&record);
         let is_full = self.size_estimator.is_full(max_batch_bytes);
+        self.full = is_full;
 
         let (tx, rx) = oneshot::channel();
         self.records.push(record);
@@ -156,6 +159,13 @@ impl PartitionBatch {
 
     pub(crate) fn is_empty(&self) -> bool {
         self.records.is_empty()
+    }
+
+    /// True once the size estimator has crossed `max_batch_bytes` on a prior
+    /// `append`. Lets the accumulator flush a full batch on the next drain
+    /// without re-running the estimator.
+    pub(crate) fn is_full(&self) -> bool {
+        self.full
     }
 
     pub(crate) fn age(&self, now: Instant) -> Duration {
@@ -273,11 +283,16 @@ mod tests {
                     outcome.is_full,
                     "is_full must stay true once the threshold is crossed"
                 );
+                assert!(
+                    batch.is_full(),
+                    "is_full() query must agree with append outcome"
+                );
             }
             last_was_full = outcome.is_full;
         }
         assert!(seen_full, "threshold never crossed");
         assert!(last_was_full);
+        assert!(batch.is_full());
     }
 
     #[test]

@@ -8,6 +8,7 @@ use kafka_protocol::records::Compression;
 
 use crate::client::PartitionId;
 
+pub(crate) mod accumulator;
 pub(crate) mod batch;
 pub(crate) mod partitioner;
 
