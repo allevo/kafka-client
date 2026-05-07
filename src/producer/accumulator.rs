@@ -2,11 +2,13 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
+use bytes::Bytes;
 use kafka_protocol::messages::TopicName;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 use crate::client::PartitionId;
 use crate::error::Result;
+use crate::producer::RecordMetadata;
 use crate::producer::ProducerConfig;
 use crate::producer::batch::{
     AppendOutcome, BatchProducerState, FrozenBatch, PartitionBatch, RecordPayload,
@@ -18,6 +20,52 @@ pub(crate) struct ReadyBatch {
     pub topic: TopicName,
     pub partition: PartitionId,
     pub frozen: FrozenBatch,
+}
+
+impl ReadyBatch {
+    /// Split into the two halves the sender consumes independently:
+    /// [`EncodedBatch`] is moved into the outgoing `ProduceRequest`,
+    /// [`PendingBatch`] stays alive until the broker response settles
+    /// the per-record waiters. Splitting eliminates the `Bytes::clone`
+    /// of the encoded payload in the request-build path.
+    pub(crate) fn split(self) -> (EncodedBatch, PendingBatch) {
+        let ReadyBatch {
+            topic,
+            partition,
+            frozen,
+        } = self;
+        let FrozenBatch {
+            encoded, waiters, ..
+        } = frozen;
+        let encoded_batch = EncodedBatch {
+            topic: topic.clone(),
+            partition,
+            encoded,
+        };
+        let pending = PendingBatch {
+            topic,
+            partition,
+            waiters,
+        };
+        (encoded_batch, pending)
+    }
+}
+
+/// The wire-format half of a [`ReadyBatch`]. Owned by `send_to_leader`
+/// only long enough to be moved into a `PartitionProduceData`.
+pub(crate) struct EncodedBatch {
+    pub topic: TopicName,
+    pub partition: PartitionId,
+    pub encoded: Bytes,
+}
+
+/// The waiter half of a [`ReadyBatch`]. Held across the broker
+/// round-trip so `settle_response` can match per-partition responses
+/// back to the records that produced them.
+pub(crate) struct PendingBatch {
+    pub topic: TopicName,
+    pub partition: PartitionId,
+    pub waiters: Vec<oneshot::Sender<Result<RecordMetadata>>>,
 }
 
 struct Inner {

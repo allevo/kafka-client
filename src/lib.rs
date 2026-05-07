@@ -13,7 +13,7 @@ pub use client::{CallOptions, Client, ClientResponseFuture, NodeTarget, Partitio
 pub use config::{Config, Security};
 pub use connection::Connection;
 pub use error::Error;
-pub use producer::{Acks, ProducerConfig, ProducerRecord, RecordMetadata};
+pub use producer::{Acks, Producer, ProducerConfig, ProducerRecord, RecordMetadata, SendFuture};
 pub use secret::SecretString;
 
 pub use kafka_protocol::messages::{BrokerId, TopicName};

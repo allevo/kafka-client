@@ -4,6 +4,7 @@ mod close_dial_race;
 mod cluster;
 mod fatal_dial;
 mod helpers;
+mod producer;
 mod reauth;
 mod reconnect_backoff;
 mod send_request;
