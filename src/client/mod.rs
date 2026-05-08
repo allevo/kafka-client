@@ -399,6 +399,61 @@ impl Client {
         }
     }
 
+    /// Dispatch a fire-and-forget request (`acks=0` Produce). Resolves the
+    /// `target` to a `BrokerClient`, negotiates the wire version, and writes
+    /// the request without waiting for (or expecting) a response.
+    ///
+    /// `Ok(())` means the bytes were flushed onto the socket; `Err` reflects
+    /// either a real write/flush failure or a torn-down connection (see
+    /// `BrokerClient::send_oneway`). The caller is responsible for surfacing
+    /// any error to user-visible waiters — at `acks=0` there is no broker
+    /// reply to clean up after.
+    pub async fn send_oneway<Req>(
+        &self,
+        target: NodeTarget,
+        api_key: ApiKey,
+        max_version: i16,
+        request: Req,
+        opts: &CallOptions,
+    ) -> Result<()>
+    where
+        Req: Encodable + HeaderVersion + Send + 'static,
+    {
+        let api_timeout = opts.timeout().unwrap_or(self.inner.api_timeout);
+        let deadline = tokio::time::Instant::now() + api_timeout;
+
+        let broker = match tokio::time::timeout_at(deadline, async {
+            match target {
+                NodeTarget::Controller => self.controller().await,
+                NodeTarget::AnyBroker => self.any_broker().await,
+                NodeTarget::Broker(id) => self.broker(id).await,
+            }
+        })
+        .await
+        {
+            Ok(r) => r?,
+            Err(_) => {
+                return Err(Error::RequestTimeout(
+                    "broker acquisition exceeded request_timeout".into(),
+                ));
+            }
+        };
+
+        let version = broker.negotiate_version(api_key, max_version)?;
+
+        match tokio::time::timeout_at(deadline, broker.send_oneway(api_key, version, &request))
+            .await
+        {
+            Ok(r) => r,
+            Err(_) => {
+                broker.shutdown();
+                Err(Error::RequestTimeout(
+                    "in-flight request exceeded request_timeout".into(),
+                ))
+            }
+        }
+    }
+
     /// Single attempt of `send`.
     async fn send_once<Req, Resp>(
         &self,

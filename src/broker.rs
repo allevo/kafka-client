@@ -59,10 +59,24 @@ impl TryFrom<&[u8]> for CorrelationId {
     }
 }
 
-struct RequestMsg {
-    correlation_id: CorrelationId,
-    data: zeropool::PooledBuffer,
-    response_tx: oneshot::Sender<Result<zeropool::PooledBuffer>>,
+enum RequestMsg {
+    /// Standard request: register in `in_flight` so the read task can route the
+    /// matching response back to `response_tx`.
+    WithResponse {
+        correlation_id: CorrelationId,
+        data: zeropool::PooledBuffer,
+        response_tx: oneshot::Sender<Result<zeropool::PooledBuffer>>,
+    },
+    /// Fire-and-forget request (`acks=0`): the broker will not reply, so we must
+    /// not register an entry in `in_flight` — otherwise the next response on the
+    /// connection would mis-correlate against this orphaned slot. `ack_tx` is
+    /// settled by `write_task` once the bytes have been flushed (or with the
+    /// underlying `Error::Io` if write/flush failed); dropped without a value
+    /// when the connection is torn down before the batch was processed.
+    OneWay {
+        data: zeropool::PooledBuffer,
+        ack_tx: oneshot::Sender<Result<()>>,
+    },
 }
 
 type InFlight = Arc<
@@ -287,7 +301,7 @@ impl BrokerClient {
 
         let (response_tx, response_rx) = oneshot::channel();
 
-        let request_msg = RequestMsg {
+        let request_msg = RequestMsg::WithResponse {
             correlation_id,
             data,
             response_tx,
@@ -308,6 +322,84 @@ impl BrokerClient {
             api_version,
             _marker: PhantomData,
         })
+    }
+
+    /// Encode and ship a fire-and-forget request (`acks=0` on Produce). The
+    /// broker will not reply, so we deliberately skip the `in_flight`
+    /// registration that `send_request` performs — registering would orphan
+    /// a slot and mis-correlate the next real response on this connection.
+    ///
+    /// Returns `Ok(())` once the bytes have been written to the socket and
+    /// the writer has been flushed. Returns `Err` if the underlying
+    /// `write_all`/`flush` failed, or the broker connection was torn down
+    /// before this batch could be processed (`ConnectionAborted`).
+    pub async fn send_oneway<Req>(
+        &self,
+        api_key: ApiKey,
+        api_version: i16,
+        request: &Req,
+    ) -> Result<()>
+    where
+        Req: Encodable + HeaderVersion + Send + 'static,
+    {
+        if self.inner.shutdown.load(Ordering::Acquire) {
+            return Err(Error::Io(std::io::Error::new(
+                std::io::ErrorKind::ConnectionAborted,
+                "broker connection closed",
+            )));
+        }
+
+        // Kafka requires a correlation id in the request header even when
+        // the broker won't reply, so allocate one but don't track it.
+        let correlation_id = CorrelationId(
+            self.inner
+                .next_correlation_id
+                .fetch_add(1, Ordering::Relaxed),
+        );
+
+        let header = RequestHeader::default()
+            .with_request_api_key(api_key as i16)
+            .with_request_api_version(api_version)
+            .with_correlation_id(*correlation_id)
+            .with_client_id(Some(StrBytes::from_static_str(CLIENT_ID)));
+
+        let header_version = Req::header_version(api_version);
+        let size = header.compute_size(header_version)? + request.compute_size(api_version)?;
+        let mut buf = self.inner.pool.get(4 + size);
+        debug_assert_eq!(buf.len(), 4 + size);
+        buf.clear();
+        let size = i32::try_from(size).map_err(|_| {
+            Error::Protocol(format!("request too large for i32 frame size: {size}"))
+        })?;
+        buf.put_i32(size);
+        header.encode(&mut *buf, header_version)?;
+        request.encode(&mut *buf, api_version)?;
+        let data = buf;
+
+        tracing::debug!(?correlation_id, bytes = data.len(), "sending one-way request");
+
+        let (ack_tx, ack_rx) = oneshot::channel();
+
+        self.inner
+            .request_tx
+            .send(RequestMsg::OneWay { data, ack_tx })
+            .await
+            .map_err(|_| {
+                tracing::error!("connection task has shut down");
+                Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionAborted,
+                    "connection task has shut down",
+                ))
+            })?;
+
+        // Await the writer's verdict.
+        match ack_rx.await {
+            Ok(result) => result,
+            Err(_) => Err(Error::Io(std::io::Error::new(
+                std::io::ErrorKind::ConnectionAborted,
+                "broker connection torn down before write completed",
+            ))),
+        }
     }
 
     pub async fn fetch_metadata(&self) -> Result<MetadataResponse> {
@@ -632,6 +724,15 @@ const RECV_MANY_BATCH_COUNT: usize = 32;
 // before flushing.
 const WRITE_BUFFER_CAPACITY: usize = 128 * 1024;
 
+/// Per-batch tag for entries in `data_batch`. `WithResponse` only carries the
+/// correlation id (its `response_tx` lives in `in_flight`); `OneWay` carries
+/// its `ack_tx` directly so `write_task` can settle it in-place after flush
+/// (or notify on write/flush failure).
+enum BatchEntry {
+    WithResponse(CorrelationId),
+    OneWay(oneshot::Sender<Result<()>>),
+}
+
 /// Write task: pulls `RequestMsg`s from the channel, registers them in `in_flight`, and
 /// writes them to the broker. Uses `recv_many` to request_batch queued requests and flush
 /// once per request_batch, reducing syscalls under concurrent load. Exits on a write/flush
@@ -649,7 +750,8 @@ async fn write_task(
     //      This means the flush on buffer forces the write
     let mut writer = tokio::io::BufWriter::with_capacity(WRITE_BUFFER_CAPACITY, writer);
     let mut request_batch: Vec<RequestMsg> = Vec::with_capacity(RECV_MANY_BATCH_COUNT);
-    let mut data_batch = Vec::with_capacity(RECV_MANY_BATCH_COUNT);
+    let mut data_batch: Vec<(BatchEntry, zeropool::PooledBuffer)> =
+        Vec::with_capacity(RECV_MANY_BATCH_COUNT);
 
     'outer: loop {
         request_batch.clear();
@@ -672,37 +774,101 @@ async fn write_task(
 
         tracing::trace!(count, "writing request request_batch to broker");
 
+        // OneWay requests never touch `in_flight`. We tag each batch entry
+        // with its kind so the error path knows how many tail in_flight
+        // slots to pop, and the success/error paths know which OneWay
+        // ack_tx senders to settle.
         {
             let mut q = in_flight.lock().unwrap();
             for req in request_batch.drain(0..count) {
-                q.push_back((req.correlation_id, req.response_tx));
-                data_batch.push((req.correlation_id, req.data));
+                match req {
+                    RequestMsg::WithResponse {
+                        correlation_id,
+                        data,
+                        response_tx,
+                    } => {
+                        q.push_back((correlation_id, response_tx));
+                        data_batch.push((BatchEntry::WithResponse(correlation_id), data));
+                    }
+                    RequestMsg::OneWay { data, ack_tx } => {
+                        data_batch.push((BatchEntry::OneWay(ack_tx), data));
+                    }
+                }
             }
         }
 
-        for (i, (correlation_id, data)) in data_batch.drain(0..count).enumerate() {
-            if let Err(e) = writer.write_all(&data).await {
-                tracing::error!(correlation_id = ?correlation_id, error = %e, "write failed");
+        let mut write_error: Option<std::io::Error> = None;
+        for i in 0..count {
+            let (entry, data) = &data_batch[i];
 
-                // Pop the failed entry and every entry after it (never written).
-                // They sit at the tail of the queue: count - i entries total.
-                {
-                    let mut q = in_flight.lock().unwrap();
-                    for _ in 0..count - i {
-                        if let Some((_, tx)) = q.pop_back() {
-                            let _ = tx
-                                .send(Err(Error::Io(std::io::Error::new(e.kind(), e.to_string()))));
-                        }
+            let e = match writer.write_all(data).await {
+                Ok(_) => continue,
+                Err(e) => e,
+            };
+
+            let correlation_id = match entry {
+                BatchEntry::WithResponse(id) => Some(*id),
+                BatchEntry::OneWay(_) => None,
+            };
+            tracing::error!(correlation_id = ?correlation_id, error = %e, "write failed");
+
+            // Notify the only WithResponse senders live in in_flight array, but not yet written
+            // Because the socket goes in error, read_task will notify the remaining
+            let unwritten_with_response = data_batch[i..count]
+                .iter()
+                .filter(|(entry, _)| matches!(entry, BatchEntry::WithResponse(_)))
+                .count();
+            {
+                let mut q = in_flight.lock().unwrap();
+                for _ in 0..unwritten_with_response {
+                    if let Some((_, tx)) = q.pop_back() {
+                        let _ = tx
+                            .send(Err(Error::Io(std::io::Error::new(e.kind(), e.to_string()))));
                     }
                 }
-
-                break 'outer;
             }
+
+            write_error = Some(e);
+            break;
+        }
+
+        // In case of error, we didn't notify the OneWay requests yet.
+        // Because they are not living inside in_flight array, we
+        // have to proceed manually here.
+        if let Some(e) = write_error {
+            // Drain consumes ownership so PooledBuffers
+            // are released as we iterate.
+            for (entry, _) in data_batch.drain(..) {
+                if let BatchEntry::OneWay(ack_tx) = entry {
+                    let _ = ack_tx
+                        .send(Err(Error::Io(std::io::Error::new(e.kind(), e.to_string()))));
+                }
+            }
+            break 'outer;
         }
 
         if let Err(e) = writer.flush().await {
             tracing::error!(error = %e, "flush failed, exiting write task");
+            // WithResponse entries are already in `in_flight`; read_task's
+            // drain_in_flight() notifies them with ConnectionAborted as the
+            // connection tears down.
+            // Instead, OneWay entries we own here, so notify
+            // directly with the flush error.
+            for (entry, _) in data_batch.drain(..) {
+                if let BatchEntry::OneWay(ack_tx) = entry {
+                    let _ = ack_tx
+                        .send(Err(Error::Io(std::io::Error::new(e.kind(), e.to_string()))));
+                }
+            }
             break;
+        }
+
+        // Success: bytes are out of the BufWriter. Settle every OneWay
+        // sender in this batch with Ok(()).
+        for (entry, _) in data_batch.drain(..) {
+            if let BatchEntry::OneWay(ack_tx) = entry {
+                let _ = ack_tx.send(Ok(()));
+            }
         }
     }
 

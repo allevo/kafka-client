@@ -125,19 +125,8 @@ async fn dispatch(
     }
 
     // ProduceRequest v9: 0 = no ack, 1 = leader-only, -1 = full ISR.
-    // Acks::None routes through a different (no-response) path, gated
-    // out at Producer::send-time in slice 2; for now the sender-side
-    // assumes the broker replies.
     let acks: i16 = match config.acks {
-        Acks::None => {
-            tracing::error!("Acks::None is not supported in slice-1 producer");
-            for batch in by_leader.into_values().flatten() {
-                notify_waiters_the_failure(batch.frozen.waiters, || {
-                    Error::Config("Acks::None is not supported in slice-1 producer".into())
-                });
-            }
-            return;
-        }
+        Acks::None => 0,
         Acks::Leader => 1,
         Acks::All => -1,
     };
@@ -182,6 +171,45 @@ async fn send_to_leader(
         .with_acks(acks)
         .with_timeout_ms(duration_to_ms(PRODUCE_REQUEST_TIMEOUT))
         .with_topic_data(topic_data);
+
+    if acks == 0 {
+        let result = client
+            .send_oneway(
+                NodeTarget::Broker(leader),
+                ApiKey::Produce,
+                9,
+                request,
+                &CallOptions::new().with_timeout(PRODUCE_CALL_TIMEOUT),
+            )
+            .await;
+
+        match result {
+            Ok(()) => {
+                for pending in pending_batches {
+                    let topic = pending.topic;
+                    let partition = pending.partition;
+                    for tx in pending.waiters {
+                        let _ = tx.send(Ok(RecordMetadata {
+                            topic: topic.clone(),
+                            partition,
+                            // Fire-and-forget: the broker won't reply, so we can't learn the
+                            // assigned offset.
+                            offset: -1,
+                            timestamp: None,
+                        }));
+                    }
+                }
+            }
+            Err(e) => {
+                // The bytes never made it onto the wire; surface this as a
+                // real failure rather than synthesising success.
+                for pending in pending_batches {
+                    notify_waiters_the_failure(pending.waiters, || clone_error(&e));
+                }
+            }
+        }
+        return;
+    }
 
     // `with_retries(0)`: a partial-success ProduceResponse (some
     // partitions OK, some not) must not be retransmitted blindly by
