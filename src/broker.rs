@@ -60,21 +60,20 @@ impl TryFrom<&[u8]> for CorrelationId {
 }
 
 enum RequestMsg {
-    /// Standard request: register in `in_flight` so the read task can route the
-    /// matching response back to `response_tx`.
+    /// Request you can wait
     WithResponse {
+        /// correlationId
         correlation_id: CorrelationId,
+        /// Serialized request
         data: zeropool::PooledBuffer,
+        /// Used to wake up the waiter when a response arrived
         response_tx: oneshot::Sender<Result<zeropool::PooledBuffer>>,
     },
-    /// Fire-and-forget request (`acks=0`): the broker will not reply, so we must
-    /// not register an entry in `in_flight` — otherwise the next response on the
-    /// connection would mis-correlate against this orphaned slot. `ack_tx` is
-    /// settled by `write_task` once the bytes have been flushed (or with the
-    /// underlying `Error::Io` if write/flush failed); dropped without a value
-    /// when the connection is torn down before the batch was processed.
+    /// Fire-and-forget request (`acks=0`)
     OneWay {
+        /// Serialized request
         data: zeropool::PooledBuffer,
+        /// Used to wake up the waiter when the request is written
         ack_tx: oneshot::Sender<Result<()>>,
     },
 }
@@ -328,11 +327,13 @@ impl BrokerClient {
     /// broker will not reply, so we deliberately skip the `in_flight`
     /// registration that `send_request` performs — registering would orphan
     /// a slot and mis-correlate the next real response on this connection.
-    ///
-    /// Returns `Ok(())` once the bytes have been written to the socket and
-    /// the writer has been flushed. Returns `Err` if the underlying
-    /// `write_all`/`flush` failed, or the broker connection was torn down
-    /// before this batch could be processed (`ConnectionAborted`).
+    /// 
+    /// Returns once the bytes have left the writer (post-`flush`). A
+    /// tear-down that occurs after that point — bytes still in the
+    /// kernel/socket buffer when the broker drops the connection — is not
+    /// surfaced to the caller; failures before that point (write/flush
+    /// errors, read-task EOF, idle close, reauth failure) are reported as
+    /// `Err`.
     pub async fn send_oneway<Req>(
         &self,
         api_key: ApiKey,
@@ -750,7 +751,7 @@ async fn write_task(
     //      This means the flush on buffer forces the write
     let mut writer = tokio::io::BufWriter::with_capacity(WRITE_BUFFER_CAPACITY, writer);
     let mut request_batch: Vec<RequestMsg> = Vec::with_capacity(RECV_MANY_BATCH_COUNT);
-    let mut data_batch: Vec<(BatchEntry, zeropool::PooledBuffer)> =
+    let mut data_batch: Vec<(BatchEntry, Option<zeropool::PooledBuffer>)> =
         Vec::with_capacity(RECV_MANY_BATCH_COUNT);
 
     'outer: loop {
@@ -788,10 +789,10 @@ async fn write_task(
                         response_tx,
                     } => {
                         q.push_back((correlation_id, response_tx));
-                        data_batch.push((BatchEntry::WithResponse(correlation_id), data));
+                        data_batch.push((BatchEntry::WithResponse(correlation_id), Some(data)));
                     }
                     RequestMsg::OneWay { data, ack_tx } => {
-                        data_batch.push((BatchEntry::OneWay(ack_tx), data));
+                        data_batch.push((BatchEntry::OneWay(ack_tx), Some(data)));
                     }
                 }
             }
@@ -799,9 +800,10 @@ async fn write_task(
 
         let mut write_error: Option<std::io::Error> = None;
         for i in 0..count {
-            let (entry, data) = &data_batch[i];
+            let data = data_batch[i].1.take().expect("buffer present at iteration i");
+            let entry = &data_batch[i].0;
 
-            let e = match writer.write_all(data).await {
+            let e = match writer.write_all(&data).await {
                 Ok(_) => continue,
                 Err(e) => e,
             };
@@ -824,6 +826,8 @@ async fn write_task(
                     if let Some((_, tx)) = q.pop_back() {
                         let _ = tx
                             .send(Err(Error::Io(std::io::Error::new(e.kind(), e.to_string()))));
+                    } else {
+                        // Do nothing in this case: `read_task` already cleans up.
                     }
                 }
             }

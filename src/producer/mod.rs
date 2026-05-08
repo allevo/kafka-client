@@ -111,6 +111,16 @@ pub enum Acks {
     All,
 }
 
+impl Acks {
+    fn as_i16(&self) -> i16 {
+        match self {
+            Acks::None => 0,
+            Acks::Leader => 1,
+            Acks::All => -1,
+        }
+    }
+}
+
 /// Tunables for the producer. Use [`ProducerConfig::default`] for reasonable
 /// starting values and refine via the `with_*` builders.
 #[non_exhaustive]

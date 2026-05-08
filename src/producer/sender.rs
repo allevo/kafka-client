@@ -124,22 +124,15 @@ async fn dispatch(
         by_leader.entry(part.leader).or_default().push(batch);
     }
 
-    // ProduceRequest v9: 0 = no ack, 1 = leader-only, -1 = full ISR.
-    let acks: i16 = match config.acks {
-        Acks::None => 0,
-        Acks::Leader => 1,
-        Acks::All => -1,
-    };
-
     for (leader, batches) in by_leader {
-        send_to_leader(client, leader, acks, batches).await;
+        send_to_leader(client, leader, config.acks, batches).await;
     }
 }
 
 async fn send_to_leader(
     client: &Client,
     leader: BrokerId,
-    acks: i16,
+    acks: Acks,
     batches: Vec<ReadyBatch>,
 ) {
     // Split each batch up front: the encoded half is moved into the
@@ -166,72 +159,75 @@ async fn send_to_leader(
         })
         .collect();
 
+    // ProduceRequest v9: 0 = no ack, 1 = leader-only, -1 = full ISR.
     let request = ProduceRequest::default()
         .with_transactional_id(None)
-        .with_acks(acks)
+        .with_acks(acks.as_i16())
         .with_timeout_ms(duration_to_ms(PRODUCE_REQUEST_TIMEOUT))
         .with_topic_data(topic_data);
 
-    if acks == 0 {
-        let result = client
-            .send_oneway(
-                NodeTarget::Broker(leader),
-                ApiKey::Produce,
-                9,
-                request,
-                &CallOptions::new().with_timeout(PRODUCE_CALL_TIMEOUT),
-            )
-            .await;
+    match acks {
+        Acks::None => {
+            let result = client
+                .send_oneway(
+                    NodeTarget::Broker(leader),
+                    ApiKey::Produce,
+                    9,
+                    request,
+                    &CallOptions::new().with_timeout(PRODUCE_CALL_TIMEOUT),
+                )
+                .await;
 
-        match result {
-            Ok(()) => {
-                for pending in pending_batches {
-                    let topic = pending.topic;
-                    let partition = pending.partition;
-                    for tx in pending.waiters {
-                        let _ = tx.send(Ok(RecordMetadata {
-                            topic: topic.clone(),
-                            partition,
-                            // Fire-and-forget: the broker won't reply, so we can't learn the
-                            // assigned offset.
-                            offset: -1,
-                            timestamp: None,
-                        }));
+            match result {
+                Ok(()) => {
+                    for pending in pending_batches {
+                        let topic = pending.topic;
+                        let partition = pending.partition;
+                        for tx in pending.waiters {
+                            let _ = tx.send(Ok(RecordMetadata {
+                                topic: topic.clone(),
+                                partition,
+                                // Fire-and-forget: the broker won't reply, so we can't learn the
+                                // assigned offset.
+                                offset: -1,
+                                timestamp: None,
+                            }));
+                        }
+                    }
+                }
+                Err(e) => {
+                    // The bytes never made it onto the wire; surface this as a
+                    // real failure rather than synthesising success.
+                    for pending in pending_batches {
+                        notify_waiters_the_failure(pending.waiters, || clone_error(&e));
                     }
                 }
             }
-            Err(e) => {
-                // The bytes never made it onto the wire; surface this as a
-                // real failure rather than synthesising success.
-                for pending in pending_batches {
-                    notify_waiters_the_failure(pending.waiters, || clone_error(&e));
+        },
+        Acks::All | Acks::Leader => {
+            // `with_retries(0)`: a partial-success ProduceResponse (some
+            // partitions OK, some not) must not be retransmitted blindly by
+            // the client-level retry loop — that would reorder/duplicate the
+            // OK partitions. Per-partition retry is the slice-2 work item.
+            let result: Result<ProduceResponse> = client
+                .send(
+                    NodeTarget::Broker(leader),
+                    ApiKey::Produce,
+                    9,
+                    request,
+                    &CallOptions::new()
+                        .with_retries(0)
+                        .with_timeout(PRODUCE_CALL_TIMEOUT),
+                )
+                .await;
+
+            match result {
+                Ok(resp) => settle_response(resp, pending_batches),
+                Err(e) => {
+                    for pending in pending_batches {
+                        notify_waiters_the_failure(pending.waiters, || clone_error(&e));
+                    }
                 }
-            }
-        }
-        return;
-    }
-
-    // `with_retries(0)`: a partial-success ProduceResponse (some
-    // partitions OK, some not) must not be retransmitted blindly by
-    // the client-level retry loop — that would reorder/duplicate the
-    // OK partitions. Per-partition retry is the slice-2 work item.
-    let result: Result<ProduceResponse> = client
-        .send(
-            NodeTarget::Broker(leader),
-            ApiKey::Produce,
-            9,
-            request,
-            &CallOptions::new()
-                .with_retries(0)
-                .with_timeout(PRODUCE_CALL_TIMEOUT),
-        )
-        .await;
-
-    match result {
-        Ok(resp) => settle_response(resp, pending_batches),
-        Err(e) => {
-            for pending in pending_batches {
-                notify_waiters_the_failure(pending.waiters, || clone_error(&e));
             }
         }
     }

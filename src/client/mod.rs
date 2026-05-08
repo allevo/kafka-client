@@ -403,6 +403,9 @@ impl Client {
     /// `target` to a `BrokerClient`, negotiates the wire version, and writes
     /// the request without waiting for (or expecting) a response.
     ///
+    /// No retries are performed here. `opts.timeout` (defaulting to
+    /// `api_timeout`) bounds the whole call, till the flush.
+    ///
     /// `Ok(())` means the bytes were flushed onto the socket; `Err` reflects
     /// either a real write/flush failure or a torn-down connection (see
     /// `BrokerClient::send_oneway`). The caller is responsible for surfacing
@@ -434,7 +437,7 @@ impl Client {
             Ok(r) => r?,
             Err(_) => {
                 return Err(Error::RequestTimeout(
-                    "broker acquisition exceeded request_timeout".into(),
+                    "send_oneway: broker acquisition exceeded api_timeout".into(),
                 ));
             }
         };
@@ -445,12 +448,9 @@ impl Client {
             .await
         {
             Ok(r) => r,
-            Err(_) => {
-                broker.shutdown();
-                Err(Error::RequestTimeout(
-                    "in-flight request exceeded request_timeout".into(),
-                ))
-            }
+            Err(_) => Err(Error::RequestTimeout(
+                "send_oneway: writer backpressure exceeded api_timeout".into(),
+            )),
         }
     }
 
