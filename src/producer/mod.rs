@@ -240,12 +240,12 @@ impl Future for SendFuture {
         // Deadline check first so a fired timer still wins even if the
         // ack lands in the same poll — preserves the wall-clock contract
         // the caller asked for when they passed `Some(timeout)`.
-        if let Some(sleep) = this.sleep.as_mut() {
-            if sleep.as_mut().poll(cx).is_ready() {
-                return Poll::Ready(Err(Error::RequestTimeout(
-                    "producer send timeout elapsed before broker ack".into(),
-                )));
-            }
+        if let Some(sleep) = this.sleep.as_mut()
+            && sleep.as_mut().poll(cx).is_ready()
+        {
+            return Poll::Ready(Err(Error::RequestTimeout(
+                "producer send timeout elapsed before broker ack".into(),
+            )));
         }
         match Pin::new(&mut this.rx).poll(cx) {
             Poll::Ready(Ok(r)) => Poll::Ready(r),

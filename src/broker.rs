@@ -87,6 +87,22 @@ type InFlight = Arc<
     >,
 >;
 
+/// Op sent from `BrokerClient::request_reauth` (called by `reauth_task`)
+/// into `write_task`. Ownership of the SASL exchange lives entirely in
+/// `write_task`: while `handle_sasl_exchange` is running, the outer
+/// `select!` is parked, so no normal request can be pulled off
+/// `request_rx` and slip between `SaslHandshake` and `SaslAuthenticate`.
+struct ReauthOp {
+    handshake_frame: zeropool::PooledBuffer,
+    handshake_corr: CorrelationId,
+    authenticate_frame: zeropool::PooledBuffer,
+    authenticate_corr: CorrelationId,
+    /// Returns the raw broker response payloads (header + body, post the
+    /// 4-byte size prefix). The caller decodes — `write_task` stays
+    /// SASL-agnostic apart from the order it writes the two frames.
+    resp_tx: oneshot::Sender<Result<(zeropool::PooledBuffer, zeropool::PooledBuffer)>>,
+}
+
 #[derive(Clone)]
 pub struct BrokerClient {
     inner: Arc<BrokerClientInner>,
@@ -97,6 +113,8 @@ struct BrokerClientInner {
     #[cfg(test)]
     id: u64,
     request_tx: mpsc::Sender<RequestMsg>,
+    /// One reauth in flight at most — bounded(1).
+    reauth_tx: mpsc::Sender<ReauthOp>,
     next_correlation_id: AtomicI32,
     pool: BufferPool,
     api_versions: Box<[ApiVersion]>,
@@ -144,15 +162,23 @@ impl BrokerClient {
 
         let api_versions = connection.fetch_api_versions(&mut correlation_id).await?;
 
+        // Initial SASL/PLAIN auth runs on the *raw* `Connection`, before the
+        // stream is split. No tasks exist yet, so there's no concurrency to
+        // coordinate against and no reason for the post-split machinery
+        // (in_flight, write_task, etc.) to be involved.
+        let initial_session_lifetime =
+            do_initial_sasl(&mut connection, &api_versions, &auth, &mut correlation_id).await?;
+
         let pool = BufferPool::new();
         let max_response_size = connection.max_response_size;
 
         let connections_max_idle = jitter_connection_max_idle(connection.connections_max_idle);
 
-        // Split the stream and build the shared in-flight map up front, so the read and
-        // write tasks are siblings spawned.
         let (reader, writer) = tokio::io::split(connection.stream);
         let (request_tx, request_rx) = mpsc::channel::<RequestMsg>(32);
+        // bounded(1): at most one re-auth round-trip in flight per
+        // connection. `reauth_task` is the only producer.
+        let (reauth_tx, reauth_rx) = mpsc::channel::<ReauthOp>(1);
 
         // Invariant: kafka guarantees in-order responses on a single connection.
         // Therefore:
@@ -170,17 +196,23 @@ impl BrokerClient {
         let close = Arc::new(Notify::new());
         let reauth_close = Arc::new(Notify::new());
         let reauth_pending = Arc::new(AtomicBool::new(false));
+        // Notify shared between `read_task` (notifier) and `write_task`
+        // (waiter inside `handle_sasl_exchange`). Lives only as long as
+        // those two tasks; not part of `BrokerClientInner`.
+        let in_flight_drained = Arc::new(Notify::new());
 
         tracing::info!("spawning write/read tasks");
         tokio::spawn(write_task(
             writer,
             request_rx,
+            reauth_rx,
             in_flight.clone(),
+            in_flight_drained.clone(),
             read_shutdown_rx,
         ));
         tokio::spawn(read_task(
             reader,
-            in_flight,
+            in_flight.clone(),
             max_response_size,
             read_shutdown_tx,
             shutdown.clone(),
@@ -189,6 +221,7 @@ impl BrokerClient {
             pool.clone(),
             connections_max_idle,
             reauth_pending.clone(),
+            in_flight_drained,
         ));
 
         let client = BrokerClient {
@@ -196,6 +229,7 @@ impl BrokerClient {
                 #[cfg(test)]
                 id: fastrand::u64(..),
                 request_tx,
+                reauth_tx,
                 pool,
                 next_correlation_id: AtomicI32::new(correlation_id + 1),
                 api_versions: api_versions.into(),
@@ -203,21 +237,16 @@ impl BrokerClient {
                 close,
                 reauth_close,
                 reauth_pending,
-                // Keep the sender alive so the oneshot in read_task stays pending.
-                // Moved into reauth_task below if reauth is needed.
                 _reauth_shutdown_tx: Mutex::new(None),
             }),
         };
 
-        let session_lifetime = client.authenticate(&auth).await?;
-
         // KIP-368: brokers with connections.max.reauth.ms > 0 will kill connections that
         // don't re-authenticate before the session expires. Spawn a background task that
         // sleeps and re-authenticates periodically.
-        if let Some(lifetime) = session_lifetime {
+        if let Some(lifetime) = initial_session_lifetime {
             tracing::info!(?lifetime, "spawning re-auth task");
 
-            // NB: Weak so, it doesn't count as strong reference
             let reauth_close = client.inner.reauth_close.clone();
             let delay_fn: ReauthDelayFn =
                 reauth_delay.unwrap_or_else(|| Arc::new(default_reauth_delay));
@@ -231,8 +260,9 @@ impl BrokerClient {
             ));
         } else {
             tracing::info!("Broker doesn't require re-auth task");
-            // Store reauth_shutdown_tx, so the `read_task` can poll it even if it will never be resolved
-            // This make the code easier at a little cost of a `tokio::sync::oneshot::Receiver::poll`
+            // Park the sender on the inner so `read_task`'s `reauth_shutdown`
+            // arm stays pending forever (a single oneshot poll is cheaper
+            // than threading conditional logic through `read_task`).
             let mut guard = client.inner._reauth_shutdown_tx.lock().unwrap();
             *guard = Some(reauth_shutdown_tx);
         }
@@ -275,26 +305,13 @@ impl BrokerClient {
         // the caller's task rather than serialised through the single
         // writer; decoding lives in `ResponseFuture::poll` for the same
         // reason.
-
-        let header = RequestHeader::default()
-            .with_request_api_key(api_key as i16)
-            .with_request_api_version(api_version)
-            .with_correlation_id(*correlation_id)
-            .with_client_id(Some(StrBytes::from_static_str(CLIENT_ID)));
-
-        let header_version = Req::header_version(api_version);
-        let size = header.compute_size(header_version)? + request.compute_size(api_version)?;
-        let mut buf = self.inner.pool.get(4 + size);
-        debug_assert_eq!(buf.len(), 4 + size);
-        // We want to start from position 0, discarding dirty (and old) values
-        buf.clear();
-        let size = i32::try_from(size).map_err(|_| {
-            Error::Protocol(format!("request too large for i32 frame size: {size}"))
-        })?;
-        buf.put_i32(size);
-        header.encode(&mut *buf, header_version)?;
-        request.encode(&mut *buf, api_version)?;
-        let data = buf;
+        let data = encode_into_pooled(
+            &self.inner.pool,
+            api_key,
+            api_version,
+            correlation_id,
+            request,
+        )?;
 
         tracing::debug!(?correlation_id, bytes = data.len(), "sending request");
 
@@ -327,7 +344,7 @@ impl BrokerClient {
     /// broker will not reply, so we deliberately skip the `in_flight`
     /// registration that `send_request` performs — registering would orphan
     /// a slot and mis-correlate the next real response on this connection.
-    /// 
+    ///
     /// Returns once the bytes have left the writer (post-`flush`). A
     /// tear-down that occurs after that point — bytes still in the
     /// kernel/socket buffer when the broker drops the connection — is not
@@ -358,26 +375,19 @@ impl BrokerClient {
                 .fetch_add(1, Ordering::Relaxed),
         );
 
-        let header = RequestHeader::default()
-            .with_request_api_key(api_key as i16)
-            .with_request_api_version(api_version)
-            .with_correlation_id(*correlation_id)
-            .with_client_id(Some(StrBytes::from_static_str(CLIENT_ID)));
+        let data = encode_into_pooled(
+            &self.inner.pool,
+            api_key,
+            api_version,
+            correlation_id,
+            request,
+        )?;
 
-        let header_version = Req::header_version(api_version);
-        let size = header.compute_size(header_version)? + request.compute_size(api_version)?;
-        let mut buf = self.inner.pool.get(4 + size);
-        debug_assert_eq!(buf.len(), 4 + size);
-        buf.clear();
-        let size = i32::try_from(size).map_err(|_| {
-            Error::Protocol(format!("request too large for i32 frame size: {size}"))
-        })?;
-        buf.put_i32(size);
-        header.encode(&mut *buf, header_version)?;
-        request.encode(&mut *buf, api_version)?;
-        let data = buf;
-
-        tracing::debug!(?correlation_id, bytes = data.len(), "sending one-way request");
+        tracing::debug!(
+            ?correlation_id,
+            bytes = data.len(),
+            "sending one-way request"
+        );
 
         let (ack_tx, ack_rx) = oneshot::channel();
 
@@ -435,8 +445,6 @@ impl BrokerClient {
 
     /// Returns `true` if the broker shut down
     pub(crate) fn is_shutdown(&self) -> bool {
-        // Acquire pairs with read_task's Release store at the bottom of read_task,
-        // matching the ordering send_request already uses.
         self.inner.shutdown.load(Ordering::Acquire)
     }
 
@@ -454,15 +462,20 @@ impl BrokerClient {
         self.inner.shutdown.store(true, Ordering::Release);
     }
 
-    /// Run a SASL/PLAIN handshake + authenticate against the broker. Used both for initial
-    /// auth and for periodic re-authentication. Returns `Some(session_lifetime)` if the
-    /// broker enforces re-auth (`session_lifetime_ms > 0`), otherwise `None`.
-    async fn authenticate(&self, auth: &Auth) -> Result<Option<Duration>> {
+    /// Request a SASL/PLAIN re-auth round-trip. Encoded frames are
+    /// pre-built here on `reauth_task`'s task; the actual write +
+    /// in-flight registration happens inside `write_task`'s reauth arm
+    /// where it cannot interleave with normal requests.
+    ///
+    /// Returns `Some(session_lifetime)` if the broker still enforces
+    /// KIP-368 on the renewed session, `None` if it's no longer enforcing
+    /// it, and `Err` on protocol/auth/IO failures.
+    async fn request_reauth(&self, auth: &Auth) -> Result<Option<Duration>> {
         let Auth::Plain { username, password } = auth else {
             return Ok(None);
         };
 
-        tracing::info!(username = %username, "starting SASL/PLAIN authentication");
+        tracing::info!(username = %username, "starting SASL/PLAIN re-authentication");
 
         let has_handshake = self
             .inner
@@ -480,15 +493,72 @@ impl BrokerClient {
             ));
         }
 
-        // SaslHandshake v1
-        let handshake_resp: SaslHandshakeResponse = self
-            .send_request(
-                ApiKey::SaslHandshake,
-                1,
-                &SaslHandshakeRequest::default().with_mechanism(StrBytes::from_static_str("PLAIN")),
-            )
-            .await?
-            .await?;
+        // Cap at v2 — v1+ is the minimum needed to receive
+        // `session_lifetime_ms` (KIP-368), and we don't parse fields
+        // beyond v2.
+        let auth_version =
+            negotiate_version(&self.inner.api_versions, ApiKey::SaslAuthenticate, 2)?;
+        tracing::debug!(auth_version, "negotiated SaslAuthenticate version");
+
+        let handshake_corr = CorrelationId(
+            self.inner
+                .next_correlation_id
+                .fetch_add(1, Ordering::Relaxed),
+        );
+        let authenticate_corr = CorrelationId(
+            self.inner
+                .next_correlation_id
+                .fetch_add(1, Ordering::Relaxed),
+        );
+
+        let handshake_frame = encode_into_pooled(
+            &self.inner.pool,
+            ApiKey::SaslHandshake,
+            1,
+            handshake_corr,
+            &SaslHandshakeRequest::default().with_mechanism(StrBytes::from_static_str("PLAIN")),
+        )?;
+
+        let token = build_plain_token(username, password.expose_secret());
+        let authenticate_frame = encode_into_pooled(
+            &self.inner.pool,
+            ApiKey::SaslAuthenticate,
+            auth_version,
+            authenticate_corr,
+            &SaslAuthenticateRequest::default().with_auth_bytes(token),
+        )?;
+
+        let (resp_tx, resp_rx) = oneshot::channel();
+        let op = ReauthOp {
+            handshake_frame,
+            handshake_corr,
+            authenticate_frame,
+            authenticate_corr,
+            resp_tx,
+        };
+
+        self.inner.reauth_tx.send(op).await.map_err(|_| {
+            Error::Io(std::io::Error::new(
+                std::io::ErrorKind::ConnectionAborted,
+                "broker connection closed before reauth could be enqueued",
+            ))
+        })?;
+
+        let (handshake_resp_buf, auth_resp_buf) = match resp_rx.await {
+            Ok(result) => result?,
+            Err(_) => {
+                return Err(Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionAborted,
+                    "write task dropped reauth response channel",
+                )));
+            }
+        };
+
+        // Decode SaslHandshake response.
+        let mut handshake_buf = Bytes::from_owner(handshake_resp_buf);
+        let hs_header_version = ApiKey::SaslHandshake.response_header_version(1);
+        let _ = ResponseHeader::decode(&mut handshake_buf, hs_header_version)?;
+        let handshake_resp = SaslHandshakeResponse::decode(&mut handshake_buf, 1)?;
         if handshake_resp.error_code != 0 {
             return Err(Error::Authentication(format!(
                 "SASL handshake failed with error code: {}",
@@ -496,21 +566,11 @@ impl BrokerClient {
             )));
         }
 
-        // Negotiate SaslAuthenticate version: min(2, broker_max). v1+ is required to receive
-        // session_lifetime_ms (KIP-368), so we cap at 2 to avoid asking for fields we don't parse.
-        let auth_version =
-            negotiate_version(&self.inner.api_versions, ApiKey::SaslAuthenticate, 2)?;
-        tracing::debug!(auth_version, "negotiated SaslAuthenticate version");
-
-        let token = build_plain_token(username, password.expose_secret());
-        let auth_resp: SaslAuthenticateResponse = self
-            .send_request(
-                ApiKey::SaslAuthenticate,
-                auth_version,
-                &SaslAuthenticateRequest::default().with_auth_bytes(token),
-            )
-            .await?
-            .await?;
+        // Decode SaslAuthenticate response.
+        let mut auth_buf = Bytes::from_owner(auth_resp_buf);
+        let auth_header_version = ApiKey::SaslAuthenticate.response_header_version(auth_version);
+        let _ = ResponseHeader::decode(&mut auth_buf, auth_header_version)?;
+        let auth_resp = SaslAuthenticateResponse::decode(&mut auth_buf, auth_version)?;
         if auth_resp.error_code != 0 {
             let msg = auth_resp
                 .error_message
@@ -523,16 +583,14 @@ impl BrokerClient {
         tracing::info!(
             username = %username,
             session_lifetime_ms,
-            "SASL/PLAIN authentication successful"
+            "SASL/PLAIN re-authentication successful"
         );
 
-        let duration = if session_lifetime_ms > 0 {
+        Ok(if session_lifetime_ms > 0 {
             Some(Duration::from_millis(session_lifetime_ms as u64))
         } else {
             None
-        };
-
-        Ok(duration)
+        })
     }
 }
 
@@ -639,6 +697,130 @@ fn build_plain_token(username: &str, password: &str) -> Bytes {
     Bytes::from(token)
 }
 
+/// Encode a Kafka request (header + body) into a pooled buffer with the
+/// 4-byte size prefix already laid down. Used by every send path
+/// (`send_request`, `send_oneway`, `request_reauth`).
+fn encode_into_pooled<R: Encodable + HeaderVersion>(
+    pool: &BufferPool,
+    api_key: ApiKey,
+    api_version: i16,
+    correlation_id: CorrelationId,
+    request: &R,
+) -> Result<zeropool::PooledBuffer> {
+    let header = RequestHeader::default()
+        .with_request_api_key(api_key as i16)
+        .with_request_api_version(api_version)
+        .with_correlation_id(*correlation_id)
+        .with_client_id(Some(StrBytes::from_static_str(CLIENT_ID)));
+
+    let header_version = R::header_version(api_version);
+    let size = header.compute_size(header_version)? + request.compute_size(api_version)?;
+    let mut buf = pool.get(4 + size);
+    debug_assert_eq!(buf.len(), 4 + size);
+    buf.clear();
+    let size = i32::try_from(size)
+        .map_err(|_| Error::Protocol(format!("request too large for i32 frame size: {size}")))?;
+    buf.put_i32(size);
+    header.encode(&mut *buf, header_version)?;
+    request.encode(&mut *buf, api_version)?;
+    Ok(buf)
+}
+
+/// Run SASL/PLAIN initial authentication directly on the `Connection`.
+async fn do_initial_sasl(
+    connection: &mut Connection,
+    api_versions: &[ApiVersion],
+    auth: &Auth,
+    correlation_id: &mut i32,
+) -> Result<Option<Duration>> {
+    let Auth::Plain { username, password } = auth else {
+        return Ok(None);
+    };
+
+    tracing::info!(username = %username, "starting SASL/PLAIN initial authentication");
+
+    let has_handshake = api_versions
+        .iter()
+        .any(|v| v.api_key == ApiKey::SaslHandshake as i16);
+    let has_authenticate = api_versions
+        .iter()
+        .any(|v| v.api_key == ApiKey::SaslAuthenticate as i16);
+    if !has_handshake || !has_authenticate {
+        return Err(Error::Authentication(
+            "broker does not support SASL authentication (missing API key 17 or 36)".into(),
+        ));
+    }
+
+    let auth_version = negotiate_version(api_versions, ApiKey::SaslAuthenticate, 2)?;
+
+    // SaslHandshake v1
+    *correlation_id += 1;
+    let handshake_corr = *correlation_id;
+    let handshake_frame = crate::connection::encode_request(
+        &SaslHandshakeRequest::default().with_mechanism(StrBytes::from_static_str("PLAIN")),
+        ApiKey::SaslHandshake as i16,
+        1,
+        handshake_corr,
+    )?;
+    connection.stream.write_all(&handshake_frame).await?;
+
+    let mut handshake_buf =
+        crate::connection::read_response(&mut connection.stream, connection.max_response_size)
+            .await?;
+    let hs_header_version = ApiKey::SaslHandshake.response_header_version(1);
+    crate::connection::decode_response_header(
+        &mut handshake_buf,
+        hs_header_version,
+        handshake_corr,
+    )?;
+    let handshake_resp = SaslHandshakeResponse::decode(&mut handshake_buf, 1)?;
+    if handshake_resp.error_code != 0 {
+        return Err(Error::Authentication(format!(
+            "SASL handshake failed with error code: {}",
+            handshake_resp.error_code
+        )));
+    }
+
+    // SaslAuthenticate
+    *correlation_id += 1;
+    let auth_corr = *correlation_id;
+    let token = build_plain_token(username, password.expose_secret());
+    let auth_frame = crate::connection::encode_request(
+        &SaslAuthenticateRequest::default().with_auth_bytes(token),
+        ApiKey::SaslAuthenticate as i16,
+        auth_version,
+        auth_corr,
+    )?;
+    connection.stream.write_all(&auth_frame).await?;
+
+    let mut auth_buf =
+        crate::connection::read_response(&mut connection.stream, connection.max_response_size)
+            .await?;
+    let auth_header_version = ApiKey::SaslAuthenticate.response_header_version(auth_version);
+    crate::connection::decode_response_header(&mut auth_buf, auth_header_version, auth_corr)?;
+    let auth_resp = SaslAuthenticateResponse::decode(&mut auth_buf, auth_version)?;
+    if auth_resp.error_code != 0 {
+        let msg = auth_resp
+            .error_message
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| format!("error code: {}", auth_resp.error_code));
+        return Err(Error::Authentication(msg));
+    }
+
+    let session_lifetime_ms = auth_resp.session_lifetime_ms;
+    tracing::info!(
+        username = %username,
+        session_lifetime_ms,
+        "SASL/PLAIN initial authentication successful"
+    );
+
+    Ok(if session_lifetime_ms > 0 {
+        Some(Duration::from_millis(session_lifetime_ms as u64))
+    } else {
+        None
+    })
+}
+
 /// Default re-auth delay: 75–85% of `session_lifetime`, with random jitter.
 ///
 /// KIP-368: re-authenticate before the broker enforces
@@ -664,8 +846,6 @@ async fn reauth_task(
     loop {
         let delay = delay_fn(session_lifetime);
         tracing::debug!(?delay, "re-auth task sleeping");
-        // Force to stop the task when a shutdown is requested instead of
-        // waiting the next cicle.
         tokio::select! {
             _ = tokio::time::sleep(delay) => {}
             _ = reauth_close.notified() => {
@@ -674,7 +854,6 @@ async fn reauth_task(
             }
         }
 
-        // None means inner is freed.
         let Some(strong) = inner.upgrade() else {
             tracing::info!("reauth task: client dropped, exiting");
             return;
@@ -683,9 +862,9 @@ async fn reauth_task(
 
         tracing::info!("re-auth timer fired, starting re-authentication");
         // Signal read_task that a re-auth is imminent so it doesn't idle-close
-        // the connection before our requests hit in_flight.
+        // the connection before the SASL frames hit the wire.
         client.inner.reauth_pending.store(true, Ordering::Release);
-        let result = client.authenticate(&auth).await;
+        let result = client.request_reauth(&auth).await;
         client.inner.reauth_pending.store(false, Ordering::Release);
         // Release our strong ref *before* the next sleep so dropping the
         // user's last external handle in the meantime triggers
@@ -699,10 +878,6 @@ async fn reauth_task(
             }
             Ok(None) => {
                 tracing::info!("re-auth returned no session lifetime, stopping reauth task");
-                // Broker no longer enforces KIP-368 on this session. Park the
-                // sender back on the inner so read_task's `reauth_shutdown`
-                // arm stays pending forever. Mirrors the init-time no-reauth path
-                // at `BrokerClient::new`.
                 if let Some(inner) = inner.upgrade() {
                     *inner._reauth_shutdown_tx.lock().unwrap() = Some(reauth_shutdown_tx);
                 }
@@ -734,6 +909,19 @@ enum BatchEntry {
     OneWay(oneshot::Sender<Result<()>>),
 }
 
+/// What the outer `select!` of `write_task` resolved to this iteration.
+enum WriteStep {
+    /// `read_task` signaled tear-down (oneshot sender dropped).
+    ReadShutdown,
+    /// A re-auth op landed. While we're handling it, the outer `select!`
+    /// is parked, so no normal request can interleave between
+    /// `SaslHandshake` and `SaslAuthenticate` — KIP-368 invariant
+    /// preserved by ownership, not by external locking.
+    Reauth(Option<ReauthOp>),
+    /// `recv_many` returned `count` normal requests (0 == channel closed).
+    ProcessRequests(usize),
+}
+
 /// Write task: pulls `RequestMsg`s from the channel, registers them in `in_flight`, and
 /// writes them to the broker. Uses `recv_many` to request_batch queued requests and flush
 /// once per request_batch, reducing syscalls under concurrent load. Exits on a write/flush
@@ -742,7 +930,9 @@ enum BatchEntry {
 async fn write_task(
     writer: tokio::io::WriteHalf<crate::connection::Stream>,
     mut request_rx: mpsc::Receiver<RequestMsg>,
+    mut reauth_rx: mpsc::Receiver<ReauthOp>,
     in_flight: InFlight,
+    in_flight_drained: Arc<Notify>,
     mut read_shutdown: oneshot::Receiver<()>,
 ) {
     // This wrap avoids one syscall per write.
@@ -758,21 +948,49 @@ async fn write_task(
         request_batch.clear();
         data_batch.clear();
 
-        let count = tokio::select! {
+        let step = tokio::select! {
             biased;
-            _ = &mut read_shutdown => {
+            _ = &mut read_shutdown => WriteStep::ReadShutdown,
+            // Reauth wins over normal traffic — when the timer fires the
+            // session is close to expiring, so don't let a fresh batch of
+            // normal requests delay it.
+            op = reauth_rx.recv() => WriteStep::Reauth(op),
+            // recv_many is cancel-safe: messages already moved into `request_batch`
+            // survive cancellation and would be processed on the next iteration.
+            count = request_rx.recv_many(&mut request_batch, RECV_MANY_BATCH_COUNT) => WriteStep::ProcessRequests(count),
+        };
+
+        match step {
+            WriteStep::ReadShutdown => {
                 tracing::warn!("read task signaled shutdown, exiting write task");
                 break;
             }
-            // recv_many is cancel-safe: messages already moved into `request_batch`
-            // survive cancellation and would be processed on the next iteration.
-            count = request_rx.recv_many(&mut request_batch, RECV_MANY_BATCH_COUNT) => count,
-        };
-        if count == 0 {
-            tracing::debug!("request channel closed, exiting write task");
-            break;
+            WriteStep::Reauth(None) => {
+                // `reauth_tx` is owned by `BrokerClientInner`; the only
+                // way it closes is the inner being dropped, which also
+                // fires the close→read_task→read_shutdown chain. Either
+                // way, we're tearing down — bail now to avoid a spurious
+                // poll loop.
+                tracing::info!("reauth channel closed, exiting write task");
+                break;
+            }
+            WriteStep::Reauth(Some(op)) => {
+                if let Err(e) =
+                    handle_sasl_exchange(&mut writer, &in_flight, &in_flight_drained, op).await
+                {
+                    tracing::error!(error = %e, "SASL exchange failed in write task");
+                    break 'outer;
+                }
+                continue;
+            }
+            WriteStep::ProcessRequests(0) => {
+                tracing::debug!("request channel closed, exiting write task");
+                break;
+            }
+            WriteStep::ProcessRequests(_) => { /* fall through to batch processing */ }
         }
 
+        let count = request_batch.len();
         tracing::trace!(count, "writing request request_batch to broker");
 
         // OneWay requests never touch `in_flight`. We tag each batch entry
@@ -800,7 +1018,10 @@ async fn write_task(
 
         let mut write_error: Option<std::io::Error> = None;
         for i in 0..count {
-            let data = data_batch[i].1.take().expect("buffer present at iteration i");
+            let data = data_batch[i]
+                .1
+                .take()
+                .expect("buffer present at iteration i");
             let entry = &data_batch[i].0;
 
             let e = match writer.write_all(&data).await {
@@ -824,8 +1045,8 @@ async fn write_task(
                 let mut q = in_flight.lock().unwrap();
                 for _ in 0..unwritten_with_response {
                     if let Some((_, tx)) = q.pop_back() {
-                        let _ = tx
-                            .send(Err(Error::Io(std::io::Error::new(e.kind(), e.to_string()))));
+                        let _ =
+                            tx.send(Err(Error::Io(std::io::Error::new(e.kind(), e.to_string()))));
                     } else {
                         // Do nothing in this case: `read_task` already cleans up.
                     }
@@ -844,8 +1065,8 @@ async fn write_task(
             // are released as we iterate.
             for (entry, _) in data_batch.drain(..) {
                 if let BatchEntry::OneWay(ack_tx) = entry {
-                    let _ = ack_tx
-                        .send(Err(Error::Io(std::io::Error::new(e.kind(), e.to_string()))));
+                    let _ =
+                        ack_tx.send(Err(Error::Io(std::io::Error::new(e.kind(), e.to_string()))));
                 }
             }
             break 'outer;
@@ -860,8 +1081,8 @@ async fn write_task(
             // directly with the flush error.
             for (entry, _) in data_batch.drain(..) {
                 if let BatchEntry::OneWay(ack_tx) = entry {
-                    let _ = ack_tx
-                        .send(Err(Error::Io(std::io::Error::new(e.kind(), e.to_string()))));
+                    let _ =
+                        ack_tx.send(Err(Error::Io(std::io::Error::new(e.kind(), e.to_string()))));
                 }
             }
             break;
@@ -882,6 +1103,135 @@ async fn write_task(
     tracing::info!("write task exiting");
 }
 
+/// Drive the SASL/PLAIN re-auth round-trip from inside `write_task`.
+/// The KIP-368 ordering invariant — no non-SASL frame between
+/// `SaslHandshake` and `SaslAuthenticate` — is upheld by structure: the
+/// caller is `write_task`'s `select!` arm, and while this function is
+/// running that `select!` is parked, so `request_rx` is not pulled.
+///
+/// Returns `Err` if the wire is in an indeterminate state (write/flush
+/// failure or read_task already gone); the caller should tear down. On
+/// any path the caller's `op.resp_tx` is signaled exactly once so
+/// `request_reauth` does not hang.
+async fn handle_sasl_exchange(
+    writer: &mut tokio::io::BufWriter<tokio::io::WriteHalf<crate::connection::Stream>>,
+    in_flight: &InFlight,
+    in_flight_drained: &Notify,
+    op: ReauthOp,
+) -> std::io::Result<()> {
+    let ReauthOp {
+        handshake_frame,
+        handshake_corr,
+        authenticate_frame,
+        authenticate_corr,
+        resp_tx,
+    } = op;
+
+    // KIP-368: wait until previously-written requests have been acked.
+    // The ordering invariant is preserved either way (we still serialize
+    // through the wire), but observing this matches the spec literally
+    // and keeps the implementation tighter.
+    drain_in_flight_wait(in_flight, in_flight_drained).await;
+
+    // ---- SaslHandshake ----
+    let (handshake_resp_tx, handshake_resp_rx) = oneshot::channel();
+    in_flight
+        .lock()
+        .unwrap()
+        .push_back((handshake_corr, handshake_resp_tx));
+
+    if let Err(e) = writer.write_all(&handshake_frame).await {
+        let _ = resp_tx.send(Err(Error::Io(std::io::Error::new(e.kind(), e.to_string()))));
+        return Err(e);
+    }
+    if let Err(e) = writer.flush().await {
+        let _ = resp_tx.send(Err(Error::Io(std::io::Error::new(e.kind(), e.to_string()))));
+        return Err(e);
+    }
+
+    let handshake_resp_buf = match handshake_resp_rx.await {
+        Ok(Ok(buf)) => buf,
+        Ok(Err(e)) => {
+            let kind = match &e {
+                Error::Io(io) => io.kind(),
+                _ => std::io::ErrorKind::Other,
+            };
+            let msg = e.to_string();
+            let _ = resp_tx.send(Err(e));
+            return Err(std::io::Error::new(kind, msg));
+        }
+        Err(_) => {
+            let io = std::io::Error::new(
+                std::io::ErrorKind::ConnectionAborted,
+                "read task dropped handshake response",
+            );
+            let _ = resp_tx.send(Err(Error::Io(std::io::Error::new(
+                io.kind(),
+                io.to_string(),
+            ))));
+            return Err(io);
+        }
+    };
+
+    // ---- SaslAuthenticate ----
+    let (auth_resp_tx, auth_resp_rx) = oneshot::channel();
+    in_flight
+        .lock()
+        .unwrap()
+        .push_back((authenticate_corr, auth_resp_tx));
+
+    if let Err(e) = writer.write_all(&authenticate_frame).await {
+        let _ = resp_tx.send(Err(Error::Io(std::io::Error::new(e.kind(), e.to_string()))));
+        return Err(e);
+    }
+    if let Err(e) = writer.flush().await {
+        let _ = resp_tx.send(Err(Error::Io(std::io::Error::new(e.kind(), e.to_string()))));
+        return Err(e);
+    }
+
+    let auth_resp_buf = match auth_resp_rx.await {
+        Ok(Ok(buf)) => buf,
+        Ok(Err(e)) => {
+            let kind = match &e {
+                Error::Io(io) => io.kind(),
+                _ => std::io::ErrorKind::Other,
+            };
+            let msg = e.to_string();
+            let _ = resp_tx.send(Err(e));
+            return Err(std::io::Error::new(kind, msg));
+        }
+        Err(_) => {
+            let io = std::io::Error::new(
+                std::io::ErrorKind::ConnectionAborted,
+                "read task dropped authenticate response",
+            );
+            let _ = resp_tx.send(Err(Error::Io(std::io::Error::new(
+                io.kind(),
+                io.to_string(),
+            ))));
+            return Err(io);
+        }
+    };
+
+    let _ = resp_tx.send(Ok((handshake_resp_buf, auth_resp_buf)));
+    Ok(())
+}
+
+/// Park until `in_flight` reports empty. The `Notified::enable()` pattern
+/// registers the wake-up *before* the empty check, so a `notify_waiters()`
+/// firing in the gap between check and await is still delivered.
+async fn drain_in_flight_wait(in_flight: &InFlight, in_flight_drained: &Notify) {
+    loop {
+        let notified = in_flight_drained.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        if in_flight.lock().unwrap().is_empty() {
+            return;
+        }
+        notified.await;
+    }
+}
+
 /// Read task: reads framed responses from the broker and dispatches them directly to the
 /// waiting caller via the shared `in_flight` map. Drains any remaining in-flight requests
 /// on exit.
@@ -897,6 +1247,7 @@ async fn read_task(
     pool: BufferPool,
     connections_max_idle: Option<Duration>,
     reauth_pending: Arc<AtomicBool>,
+    in_flight_drained: Arc<Notify>,
 ) {
     let mut size_buf = [0u8; 4];
     // Persistent offset into `size_buf` across loop iterations. The read arm
@@ -1042,9 +1393,9 @@ async fn read_task(
             "received response from broker"
         );
 
-        let tx = {
+        let (tx, drained) = {
             let mut q = in_flight.lock().unwrap();
-            match q.front() {
+            let tx = match q.front() {
                 Some((id, _)) if *id == correlation_id => q.pop_front().map(|(_, tx)| tx),
                 Some((id, _)) => {
                     tracing::error!(
@@ -1066,8 +1417,16 @@ async fn read_task(
                     debug_assert!(false, "Unexpected response. No request is performed");
                     None
                 }
-            }
+            };
+            (tx, q.is_empty())
         };
+        // Wake any waiter parked in `drain_in_flight_wait`. The
+        // `Notified::enable()` pattern there registers the future before
+        // its empty check, so a notify between check and await is still
+        // delivered — see `drain_in_flight_wait`.
+        if drained {
+            in_flight_drained.notify_waiters();
+        }
 
         if let Some(tx) = tx {
             let _ = tx.send(Ok(response_buf));

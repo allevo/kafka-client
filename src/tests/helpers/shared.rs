@@ -101,6 +101,29 @@ pub async fn sasl_reauth_broker() -> &'static SharedBroker {
         .await
 }
 
+/// One-off SASL reauth broker, owned by the caller. Use this for the
+/// long-running `test_connection_survives_reauth` so heavy parallel test
+/// load on the shared `SASL_REAUTH` broker can't starve it (Docker
+/// resource exhaustion under full-suite runs caused that broker to stop
+/// responding mid-flight, killing connections that depend on KIP-368
+/// re-auth round-trips landing on time).
+pub async fn dedicated_sasl_reauth_broker(reauth_ms: u32) -> SharedBroker {
+    let kafka = containers::standalone_sasl_reauth_broker(reauth_ms)
+        .start()
+        .await
+        .unwrap();
+    let host = kafka.get_host().await.unwrap().to_string();
+    let port = kafka
+        .get_host_port_ipv4(containers::SASL_PLAINTEXT_PORT)
+        .await
+        .unwrap();
+    SharedBroker {
+        host,
+        port,
+        _container: Box::new(kafka),
+    }
+}
+
 pub async fn plaintext_cluster() -> &'static SharedCluster {
     CLUSTER
         .get_or_init(|| async {

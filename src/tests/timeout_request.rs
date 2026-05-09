@@ -38,7 +38,14 @@ async fn client_with_synthetic_full(
         .with_api_timeout(api_timeout)
         .with_retries(retries)
         .with_retry_backoff(Duration::from_millis(10))
-        .with_retry_backoff_max(Duration::from_millis(50))];
+        .with_retry_backoff_max(Duration::from_millis(50))
+        // Default reconnect_backoff is 100 ms, which `Client::broker`
+        // burns when respawning a dialer for a shut-down slot
+        // (`initial_times=1`). With request_timeout in the few-hundred-ms
+        // range that sleep alone can dominate the redial budget and turn
+        // `request_timeout_wire_phase_stall` flaky on a loaded host.
+        .with_reconnect_backoff(Duration::from_millis(10))
+        .with_reconnect_backoff_max(Duration::from_millis(50))];
     let client = crate::Client::connect(&bootstrap, crate::Security::Plaintext, crate::Auth::None)
         .await
         .unwrap();
@@ -69,16 +76,27 @@ fn metadata_request() -> MetadataRequest {
 /// Wire-phase stall: the proxy lets the Metadata *request* through but
 /// delays the *response* past the budget. The first `send` must return
 /// `RequestTimeout` roughly within the budget, the underlying broker
-/// slot must end up torn down, and a subsequent `send` must redial and
-/// succeed (exercises the `Client::broker` self-heal fast path).
+/// slot must end up torn down, and a subsequent `Client::broker(id)`
+/// call must respawn the dialer and hand back a fresh `BrokerClient`
+/// (exercises the `Client::broker` self-heal path).
+///
+/// The self-heal half is asserted by *identity*, not by re-issuing a
+/// `Client::send`: `send_once` clamps the acquisition phase at
+/// `request_timeout` (the same small budget that drives the wire-phase
+/// timeout under test), so coupling the redial to it makes the test
+/// flaky on loaded hosts whenever TCP connect + ApiVersions handshake
+/// runs longer than the 400 ms budget. `Client::broker` itself has no
+/// internal time budget — it parks on the dialer's oneshot — so driving
+/// it directly tests exactly the same self-heal logic without that
+/// coupling.
 #[tokio::test]
 #[tracing_test::traced_test]
 async fn request_timeout_wire_phase_stall() {
     let upstream = helpers::plaintext_broker().await;
 
     // Count Metadata responses. Delay the first one past the budget;
-    // forward every subsequent response untouched so the second `send`
-    // can succeed.
+    // forward every subsequent response untouched so the healed broker
+    // can serve traffic.
     let delayed = Arc::new(AtomicUsize::new(0));
     let delayed_hook = delayed.clone();
     let plan = FaultPlan {
@@ -105,11 +123,16 @@ async fn request_timeout_wire_phase_stall() {
     let client = client_with_synthetic(&proxy.host, proxy.port, request_timeout).await;
 
     // First, pre-dial the synthetic broker so the handshake (ApiVersions
-    // + initial Metadata inside BrokerClient::new) completes cleanly.
-    let _ = client
+    // + auth inside BrokerClient::new) completes cleanly. Capture the
+    // pre-dial instance id — the self-heal assertion below compares
+    // against it to prove a *new* BrokerClient was constructed (i.e.
+    // the dialer actually re-ran), not just that the call returned.
+    let pre_dial = client
         .broker(SYNTH_ID)
         .await
         .expect("pre-dial synthetic broker");
+    let pre_dial_id = pre_dial.id();
+    drop(pre_dial);
 
     // Arm the fault: the *next* Metadata response on this connection
     // gets delayed past the budget.
@@ -137,23 +160,34 @@ async fn request_timeout_wire_phase_stall() {
         "wire-phase timeout fired at unexpected time: {elapsed:?}"
     );
 
-    // Subsequent send self-heals: the stale `Slot::Resolved` is shut
-    // down, so `Client::broker` respawns a dialer and the new
-    // connection (proxy plan no longer delays) completes normally.
-    // Budget the second call generously.
-    tokio::time::timeout(
-        Duration::from_secs(5),
-        client.send::<_, kafka_protocol::messages::MetadataResponse>(
-            crate::NodeTarget::Broker(SYNTH_ID),
-            ApiKey::Metadata,
-            1,
-            metadata_request(),
-            &crate::CallOptions::default(),
-        ),
-    )
-    .await
-    .expect("second send must not hang")
-    .expect("second send must succeed after self-heal");
+    // Self-heal: the wire-phase timeout called `shutdown()` on the
+    // broker, so the cached `Slot::Resolved` now reports `is_shutdown()`
+    // synchronously. The next `client.broker(SYNTH_ID)` must observe
+    // that, evict the slot, respawn the dialer, and hand back a fresh
+    // `BrokerClient`. The outer `tokio::time::timeout` is a generous
+    // safety net for catching a hang — `client.broker` has no internal
+    // budget, so a real self-heal completes in tens of ms.
+    let healed = tokio::time::timeout(Duration::from_secs(5), client.broker(SYNTH_ID))
+        .await
+        .expect("self-heal must not hang")
+        .expect("self-heal must redial");
+    assert_ne!(
+        healed.id(),
+        pre_dial_id,
+        "self-heal returned the original (shut-down) BrokerClient instead of redialing"
+    );
+    assert!(
+        !healed.is_shutdown(),
+        "self-heal returned a still-shut-down BrokerClient"
+    );
+
+    // Sanity-check the healed connection serves real traffic. The proxy
+    // plan no longer delays (counter is 0), so the round-trip completes
+    // without time pressure from `request_timeout`.
+    healed
+        .fetch_metadata()
+        .await
+        .expect("healed broker must serve requests");
 }
 
 /// Acquisition-phase stall: the synthetic broker's address points at a

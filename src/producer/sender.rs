@@ -104,10 +104,7 @@ async fn dispatch(
     for batch in ready {
         let Some(meta) = client.topic_metadata(&batch.topic) else {
             notify_waiters_the_failure(batch.frozen.waiters, || {
-                Error::NoBrokerAvailable(format!(
-                    "topic '{}' metadata gone",
-                    batch.topic.as_str()
-                ))
+                Error::NoBrokerAvailable(format!("topic '{}' metadata gone", batch.topic.as_str()))
             });
             continue;
         };
@@ -129,12 +126,7 @@ async fn dispatch(
     }
 }
 
-async fn send_to_leader(
-    client: &Client,
-    leader: BrokerId,
-    acks: Acks,
-    batches: Vec<ReadyBatch>,
-) {
+async fn send_to_leader(client: &Client, leader: BrokerId, acks: Acks, batches: Vec<ReadyBatch>) {
     // Split each batch up front: the encoded half is moved into the
     // outgoing `ProduceRequest` (no `Bytes::clone`), the pending half
     // stays here to settle waiters once the response lands.
@@ -203,7 +195,7 @@ async fn send_to_leader(
                     }
                 }
             }
-        },
+        }
         Acks::All | Acks::Leader => {
             // `with_retries(0)`: a partial-success ProduceResponse (some
             // partitions OK, some not) must not be retransmitted blindly by
@@ -238,8 +230,10 @@ async fn send_to_leader(
 /// protocol error — the broker is expected to echo back every
 /// partition we sent.
 fn settle_response(resp: ProduceResponse, pending: Vec<PendingBatch>) {
-    let mut response_index: HashMap<(TopicName, i32), &kafka_protocol::messages::produce_response::PartitionProduceResponse> =
-        HashMap::new();
+    let mut response_index: HashMap<
+        (TopicName, i32),
+        &kafka_protocol::messages::produce_response::PartitionProduceResponse,
+    > = HashMap::new();
     for tr in &resp.responses {
         for pr in &tr.partition_responses {
             response_index.insert((tr.name.clone(), pr.index), pr);
@@ -281,8 +275,8 @@ fn settle_response(resp: ProduceResponse, pending: Vec<PendingBatch>) {
             // Unknown codes preserve the original i16 instead of
             // collapsing to UnknownServerError, so the waiter sees the
             // exact code the broker returned.
-            let response_error =
-                ResponseError::try_from_code(pr.error_code).unwrap_or(ResponseError::Unknown(pr.error_code));
+            let response_error = ResponseError::try_from_code(pr.error_code)
+                .unwrap_or(ResponseError::Unknown(pr.error_code));
             notify_waiters_the_failure(batch.waiters, || Error::Broker {
                 error: response_error,
             });

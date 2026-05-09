@@ -8,8 +8,8 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::client::PartitionId;
 use crate::error::Result;
-use crate::producer::RecordMetadata;
 use crate::producer::ProducerConfig;
+use crate::producer::RecordMetadata;
 use crate::producer::batch::{
     AppendOutcome, BatchProducerState, FrozenBatch, PartitionBatch, RecordPayload,
 };

@@ -42,10 +42,18 @@ async fn test_session_lifetime_ms_parsed() {
 /// Verify that the connection survives past the session lifetime by periodically sending
 /// metadata requests over a period longer than `connections.max.reauth.ms` (5 s).
 /// Without re-auth the broker would kill the connection.
+///
+/// Uses a dedicated broker — not the shared `sasl_reauth_broker` — because
+/// this test runs for 12 s and is sensitive to the broker dropping a
+/// single response on the floor. Under heavy parallel test load the
+/// shared broker becomes intermittently unresponsive (Docker resource
+/// exhaustion from concurrent cluster/TLS test starts), and a single
+/// missed response is enough to fail the test mid-loop. Owning our own
+/// container insulates this test from that contention.
 #[tokio::test]
 #[tracing_test::traced_test]
 async fn test_connection_survives_reauth() {
-    let broker = helpers::sasl_reauth_broker().await;
+    let broker = helpers::dedicated_sasl_reauth_broker(5000).await;
 
     let config = crate::Config::new(&broker.host, broker.port);
     let auth = crate::Auth::Plain {
@@ -82,9 +90,13 @@ async fn test_connection_survives_reauth() {
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
 
+    // The point is that several round trips spanned reauth boundaries,
+    // not a wall-clock throughput rate — under heavy Docker load each
+    // iteration can creep past 1 s, so the threshold is set to "clearly
+    // more than just the initial fetch" rather than "≈ 1 per second".
     assert!(
-        successes >= 10,
-        "expected at least 10 successes, got {successes}"
+        successes >= 6,
+        "expected at least 6 successes, got {successes}"
     );
 
     // Verify the background reauth task actually fired and succeeded.

@@ -3,7 +3,9 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use kafka_protocol::messages::fetch_request::{FetchPartition, FetchTopic};
-use kafka_protocol::messages::{ApiKey, BrokerId, FetchRequest, FetchResponse, MetadataResponse, TopicName};
+use kafka_protocol::messages::{
+    ApiKey, BrokerId, FetchRequest, FetchResponse, MetadataResponse, TopicName,
+};
 use kafka_protocol::protocol::StrBytes;
 use kafka_protocol::records::RecordBatchDecoder;
 
@@ -26,6 +28,26 @@ async fn acks_none_round_trip() {
     let name = "producer-acks-none";
     create_topic(&client, name, 1).await;
     let topic = TopicName::from(StrBytes::from_static_str(name));
+
+    // `create_topic`'s `wait_for_topic_visible` only proves that the
+    // broker's `MetadataCache` has replayed the topic-creation record;
+    // the leader's `ReplicaManager` may still be initialising the
+    // partition's `UnifiedLog`. A `Produce(acks=0)` arriving in that
+    // window hits `getPartitionOrException` →
+    // `UnknownTopicOrPartitionException`, and because acks=0 admits no
+    // response, `KafkaApis.handleProduceRequest` reacts to
+    // `errorInResponse` by silently closing the socket — the records
+    // are dropped and a downstream Fetch returns nothing. Refresh the
+    // client's metadata so `leader_for` resolves the partition leader,
+    // then drive `Fetch(max_wait_ms=0)` against that leader until it
+    // reports `error_code == 0`: same `getPartitionOrException` path
+    // Produce uses, so a green Fetch proves Produce will be accepted.
+    client
+        .refresh_topics(&[topic.clone()])
+        .await
+        .expect("topic metadata must refresh");
+    let leader = leader_for(&client, &topic).await;
+    wait_for_partition_ready(&client, leader, &topic).await;
 
     let producer = crate::Producer::new(
         client.clone(),
@@ -55,18 +77,15 @@ async fn acks_none_round_trip() {
         assert!(meta.timestamp.is_none());
     }
 
-    // The broker accepted the bytes asynchronously; poll Fetch until N
-    // records appear (or fail the test on timeout).
-    let leader = leader_for(&client, &topic).await;
-    let deadline = Instant::now() + Duration::from_secs(10);
-    let mut total = 0usize;
-    while Instant::now() < deadline {
-        total = fetch_record_count(&client, leader, &topic).await;
-        if total >= N {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
+    // Kafka's `SocketServer` mutes the per-connection channel for the
+    // duration of a request and only reads the next one after the
+    // current handler finishes (a `NoOpResponse` for acks=0). So by
+    // the time the broker reads this Fetch off the socket the
+    // preceding `Produce` has already appended every record to the
+    // log. Combined with the readiness probe above proving the
+    // partition is online, a single Fetch must see all N records — no
+    // wall-clock polling required.
+    let total = fetch_record_count(&client, leader, &topic).await;
     assert_eq!(total, N, "expected {N} records persisted, found {total}");
 
     // Connection-health probe: a follow-up Metadata request would fail
@@ -86,6 +105,77 @@ async fn acks_none_round_trip() {
     producer.close().await.unwrap();
 }
 
+/// Probe `(topic, partition 0)` on `leader` with `Fetch(max_wait_ms=0)`
+/// until the broker reports `error_code == 0`. Both Produce and Fetch
+/// flow through `ReplicaManager.getPartitionOrException`, so a clean
+/// Fetch is a stand-in for "the leader's `ReplicaManager` has the
+/// partition online" — the missing readiness signal that
+/// `wait_for_topic_visible` does not cover.
+async fn wait_for_partition_ready(client: &crate::Client, leader: BrokerId, topic: &TopicName) {
+    // Generous safety net for a wedged broker. The expected path
+    // converges in tens of ms; this only fires if the partition never
+    // becomes online, which would be a Kafka-side bug worth surfacing
+    // loudly rather than letting the test hang.
+    const TIMEOUT: Duration = Duration::from_secs(30);
+    let deadline = Instant::now() + TIMEOUT;
+    let mut backoff = Duration::from_millis(20);
+
+    loop {
+        let request = FetchRequest::default()
+            .with_replica_id(BrokerId(-1))
+            .with_max_wait_ms(0)
+            .with_min_bytes(0)
+            // 1 byte is enough: we only care about the per-partition
+            // error code, not the records.
+            .with_max_bytes(1)
+            .with_isolation_level(0)
+            .with_session_id(0)
+            .with_session_epoch(-1)
+            .with_topics(vec![
+                FetchTopic::default()
+                    .with_topic(topic.clone())
+                    .with_partitions(vec![
+                        FetchPartition::default()
+                            .with_partition(0)
+                            .with_current_leader_epoch(-1)
+                            .with_fetch_offset(0)
+                            .with_last_fetched_epoch(-1)
+                            .with_log_start_offset(-1)
+                            .with_partition_max_bytes(1),
+                    ]),
+            ]);
+
+        let resp: FetchResponse = client
+            .send(
+                crate::NodeTarget::Broker(leader),
+                ApiKey::Fetch,
+                12,
+                request,
+                &crate::CallOptions::default(),
+            )
+            .await
+            .expect("readiness probe Fetch must succeed");
+
+        let ready = resp.responses.iter().any(|tr| {
+            tr.partitions
+                .iter()
+                .any(|pr| pr.partition_index == 0 && pr.error_code == 0)
+        });
+        if ready {
+            return;
+        }
+
+        assert!(
+            Instant::now() < deadline,
+            "partition 0 of topic '{}' never became ready for I/O within {TIMEOUT:?}",
+            topic.as_str(),
+        );
+
+        tokio::time::sleep(backoff).await;
+        backoff = (backoff * 2).min(Duration::from_millis(200));
+    }
+}
+
 async fn leader_for(client: &crate::Client, topic: &TopicName) -> BrokerId {
     let meta = client
         .topic_metadata(topic)
@@ -97,11 +187,7 @@ async fn leader_for(client: &crate::Client, topic: &TopicName) -> BrokerId {
         .expect("partition 0 must exist")
 }
 
-async fn fetch_record_count(
-    client: &crate::Client,
-    leader: BrokerId,
-    topic: &TopicName,
-) -> usize {
+async fn fetch_record_count(client: &crate::Client, leader: BrokerId, topic: &TopicName) -> usize {
     let request = FetchRequest::default()
         .with_replica_id(BrokerId(-1))
         .with_max_wait_ms(0)
@@ -149,7 +235,10 @@ async fn fetch_record_count(
             while (cursor.position() as usize) < records.len() {
                 match RecordBatchDecoder::decode(&mut cursor) {
                     Ok(batch) => count += batch.records.len(),
-                    Err(_) => break,
+                    Err(e) => {
+                        tracing::error!(error = ?e, "record batch decode failed");
+                        break;
+                    }
                 }
             }
         }

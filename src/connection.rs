@@ -177,7 +177,7 @@ impl AsyncWrite for Stream {
 }
 
 /// Encode a Kafka request with its header and 4-byte size prefix.
-fn encode_request<R: Encodable + HeaderVersion>(
+pub(crate) fn encode_request<R: Encodable + HeaderVersion>(
     request: &R,
     api_key: i16,
     api_version: i16,
@@ -205,7 +205,7 @@ fn encode_request<R: Encodable + HeaderVersion>(
 }
 
 /// Read a framed response from the stream: 4-byte size prefix, then payload.
-async fn read_response(stream: &mut Stream, max_response_size: usize) -> Result<Bytes> {
+pub(crate) async fn read_response(stream: &mut Stream, max_response_size: usize) -> Result<Bytes> {
     let mut size_buf = [0u8; 4];
     stream.read_exact(&mut size_buf).await?;
     let response_size = i32::from_be_bytes(size_buf);
@@ -222,7 +222,7 @@ async fn read_response(stream: &mut Stream, max_response_size: usize) -> Result<
 }
 
 /// Decode a response header and verify correlation ID.
-fn decode_response_header(
+pub(crate) fn decode_response_header(
     buf: &mut Bytes,
     header_version: i16,
     expected_correlation_id: i32,
