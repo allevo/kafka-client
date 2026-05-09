@@ -145,9 +145,7 @@ impl AdminClient {
             let to_wait: Vec<TopicName> = response
                 .topics
                 .iter()
-                .filter(|t| {
-                    t.error_code == 0 || t.error_code == ERR_TOPIC_ALREADY_EXISTS
-                })
+                .filter(|t| t.error_code == 0 || t.error_code == ERR_TOPIC_ALREADY_EXISTS)
                 .map(|t| t.name.clone())
                 .collect();
             if !to_wait.is_empty() {
@@ -193,9 +191,7 @@ impl AdminClient {
             let to_wait: Vec<TopicName> = response
                 .responses
                 .iter()
-                .filter(|r| {
-                    r.error_code == 0 || r.error_code == ERR_UNKNOWN_TOPIC_OR_PARTITION
-                })
+                .filter(|r| r.error_code == 0 || r.error_code == ERR_UNKNOWN_TOPIC_OR_PARTITION)
                 .filter_map(|r| r.name.clone())
                 .collect();
             if !to_wait.is_empty() {
@@ -335,8 +331,12 @@ impl AdminClient {
         if topics.is_empty() {
             return Ok(());
         }
-        self.poll_topics_until(topics, PropagationDirection::Visible, Instant::now() + timeout)
-            .await
+        self.poll_topics_until(
+            topics,
+            PropagationDirection::Visible,
+            Instant::now() + timeout,
+        )
+        .await
     }
 
     /// Mirror of [`Self::wait_for_topics_visible`] for deletions: block
@@ -381,8 +381,7 @@ impl AdminClient {
         };
 
         let metadata = self.client.refresh_metadata().await?;
-        let broker_ids: Vec<BrokerId> =
-            metadata.brokers.iter().map(|b| b.node_id).collect();
+        let broker_ids: Vec<BrokerId> = metadata.brokers.iter().map(|b| b.node_id).collect();
         if broker_ids.is_empty() {
             return Err(Error::NoBrokerAvailable(
                 "no brokers known to client — cannot poll for topic propagation".into(),
@@ -403,8 +402,7 @@ impl AdminClient {
         loop {
             let mut still_failing: Option<TopicName> = None;
             'brokers: for &broker_id in &broker_ids {
-                let request = MetadataRequest::default()
-                    .with_topics(Some(request_topics.clone()));
+                let request = MetadataRequest::default().with_topics(Some(request_topics.clone()));
                 let resp: MetadataResponse = self
                     .client
                     .send(
@@ -423,11 +421,7 @@ impl AdminClient {
                     // "missing" as `UNKNOWN_TOPIC_OR_PARTITION` so the
                     // gone-check is symmetric with the visible-check.
                     let synthetic_missing;
-                    let topic = match resp
-                        .topics
-                        .iter()
-                        .find(|t| t.name.as_ref() == Some(wanted))
-                    {
+                    let topic = match resp.topics.iter().find(|t| t.name.as_ref() == Some(wanted)) {
                         Some(t) => t,
                         None => {
                             synthetic_missing = MetadataResponseTopic::default()
