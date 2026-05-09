@@ -1042,6 +1042,7 @@ dependencies = [
  "arc-swap",
  "bytes",
  "fastrand",
+ "futures-core",
  "kafka-protocol",
  "murmur2",
  "rustls",

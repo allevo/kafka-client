@@ -1,11 +1,13 @@
 use std::time::{Duration, Instant};
 
-use kafka_protocol::messages::TopicName;
 use kafka_protocol::messages::create_topics_request::CreatableTopic;
 use kafka_protocol::messages::metadata_request::MetadataRequestTopic;
+use kafka_protocol::messages::metadata_response::MetadataResponseTopic;
+use kafka_protocol::messages::{ApiKey, BrokerId, MetadataRequest, MetadataResponse, TopicName};
 use kafka_protocol::protocol::StrBytes;
 
 use crate::CallOptions;
+use crate::client::NodeTarget;
 
 /// Create a topic and wait until the broker's MetadataCache reports it.
 ///
@@ -92,72 +94,107 @@ pub async fn wait_for_topic_gone_by_name(client: &crate::Client, name: &'static 
 }
 
 async fn wait_for_topic_visible(client: &crate::Client, topic_name: &TopicName) {
-    const TIMEOUT: Duration = Duration::from_secs(30);
-    let deadline = Instant::now() + TIMEOUT;
-    let mut backoff = Duration::from_millis(20);
-
-    loop {
-        let resp = client
-            .admin()
-            .describe_topics(
-                vec![MetadataRequestTopic::default().with_name(Some(topic_name.clone()))],
-                CallOptions::default(),
-            )
-            .await
-            .unwrap();
-
-        // Any non-zero code (typically UNKNOWN_TOPIC_OR_PARTITION = 3)
-        // means the broker's MetadataCache hasn't replayed the creation
-        // record yet.
-        let visible = resp
-            .topics
-            .iter()
-            .any(|t| t.name.as_ref() == Some(topic_name) && t.error_code == 0);
-        if visible {
-            return;
-        }
-
-        assert!(
-            Instant::now() < deadline,
-            "topic '{}' never became visible in metadata within {TIMEOUT:?}",
-            topic_name.as_str()
-        );
-
-        tokio::time::sleep(backoff).await;
-        backoff = (backoff * 2).min(Duration::from_millis(200));
-    }
+    // In a multi-broker cluster `describe_topics(AnyBroker)` only confirms
+    // the replay reached *one* broker — but the producer's leader for a
+    // partition may be a sibling whose MetadataCache is still behind,
+    // and that broker would reject the produce with
+    // UNKNOWN_TOPIC_OR_PARTITION. Poll every known broker individually.
+    //
+    // Topic-level `error_code == 0` is necessary but not sufficient:
+    // KRaft replays the topic-creation record into MetadataCache and
+    // ReplicaManager separately, so a broker can advertise the topic
+    // before any partition has an elected leader (`leader_id == -1`,
+    // or per-partition `LEADER_NOT_AVAILABLE` / `NOT_LEADER_OR_FOLLOWER`).
+    // Sending a ProduceRequest in that window earns `NotLeaderOrFollower`,
+    // and the producer doesn't yet retry per-partition (slice-2 work).
+    // Wait until every partition is assigned to a real leader, on every
+    // broker, before returning.
+    poll_topic_state(client, topic_name, |topic| {
+        topic.error_code == 0
+            && !topic.partitions.is_empty()
+            && topic
+                .partitions
+                .iter()
+                .all(|p| p.error_code == 0 && *p.leader_id >= 0)
+    })
+    .await;
 }
 
 async fn wait_for_topic_gone(client: &crate::Client, topic_name: &TopicName) {
+    // Symmetric to `wait_for_topic_visible`: deletions also propagate
+    // per-broker, so the topic must be gone (or UNKNOWN_TOPIC_OR_PARTITION)
+    // on every broker before the replay is fully caught up.
+    poll_topic_state(client, topic_name, |topic| topic.error_code == 3).await;
+}
+
+/// Refresh metadata to learn every broker id, then poll each broker's
+/// `MetadataRequest` view of `topic_name` until `accept(topic)` is true
+/// on all of them. Panics on timeout.
+///
+/// A topic missing from the response is synthesised as a
+/// `MetadataResponseTopic` with `error_code = UNKNOWN_TOPIC_OR_PARTITION`
+/// (3) and no partitions, so callers can express the gone-check in the
+/// same form as the visible-check.
+async fn poll_topic_state(
+    client: &crate::Client,
+    topic_name: &TopicName,
+    accept: impl Fn(&MetadataResponseTopic) -> bool,
+) {
     const TIMEOUT: Duration = Duration::from_secs(30);
     let deadline = Instant::now() + TIMEOUT;
     let mut backoff = Duration::from_millis(20);
 
-    loop {
-        let resp = client
-            .admin()
-            .describe_topics(
-                vec![MetadataRequestTopic::default().with_name(Some(topic_name.clone()))],
-                CallOptions::default(),
-            )
-            .await
-            .unwrap();
+    let metadata = client.refresh_metadata().await.unwrap();
+    let broker_ids: Vec<BrokerId> = metadata.brokers.iter().map(|b| b.node_id).collect();
+    assert!(
+        !broker_ids.is_empty(),
+        "no brokers known to client — cannot wait for topic state"
+    );
 
-        // `describe_topics` always returns an entry for requested names.
-        // UNKNOWN_TOPIC_OR_PARTITION (3) is the signal that the replay
-        // has caught up with the deletion.
-        let gone = resp
-            .topics
-            .iter()
-            .find(|t| t.name.as_ref() == Some(topic_name))
-            .is_none_or(|t| t.error_code == 3);
-        if gone {
+    loop {
+        let mut all_ok = true;
+        for &broker_id in &broker_ids {
+            let request = MetadataRequest::default().with_topics(Some(vec![
+                MetadataRequestTopic::default().with_name(Some(topic_name.clone())),
+            ]));
+            let resp: MetadataResponse = client
+                .send(
+                    NodeTarget::Broker(broker_id),
+                    ApiKey::Metadata,
+                    9,
+                    request,
+                    &CallOptions::default(),
+                )
+                .await
+                .unwrap();
+            // `MetadataRequest` always echoes back an entry per requested
+            // topic; treat a missing entry as `UNKNOWN_TOPIC_OR_PARTITION`
+            // so the gone-check matches the deletion case symmetrically.
+            let synthetic_missing;
+            let topic = match resp
+                .topics
+                .iter()
+                .find(|t| t.name.as_ref() == Some(topic_name))
+            {
+                Some(t) => t,
+                None => {
+                    synthetic_missing =
+                        MetadataResponseTopic::default().with_error_code(3);
+                    &synthetic_missing
+                }
+            };
+            if !accept(topic) {
+                all_ok = false;
+                break;
+            }
+        }
+        if all_ok {
             return;
         }
 
         assert!(
             Instant::now() < deadline,
-            "topic '{}' never disappeared from metadata within {TIMEOUT:?}",
+            "topic '{}' never reached expected state on all brokers within {TIMEOUT:?}",
             topic_name.as_str()
         );
 

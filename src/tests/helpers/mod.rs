@@ -1,3 +1,4 @@
+pub mod consumer;
 pub mod containers;
 pub mod log_wait;
 pub mod proxy;
@@ -6,6 +7,7 @@ pub mod stall_listener;
 pub mod tls;
 pub mod topic;
 
+pub use consumer::{collect_n, topic_partition};
 pub use containers::*;
 pub use log_wait::wait_for_log;
 pub use shared::*;

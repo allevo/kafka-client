@@ -2,6 +2,7 @@ mod admin;
 mod close;
 mod close_dial_race;
 mod cluster;
+mod consumer;
 mod fatal_dial;
 mod helpers;
 mod producer;
