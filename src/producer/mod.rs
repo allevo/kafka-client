@@ -1,6 +1,6 @@
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -268,10 +268,11 @@ pub struct Producer {
     /// Cached from `ProducerConfig::max_block` so `send` doesn't pay the
     /// `Arc<ProducerConfig>` deref on every call.
     max_block: Duration,
-    // `Mutex<Option<_>>` so `close(self)` can take the sender / handle
-    // exactly once and `Drop` can no-op when close already ran.
-    shutdown_tx: Mutex<Option<oneshot::Sender<()>>>,
-    sender_handle: Mutex<Option<JoinHandle<()>>>,
+    // `Option<_>` so `close(self)` can take the sender / handle exactly
+    // once and `Drop` can no-op when close already ran. No mutex needed:
+    // `close(self)` has owned access and `Drop` has `&mut self`.
+    shutdown_tx: Option<oneshot::Sender<()>>,
+    sender_handle: Option<JoinHandle<()>>,
 }
 
 impl Producer {
@@ -298,8 +299,8 @@ impl Producer {
             accumulator,
             sticky,
             max_block,
-            shutdown_tx: Mutex::new(Some(shutdown_tx)),
-            sender_handle: Mutex::new(Some(handle)),
+            shutdown_tx: Some(shutdown_tx),
+            sender_handle: Some(handle),
         }
     }
 
@@ -435,12 +436,11 @@ impl Producer {
 
     /// Signal the sender task to drain the accumulator one last time
     /// and exit, then await its completion.
-    pub async fn close(self) -> Result<()> {
-        if let Some(tx) = self.shutdown_tx.lock().unwrap().take() {
+    pub async fn close(mut self) -> Result<()> {
+        if let Some(tx) = self.shutdown_tx.take() {
             let _ = tx.send(());
         }
-        let handle = self.sender_handle.lock().unwrap().take();
-        if let Some(handle) = handle {
+        if let Some(handle) = self.sender_handle.take() {
             // JoinError only fires on panic / cancellation; either way
             // we've already signalled the task, so swallow it.
             let _ = handle.await;
@@ -456,7 +456,7 @@ impl Drop for Producer {
         // SendFutures whose waiters still live in the accumulator
         // resolve to `Error::Protocol("producer closed")` once the
         // sender exits and drops the FrozenBatch waiters.
-        if let Some(tx) = self.shutdown_tx.lock().unwrap().take() {
+        if let Some(tx) = self.shutdown_tx.take() {
             tracing::warn!("producer dropped without close()");
             let _ = tx.send(());
             // sender_handle deliberately leaked: Drop can't await it.

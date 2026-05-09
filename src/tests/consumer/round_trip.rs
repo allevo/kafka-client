@@ -50,11 +50,11 @@ async fn round_trip_single_partition() {
         fut.await.expect("ack");
     }
 
-    let consumer = crate::Consumer::new(client.clone(), crate::ConsumerConfig::default());
+    let mut consumer = crate::Consumer::new(client.clone(), crate::ConsumerConfig::default());
     let tp = topic_partition(name, 0);
     consumer.assign(vec![tp]).await.expect("assign");
 
-    let records = collect_n(&consumer, N, Duration::from_secs(30)).await;
+    let records = collect_n(&mut consumer, N, Duration::from_secs(30)).await;
 
     for (i, rec) in records.iter().enumerate() {
         assert_eq!(rec.topic, topic);

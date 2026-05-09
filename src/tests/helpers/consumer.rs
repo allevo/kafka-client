@@ -21,7 +21,11 @@ pub fn topic_partition(name: &'static str, p: i32) -> TopicPartition {
 /// stuck fetcher fails fast with an assertion-friendly message instead of
 /// hanging the test. Returns the records on success; panics on timeout,
 /// stream end, or a fetcher-emitted error.
-pub async fn collect_n(consumer: &Consumer, n: usize, timeout: Duration) -> Vec<ConsumerRecord> {
+pub async fn collect_n(
+    consumer: &mut Consumer,
+    n: usize,
+    timeout: Duration,
+) -> Vec<ConsumerRecord> {
     let deadline = Instant::now() + timeout;
     let mut out = Vec::with_capacity(n);
     while out.len() < n {

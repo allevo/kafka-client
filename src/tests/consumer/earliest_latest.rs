@@ -52,14 +52,14 @@ async fn reset_earliest_reads_pre_existing() {
         fut.await.expect("ack");
     }
 
-    let consumer = crate::Consumer::new(
+    let mut consumer = crate::Consumer::new(
         client.clone(),
         ConsumerConfig::default().with_auto_offset_reset(OffsetReset::Earliest),
     );
     let tp = topic_partition(name, 0);
     consumer.assign(vec![tp]).await.expect("assign");
 
-    let records = collect_n(&consumer, N, Duration::from_secs(30)).await;
+    let records = collect_n(&mut consumer, N, Duration::from_secs(30)).await;
 
     for (i, rec) in records.iter().enumerate() {
         assert_eq!(rec.topic, topic);
@@ -108,7 +108,7 @@ async fn reset_latest_skips_pre_existing() {
         fut.await.expect("ack");
     }
 
-    let consumer = crate::Consumer::new(
+    let mut consumer = crate::Consumer::new(
         client.clone(),
         ConsumerConfig::default().with_auto_offset_reset(OffsetReset::Latest),
     );
@@ -132,7 +132,7 @@ async fn reset_latest_skips_pre_existing() {
         fut.await.expect("ack");
     }
 
-    let records = collect_n(&consumer, POST, Duration::from_secs(30)).await;
+    let records = collect_n(&mut consumer, POST, Duration::from_secs(30)).await;
 
     for (i, rec) in records.iter().enumerate() {
         assert_eq!(rec.topic, topic);

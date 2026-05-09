@@ -306,6 +306,10 @@ fn clone_error(e: &Error) -> Error {
         Error::Authentication(s) => Error::Authentication(s.clone()),
         Error::Broker { error } => Error::Broker { error: *error },
         Error::RequestTimeout(s) => Error::RequestTimeout(s.clone()),
+        Error::TopicPropagationTimeout { topic, direction } => Error::TopicPropagationTimeout {
+            topic: topic.clone(),
+            direction: *direction,
+        },
     }
 }
 

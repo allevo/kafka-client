@@ -10,6 +10,7 @@ use kafka_protocol::messages::metadata_request::MetadataRequestTopic;
 use kafka_protocol::protocol::StrBytes;
 
 use crate::CallOptions;
+use crate::admin::DeleteTopicsOptions;
 
 use super::helpers;
 use super::helpers::create_topic;
@@ -34,11 +35,17 @@ async fn test_admin_delete_topics() {
     let name = "admin-delete-topics";
     create_topic(&client, name, 1).await;
 
+    // Disable the built-in propagation wait so the test can assert on the
+    // raw `DeleteTopicsResponse` before waiting separately. Mirrors how a
+    // user would inspect per-topic error codes before deciding to wait.
     let response = client
         .admin()
         .delete_topics(
             vec![TopicName::from(StrBytes::from_static_str(name))],
-            Some(Duration::from_secs(5)),
+            DeleteTopicsOptions {
+                broker_operation_timeout: Some(Duration::from_secs(5)),
+                wait_for_propagation: false,
+            },
             CallOptions::default(),
         )
         .await
@@ -241,7 +248,10 @@ async fn test_admin_create_list_delete_list_create_list_flow() {
         .admin()
         .delete_topics(
             vec![TopicName::from(StrBytes::from_static_str(name))],
-            Some(Duration::from_secs(5)),
+            DeleteTopicsOptions {
+                broker_operation_timeout: Some(Duration::from_secs(5)),
+                wait_for_propagation: false,
+            },
             CallOptions::default(),
         )
         .await

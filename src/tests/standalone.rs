@@ -2,6 +2,8 @@ use kafka_protocol::messages::TopicName;
 use kafka_protocol::messages::create_topics_request::CreatableTopic;
 use kafka_protocol::protocol::StrBytes;
 
+use crate::admin::CreateTopicsOptions;
+
 use super::helpers;
 
 #[tokio::test]
@@ -88,11 +90,17 @@ async fn test_standalone_create_topic() {
         .with_num_partitions(3)
         .with_replication_factor(1);
 
+    // Disable the built-in propagation wait so the test can assert on the
+    // raw `CreateTopicsResponse` (specifically the per-topic error code)
+    // before deciding to wait separately.
     let response = client
         .admin()
         .create_topics(
             vec![topic],
-            Some(std::time::Duration::from_secs(5)),
+            CreateTopicsOptions {
+                broker_operation_timeout: Some(std::time::Duration::from_secs(5)),
+                wait_for_propagation: false,
+            },
             crate::CallOptions::default(),
         )
         .await

@@ -1,5 +1,5 @@
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -171,21 +171,20 @@ impl ConsumerConfig {
 pub struct Consumer {
     client: Client,
     config: Arc<ConsumerConfig>,
-    // `Mutex<Option<_>>` so the receiver can be moved out lazily on the
-    // first `recv` / `poll_next` and held across awaits without a second
-    // lock acquisition. Only the first taker observes `Some`; later
-    // callers see `None` and must reuse the moved-out receiver.
-    record_rx: Mutex<Option<mpsc::Receiver<Result<ConsumerRecord>>>>,
+    // `mpsc::Receiver::recv` / `poll_recv` already require `&mut`, and
+    // `recv` / `Stream::poll_next` are the only readers — exclusive
+    // access through `&mut Consumer` is enough. No mutex needed.
+    record_rx: mpsc::Receiver<Result<ConsumerRecord>>,
     // Unbounded so `seek` can stay synchronous: a Seek update is tiny,
     // and bounding it would force `seek` to be `async` just to handle
     // back-pressure from the fetcher. `assign` already awaits its own
     // ack channel for completion semantics.
     assign_tx: mpsc::UnboundedSender<AssignmentUpdate>,
-    // `Mutex<Option<_>>` so `close(self)` can take the sender / handle
-    // exactly once and `Drop` can no-op when close already ran. Mirrors
-    // the Producer pattern in `producer/mod.rs:273`.
-    shutdown_tx: Mutex<Option<oneshot::Sender<()>>>,
-    fetcher_handle: Mutex<Option<JoinHandle<()>>>,
+    // `Option<_>` so `close(self)` can take the sender / handle exactly
+    // once and `Drop` can no-op when close already ran. No mutex needed:
+    // `close(self)` has owned access and `Drop` has `&mut self`.
+    shutdown_tx: Option<oneshot::Sender<()>>,
+    fetcher_handle: Option<JoinHandle<()>>,
 }
 
 impl Consumer {
@@ -214,10 +213,10 @@ impl Consumer {
         Self {
             client,
             config,
-            record_rx: Mutex::new(Some(record_rx)),
+            record_rx,
             assign_tx,
-            shutdown_tx: Mutex::new(Some(shutdown_tx)),
-            fetcher_handle: Mutex::new(Some(handle)),
+            shutdown_tx: Some(shutdown_tx),
+            fetcher_handle: Some(handle),
         }
     }
 
@@ -295,30 +294,18 @@ impl Consumer {
     /// the fetcher has exited and its in-flight buffer has drained.
     ///
     /// Escape hatch for callers who don't want to depend on
-    /// [`futures_core::Stream`] / `StreamExt`. Callers are expected to
-    /// drive `recv` from a single task — concurrent calls are
-    /// serialized by the receiver's exclusive ownership and the second
-    /// caller observes `None` for the duration the first caller holds
-    /// the receiver.
-    pub async fn recv(&self) -> Option<Result<ConsumerRecord>> {
-        // `mpsc::Receiver::recv` needs `&mut`; a `std::sync::Mutex`
-        // can't be held across an await. Take the receiver out for
-        // the duration of one recv, then put it back so subsequent
-        // calls (and the Stream impl) keep working.
-        let mut rx = self.record_rx.lock().unwrap().take()?;
-        let result = rx.recv().await;
-        *self.record_rx.lock().unwrap() = Some(rx);
-        result
+    /// [`futures_core::Stream`] / `StreamExt`.
+    pub async fn recv(&mut self) -> Option<Result<ConsumerRecord>> {
+        self.record_rx.recv().await
     }
 
     /// Signal the fetcher task to exit and await its completion.
     /// Mirrors [`Producer::close`].
-    pub async fn close(self) -> Result<()> {
-        if let Some(tx) = self.shutdown_tx.lock().unwrap().take() {
+    pub async fn close(mut self) -> Result<()> {
+        if let Some(tx) = self.shutdown_tx.take() {
             let _ = tx.send(());
         }
-        let handle = self.fetcher_handle.lock().unwrap().take();
-        if let Some(handle) = handle {
+        if let Some(handle) = self.fetcher_handle.take() {
             // JoinError only fires on panic / cancellation; either way
             // we've already signalled the task, so swallow it.
             let _ = handle.await;
@@ -330,21 +317,12 @@ impl Consumer {
 impl futures_core::Stream for Consumer {
     type Item = Result<ConsumerRecord>;
 
-    // `poll_recv` is non-blocking, so we hold the std mutex only for
-    // the duration of one poll — never across an await. Yields
-    // `Ready(None)` when the inner channel is closed *and* drained
-    // (the contract of `Receiver::poll_recv`), which happens once the
-    // fetcher task exits and all `record_tx` clones are dropped.
-    //
-    // Sees `None` here only if a concurrent `recv()` call has the
-    // receiver checked out; per the `recv` doc, callers are expected
-    // not to mix the two on the same `Consumer`.
+    // Yields `Ready(None)` when the inner channel is closed *and*
+    // drained (the contract of `Receiver::poll_recv`), which happens
+    // once the fetcher task exits and all `record_tx` clones are
+    // dropped.
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let mut guard = self.record_rx.lock().unwrap();
-        match guard.as_mut() {
-            Some(rx) => rx.poll_recv(cx),
-            None => Poll::Ready(None),
-        }
+        self.get_mut().record_rx.poll_recv(cx)
     }
 }
 
@@ -355,7 +333,7 @@ impl Drop for Consumer {
         // record channel will be closed once the fetcher drops its
         // `record_tx`, so any pending `recv` / `poll_next` resolves
         // to `None` after the in-flight buffer drains.
-        if let Some(tx) = self.shutdown_tx.lock().unwrap().take() {
+        if let Some(tx) = self.shutdown_tx.take() {
             tracing::warn!("consumer dropped without close()");
             let _ = tx.send(());
             // fetcher_handle deliberately leaked: Drop can't await it.

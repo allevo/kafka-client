@@ -84,12 +84,12 @@ async fn round_trip_three_partitions() {
         fut.await.expect("ack");
     }
 
-    let consumer = crate::Consumer::new(client.clone(), crate::ConsumerConfig::default());
+    let mut consumer = crate::Consumer::new(client.clone(), crate::ConsumerConfig::default());
     let tps: Vec<_> = (0..PARTS).map(|p| topic_partition(name, p)).collect();
     consumer.assign(tps).await.expect("assign");
 
     let total = N_PER_PART * PARTS as usize;
-    let records = collect_n(&consumer, total, Duration::from_secs(60)).await;
+    let records = collect_n(&mut consumer, total, Duration::from_secs(60)).await;
 
     // Order across partitions is unspecified (the fetcher polls leaders in
     // parallel), so bucket per-partition before asserting. Within a single

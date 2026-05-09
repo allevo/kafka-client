@@ -16,7 +16,7 @@ pub use connection::Connection;
 pub use consumer::{
     Consumer, ConsumerConfig, ConsumerRecord, IsolationLevel, OffsetReset, TopicPartition,
 };
-pub use error::Error;
+pub use error::{Error, PropagationDirection};
 pub use producer::{Acks, Producer, ProducerConfig, ProducerRecord, RecordMetadata, SendFuture};
 pub use secret::SecretString;
 

@@ -1,4 +1,5 @@
 use kafka_protocol::ResponseError;
+use kafka_protocol::messages::TopicName;
 use std::fmt;
 use std::io;
 
@@ -20,6 +21,36 @@ pub enum Error {
     /// for generic I/O, while a request-budget expiry specifically implies
     /// "topology is suspect, re-resolve before retrying".
     RequestTimeout(String),
+    /// The controller acknowledged a `CreateTopics` / `DeleteTopics` RPC,
+    /// but the per-broker MetadataCache replay did not converge to the
+    /// expected state within the caller-supplied deadline. KRaft applies
+    /// topic records to each broker asynchronously: this error means the
+    /// cluster is still propagating, not that the operation failed —
+    /// the topic was (or will be) created/deleted on the controller.
+    /// Classified as `Retry` so callers can re-poll without re-issuing
+    /// the underlying mutation.
+    TopicPropagationTimeout {
+        topic: TopicName,
+        direction: PropagationDirection,
+    },
+}
+
+/// Direction of a metadata-propagation wait.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PropagationDirection {
+    /// Waiting for a freshly-created topic to surface on every broker.
+    Visible,
+    /// Waiting for a freshly-deleted topic to disappear from every broker.
+    Gone,
+}
+
+impl fmt::Display for PropagationDirection {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            PropagationDirection::Visible => f.write_str("visible"),
+            PropagationDirection::Gone => f.write_str("gone"),
+        }
+    }
 }
 
 /// How a failed request should be handled by a retry loop.
@@ -59,6 +90,11 @@ impl Error {
             Error::Authentication(_) => RetryAction::Fatal,
             Error::Broker { error } => classify_response_error(*error),
             Error::RequestTimeout(_) => RetryAction::RefreshMetadata,
+            // The controller mutation succeeded; we just lost the race
+            // with broker replay. Plain retry is the right action — a
+            // metadata refresh would not unblock anything that another
+            // poll round won't unblock on its own.
+            Error::TopicPropagationTimeout { .. } => RetryAction::Retry,
         }
     }
 
@@ -175,6 +211,11 @@ impl fmt::Display for Error {
             Error::Authentication(msg) => write!(f, "authentication error: {msg}"),
             Error::Broker { error } => write!(f, "broker error: {error}"),
             Error::RequestTimeout(msg) => write!(f, "request timeout: {msg}"),
+            Error::TopicPropagationTimeout { topic, direction } => write!(
+                f,
+                "topic '{}' did not become {direction} on every broker before the deadline",
+                topic.as_str()
+            ),
         }
     }
 }
@@ -351,6 +392,15 @@ mod tests {
     }
 
     #[test]
+    fn topic_propagation_timeout_is_retry() {
+        let e = Error::TopicPropagationTimeout {
+            topic: TopicName::from(kafka_protocol::protocol::StrBytes::from_static_str("t")),
+            direction: PropagationDirection::Visible,
+        };
+        assert_eq!(e.classify(), RetryAction::Retry);
+    }
+
+    #[test]
     fn is_retriable_and_is_fatal_are_disjoint() {
         let cases = [
             io(ErrorKind::ConnectionReset),
@@ -361,6 +411,10 @@ mod tests {
             Error::NoBrokerAvailable("x".into()),
             Error::Authentication("x".into()),
             Error::RequestTimeout("x".into()),
+            Error::TopicPropagationTimeout {
+                topic: TopicName::from(kafka_protocol::protocol::StrBytes::from_static_str("t")),
+                direction: PropagationDirection::Gone,
+            },
             broker(ResponseError::NotLeaderOrFollower),
             broker(ResponseError::RequestTimedOut),
             broker(ResponseError::TransactionAbortable),

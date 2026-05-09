@@ -49,13 +49,13 @@ async fn seek_replays_from_offset_zero() {
         fut.await.expect("ack");
     }
 
-    let consumer = crate::Consumer::new(client.clone(), crate::ConsumerConfig::default());
+    let mut consumer = crate::Consumer::new(client.clone(), crate::ConsumerConfig::default());
     let tp = topic_partition(name, 0);
     consumer.assign(vec![tp.clone()]).await.expect("assign");
 
     // Drain the first 5 records — natural sequence from the start of the log.
     const TAKE: usize = 5;
-    let initial = collect_n(&consumer, TAKE, Duration::from_secs(30)).await;
+    let initial = collect_n(&mut consumer, TAKE, Duration::from_secs(30)).await;
     for (i, rec) in initial.iter().enumerate() {
         assert_eq!(rec.topic, topic);
         assert_eq!(rec.partition, PartitionId(0));

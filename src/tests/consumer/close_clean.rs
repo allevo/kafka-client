@@ -55,7 +55,7 @@ async fn close_joins_fetcher_when_backpressured() {
     // consumer drains a slot. By the time we call `close()` the fetcher
     // is parked mid-emission; close must preempt that wait via the
     // biased `select!` in `fetcher_main`.
-    let consumer = crate::Consumer::new(
+    let mut consumer = crate::Consumer::new(
         client.clone(),
         crate::ConsumerConfig::default().with_channel_capacity(2),
     );
