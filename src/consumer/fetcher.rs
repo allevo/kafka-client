@@ -207,15 +207,8 @@ async fn handle_fetch_response(
             // OffsetOutOfRange, bump refresh_attempts on RefreshMetadata)
             // and surfaces fatal errors via `record_tx`.
             if part.error_code != 0 {
-                handle_partition_error(
-                    client,
-                    config,
-                    part.error_code,
-                    &tp,
-                    cursors,
-                    record_tx,
-                )
-                .await;
+                handle_partition_error(client, config, part.error_code, &tp, cursors, record_tx)
+                    .await;
                 continue;
             }
 
@@ -230,22 +223,19 @@ async fn handle_fetch_response(
                     continue;
                 };
 
-                let records = match decode::decode_partition_records(
-                    &topic,
-                    tp.partition,
-                    part.records,
-                ) {
-                    Ok(r) => r,
-                    Err(e) => {
-                        // Wire-level decode failure is unrecoverable for
-                        // this partition; surface once and drop the
-                        // partition so we don't spin re-decoding the
-                        // same bytes on the next round.
-                        let _ = record_tx.send(Err(e)).await;
-                        cursors.remove(&tp);
-                        continue;
-                    }
-                };
+                let records =
+                    match decode::decode_partition_records(&topic, tp.partition, part.records) {
+                        Ok(r) => r,
+                        Err(e) => {
+                            // Wire-level decode failure is unrecoverable for
+                            // this partition; surface once and drop the
+                            // partition so we don't spin re-decoding the
+                            // same bytes on the next round.
+                            let _ = record_tx.send(Err(e)).await;
+                            cursors.remove(&tp);
+                            continue;
+                        }
+                    };
 
                 // Mid-batch trim: the broker returns whole batches
                 // starting at-or-before the requested fetch offset, so
@@ -567,8 +557,8 @@ async fn handle_partition_error(
     // collapsing to `UnknownServerError`, so a downstream observer sees
     // exactly what the broker returned. Mirrors the producer pattern in
     // `producer/sender.rs:278`.
-    let response_error = ResponseError::try_from_code(error_code)
-        .unwrap_or(ResponseError::Unknown(error_code));
+    let response_error =
+        ResponseError::try_from_code(error_code).unwrap_or(ResponseError::Unknown(error_code));
 
     match response_error {
         ResponseError::OffsetOutOfRange => {

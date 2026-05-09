@@ -178,8 +178,7 @@ async fn poll_topic_state(
             {
                 Some(t) => t,
                 None => {
-                    synthetic_missing =
-                        MetadataResponseTopic::default().with_error_code(3);
+                    synthetic_missing = MetadataResponseTopic::default().with_error_code(3);
                     &synthetic_missing
                 }
             };

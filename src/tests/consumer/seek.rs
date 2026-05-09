@@ -59,7 +59,10 @@ async fn seek_replays_from_offset_zero() {
     for (i, rec) in initial.iter().enumerate() {
         assert_eq!(rec.topic, topic);
         assert_eq!(rec.partition, PartitionId(0));
-        assert_eq!(rec.offset, i as i64, "initial drain offsets must be dense 0..TAKE");
+        assert_eq!(
+            rec.offset, i as i64,
+            "initial drain offsets must be dense 0..TAKE"
+        );
     }
 
     // Reposition the cursor back to offset 0. `seek` is fire-and-forget;
@@ -78,12 +81,14 @@ async fn seek_replays_from_offset_zero() {
     let mut total_after_seek = 0usize;
     let deadline = Instant::now() + Duration::from_secs(30);
     while !zero_seen_after_seek || seen.len() < N {
-        let remaining = deadline.checked_duration_since(Instant::now()).unwrap_or_else(|| {
-            panic!(
-                "seek drain timed out: zero_seen={zero_seen_after_seek} \
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .unwrap_or_else(|| {
+                panic!(
+                    "seek drain timed out: zero_seen={zero_seen_after_seek} \
                  seen={seen:?} count={total_after_seek}"
-            )
-        });
+                )
+            });
         let rec = match tokio::time::timeout(remaining, consumer.recv()).await {
             Ok(Some(Ok(r))) => r,
             Ok(Some(Err(e))) => panic!("consumer yielded error after seek: {e:?}"),
