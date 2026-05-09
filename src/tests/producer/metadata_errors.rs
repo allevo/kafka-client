@@ -51,7 +51,8 @@ async fn cached_unknown_topic_refreshes_then_succeeds() {
     let producer = crate::Producer::new(
         client,
         crate::ProducerConfig::default().with_linger(Duration::from_millis(0)),
-    );
+    )
+    .expect("producer config");
     let fut = producer
         .send(
             crate::ProducerRecord::new(topic.clone(), Bytes::from_static(b"hello")),
@@ -99,7 +100,8 @@ async fn invalid_topic_name_fails_fast() {
         crate::ProducerConfig::default()
             .with_linger(Duration::from_millis(0))
             .with_max_block(max_block),
-    );
+    )
+    .expect("producer config");
 
     let started = std::time::Instant::now();
     let result = producer

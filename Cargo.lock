@@ -1041,6 +1041,7 @@ dependencies = [
  "anyhow",
  "arc-swap",
  "bytes",
+ "crc32c",
  "fastrand",
  "futures-core",
  "kafka-protocol",

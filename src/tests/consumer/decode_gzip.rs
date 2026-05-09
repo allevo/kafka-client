@@ -34,7 +34,8 @@ async fn gzip_round_trip() {
         crate::ProducerConfig::default()
             .with_compression(Compression::Gzip)
             .with_linger(Duration::from_millis(0)),
-    );
+    )
+    .expect("producer config");
 
     const N: usize = 8;
     let mut futures = Vec::with_capacity(N);

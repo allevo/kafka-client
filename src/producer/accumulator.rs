@@ -14,6 +14,7 @@ use crate::producer::batch::{
     AppendOutcome, BatchProducerState, FrozenBatch, PartitionBatch, RecordPayload,
 };
 
+
 /// A frozen batch ready to ship, paired with the routing key needed to build
 /// a `ProduceRequest`.
 pub(crate) struct ReadyBatch {
@@ -35,7 +36,11 @@ impl ReadyBatch {
             frozen,
         } = self;
         let FrozenBatch {
-            encoded, waiters, ..
+            encoded,
+            waiters,
+            record_count,
+            state,
+            ..
         } = frozen;
         let encoded_batch = EncodedBatch {
             topic: topic.clone(),
@@ -46,8 +51,47 @@ impl ReadyBatch {
             topic,
             partition,
             waiters,
+            record_count,
+            state,
         };
         (encoded_batch, pending)
+    }
+
+    /// Idempotent split that hands back a `Bytes`-clone of the encoded
+    /// payload alongside the pending half, so the sender can stash the
+    /// bytes in the in-flight queue and still ship them on the wire.
+    /// The shared `Bytes` ref stays the source-of-truth for both the
+    /// outgoing wire write and the in-flight queue's retransmit copy;
+    /// an epoch-bump rewrite (slice C1) operates on a `BytesMut` clone
+    /// of these bytes via the header-rewrite helper, so we don't need
+    /// to retain the decoded record payloads here.
+    pub(crate) fn split_keeping_encoded(self) -> (EncodedBatch, PendingBatch, Bytes) {
+        let ReadyBatch {
+            topic,
+            partition,
+            frozen,
+        } = self;
+        let FrozenBatch {
+            encoded,
+            waiters,
+            record_count,
+            state,
+            ..
+        } = frozen;
+        let kept = encoded.clone();
+        let encoded_batch = EncodedBatch {
+            topic: topic.clone(),
+            partition,
+            encoded,
+        };
+        let pending = PendingBatch {
+            topic,
+            partition,
+            waiters,
+            record_count,
+            state,
+        };
+        (encoded_batch, pending, kept)
     }
 }
 
@@ -66,6 +110,8 @@ pub(crate) struct PendingBatch {
     pub topic: TopicName,
     pub partition: PartitionId,
     pub waiters: Vec<oneshot::Sender<Result<RecordMetadata>>>,
+    pub record_count: usize,
+    pub state: BatchProducerState,
 }
 
 struct Inner {
@@ -133,7 +179,16 @@ impl Accumulator {
     /// Freeze and return every batch whose age has reached `config.linger` or
     /// which already crossed the size threshold. Drained entries are removed,
     /// so a subsequent `append` to the same key starts a fresh batch.
-    pub(crate) fn drain_ready(&self, now: Instant) -> Result<Vec<ReadyBatch>> {
+    ///
+    /// `state_for` supplies the `BatchProducerState` per `(topic,
+    /// partition, record_count)` so the sender can stamp idempotent
+    /// `(producer_id, producer_epoch, base_sequence)` fields without
+    /// re-traversing the per-partition state.
+    pub(crate) fn drain_ready(
+        &self,
+        now: Instant,
+        state_for: impl FnMut(&TopicName, PartitionId, usize) -> BatchProducerState,
+    ) -> Result<Vec<ReadyBatch>> {
         let drained = {
             let mut guard = self.inner.lock().unwrap();
             let linger = self.config.linger;
@@ -150,18 +205,21 @@ impl Accumulator {
                 })
                 .collect::<Vec<_>>()
         };
-        self.freeze_all(drained)
+        self.freeze_all(drained, state_for)
     }
 
     /// Freeze and return every open batch unconditionally. Used by `flush`
     /// and `close` once the user has signalled they want everything shipped
     /// regardless of linger.
-    pub(crate) fn drain_all(&self) -> Result<Vec<ReadyBatch>> {
+    pub(crate) fn drain_all(
+        &self,
+        state_for: impl FnMut(&TopicName, PartitionId, usize) -> BatchProducerState,
+    ) -> Result<Vec<ReadyBatch>> {
         let drained: Vec<((TopicName, PartitionId), PartitionBatch)> = {
             let mut guard = self.inner.lock().unwrap();
             guard.batches.drain().collect()
         };
-        self.freeze_all(drained)
+        self.freeze_all(drained, state_for)
     }
 
     /// True iff there are zero open batches. The sender uses this on flush
@@ -173,17 +231,13 @@ impl Accumulator {
     fn freeze_all(
         &self,
         drained: Vec<((TopicName, PartitionId), PartitionBatch)>,
+        mut state_for: impl FnMut(&TopicName, PartitionId, usize) -> BatchProducerState,
     ) -> Result<Vec<ReadyBatch>> {
         let mut out = Vec::with_capacity(drained.len());
         for ((topic, partition), batch) in drained {
-            // v1: non-idempotent, non-transactional. Idempotence and
-            // transactions get their own producer state when those slices
-            // land; encoding stays the same modulo the producer-id /
-            // sequence fields stamped here.
-            let frozen = batch.freeze(
-                BatchProducerState::non_idempotent(),
-                self.config.compression,
-            )?;
+            let record_count = batch.len();
+            let state = state_for(&topic, partition, record_count);
+            let frozen = batch.freeze(state, self.config.compression)?;
             out.push(ReadyBatch {
                 topic,
                 partition,
@@ -232,12 +286,18 @@ mod tests {
         Arc::new(ProducerConfig::default())
     }
 
+    /// Default `state_for` closure for tests: always non-idempotent.
+    fn nonid()
+    -> impl FnMut(&TopicName, PartitionId, usize) -> BatchProducerState {
+        |_, _, _| BatchProducerState::non_idempotent()
+    }
+
     #[test]
     fn append_creates_batch_on_first_record() {
         let (acc, _rx) = Accumulator::new(default_cfg());
         let _ = acc.append(topic("t"), PartitionId(0), payload(b"a"));
         let _ = acc.append(topic("t"), PartitionId(0), payload(b"b"));
-        let drained = acc.drain_all().expect("drain");
+        let drained = acc.drain_all(nonid()).expect("drain");
         assert_eq!(drained.len(), 1, "second append must reuse the first batch");
         assert_eq!(drained[0].frozen.record_count, 2);
     }
@@ -264,7 +324,7 @@ mod tests {
         let (acc, _rx) = Accumulator::new(default_cfg());
         let _ = acc.append(topic("t"), PartitionId(0), payload(b"a"));
         let _ = acc.append(topic("t"), PartitionId(1), payload(b"b"));
-        let drained = acc.drain_all().expect("drain");
+        let drained = acc.drain_all(nonid()).expect("drain");
         assert_eq!(drained.len(), 2);
         let mut parts: Vec<PartitionId> = drained.iter().map(|r| r.partition).collect();
         parts.sort();
@@ -281,10 +341,10 @@ mod tests {
         let t0 = Instant::now();
         let _ = acc.append(topic("t"), PartitionId(0), payload(b"a"));
         // age < linger: nothing ready.
-        assert!(acc.drain_ready(t0).expect("drain").is_empty());
+        assert!(acc.drain_ready(t0, nonid()).expect("drain").is_empty());
         // age >> linger: returns the batch.
         let drained = acc
-            .drain_ready(t0 + Duration::from_millis(200))
+            .drain_ready(t0 + Duration::from_millis(200), nonid())
             .expect("drain");
         assert_eq!(drained.len(), 1);
     }
@@ -300,7 +360,7 @@ mod tests {
         let _ = acc.append(topic("t"), PartitionId(0), big_payload(64));
         // `now` is the wall clock — far short of the 10s linger — so the
         // only reason this drains is the `is_full` short-circuit.
-        let drained = acc.drain_ready(Instant::now()).expect("drain");
+        let drained = acc.drain_ready(Instant::now(), nonid()).expect("drain");
         assert_eq!(
             drained.len(),
             1,
@@ -314,7 +374,7 @@ mod tests {
         let (acc, _rx) = Accumulator::new(cfg);
         let _ = acc.append(topic("t"), PartitionId(0), payload(b"a"));
         let drained = acc
-            .drain_ready(Instant::now() + Duration::from_secs(1))
+            .drain_ready(Instant::now() + Duration::from_secs(1), nonid())
             .expect("drain");
         assert_eq!(drained.len(), 1);
         assert!(acc.is_empty());
@@ -322,7 +382,7 @@ mod tests {
         // A subsequent append against the same key must allocate a fresh
         // batch — record_count starts at 1, not 2.
         let _ = acc.append(topic("t"), PartitionId(0), payload(b"b"));
-        let again = acc.drain_all().expect("drain");
+        let again = acc.drain_all(nonid()).expect("drain");
         assert_eq!(again.len(), 1);
         assert_eq!(again[0].frozen.record_count, 1);
     }
@@ -337,7 +397,7 @@ mod tests {
         let _ = acc.append(topic("u"), PartitionId(0), payload(b"x"));
         let _ = acc.append(topic("u"), PartitionId(0), payload(b"y"));
 
-        let drained = acc.drain_all().expect("drain");
+        let drained = acc.drain_all(nonid()).expect("drain");
         assert_eq!(drained.len(), 3, "one entry per (topic, partition) key");
         assert!(acc.is_empty());
     }
@@ -348,7 +408,7 @@ mod tests {
         let out_a = acc.append(topic("t"), PartitionId(0), payload(b"a"));
         let out_b = acc.append(topic("t"), PartitionId(0), payload(b"b"));
 
-        let mut drained = acc.drain_all().expect("drain");
+        let mut drained = acc.drain_all(nonid()).expect("drain");
         assert_eq!(drained.len(), 1);
         let ready = drained.pop().unwrap();
         assert_eq!(ready.frozen.waiters.len(), 2);
@@ -387,7 +447,7 @@ mod tests {
             let _ = acc.append(topic("t"), PartitionId(0), p);
         }
 
-        let drained = acc.drain_all().expect("drain");
+        let drained = acc.drain_all(nonid()).expect("drain");
         assert_eq!(drained.len(), 1);
         let mut cursor = Cursor::new(drained[0].frozen.encoded.as_ref());
         let decoded = RecordBatchDecoder::decode(&mut cursor).expect("decode");

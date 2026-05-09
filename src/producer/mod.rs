@@ -17,10 +17,13 @@ use crate::client::{Client, PartitionId, TopicMetadata};
 use crate::error::{Error, Result, RetryAction};
 use crate::producer::accumulator::Accumulator;
 use crate::producer::batch::RecordPayload;
+use crate::producer::idempotent::IdempotentState;
 use crate::producer::partitioner::{StickyState, partition_for};
 
 pub(crate) mod accumulator;
 pub(crate) mod batch;
+pub(crate) mod batch_rewrite;
+pub(crate) mod idempotent;
 pub(crate) mod partitioner;
 pub(crate) mod sender;
 
@@ -150,6 +153,20 @@ pub struct ProducerConfig {
     /// Maximum time [`Producer::send`] will block waiting for cluster
     /// metadata to resolve a record's topic.
     pub max_block: Duration,
+    /// Enable the idempotent producer (KIP-98). When `true`, the producer
+    /// acquires a `(producer_id, producer_epoch)` from the broker on first
+    /// send, assigns monotonic per-partition `base_sequence` numbers, and
+    /// retries retryable errors with the same sequence so the broker dedups
+    /// any wire-level duplicates.
+    ///
+    /// Coerces `acks = All`, caps `max_in_flight_per_broker` at 5, and
+    /// raises `retries` to `u32::MAX` if it was 0. `acks = None` combined
+    /// with idempotence is rejected by [`Producer::new`] (matching Java).
+    pub enable_idempotence: bool,
+    /// Wall-clock budget for a single record from enqueue to ack. Once
+    /// exceeded, the in-flight batch fails with `Error::RequestTimeout`.
+    /// Only consulted when `enable_idempotence = true`.
+    pub delivery_timeout: Duration,
 }
 
 impl Default for ProducerConfig {
@@ -162,6 +179,8 @@ impl Default for ProducerConfig {
             max_in_flight_per_broker: 5,
             retries: 0,
             max_block: Duration::from_secs(60),
+            enable_idempotence: false,
+            delivery_timeout: Duration::from_secs(120),
         }
     }
 }
@@ -213,6 +232,21 @@ impl ProducerConfig {
     /// metadata to resolve. See [`ProducerConfig::max_block`].
     pub fn with_max_block(mut self, max_block: Duration) -> Self {
         self.max_block = max_block;
+        self
+    }
+
+    /// Toggle the idempotent producer. See
+    /// [`ProducerConfig::enable_idempotence`] for the auto-coercion rules
+    /// applied at [`Producer::new`] time.
+    pub fn with_enable_idempotence(mut self, enable: bool) -> Self {
+        self.enable_idempotence = enable;
+        self
+    }
+
+    /// Set the wall-clock delivery deadline for an idempotent record.
+    /// See [`ProducerConfig::delivery_timeout`].
+    pub fn with_delivery_timeout(mut self, d: Duration) -> Self {
+        self.delivery_timeout = d;
         self
     }
 }
@@ -273,35 +307,88 @@ pub struct Producer {
     // `close(self)` has owned access and `Drop` has `&mut self`.
     shutdown_tx: Option<oneshot::Sender<()>>,
     sender_handle: Option<JoinHandle<()>>,
+    /// Snapshot of the effective config after auto-coercion, exposed only
+    /// to the in-tree tests so they can verify the coercion rules without
+    /// rebuilding a producer.
+    #[cfg(test)]
+    effective_config: Arc<ProducerConfig>,
+}
+
+impl Producer {
+    /// Test-only: peek at the effective `ProducerConfig` after the
+    /// `enable_idempotence` coercion has been applied.
+    #[cfg(test)]
+    pub(crate) fn effective_config(&self) -> &ProducerConfig {
+        &self.effective_config
+    }
 }
 
 impl Producer {
     /// Spawn the background sender task and return a usable producer
     /// handle. The caller must already be inside a tokio runtime.
-    pub fn new(client: Client, config: ProducerConfig) -> Self {
+    ///
+    /// Fails with [`Error::Config`] when `enable_idempotence = true` is
+    /// combined with `acks = None` (matches Java's
+    /// `enable.idempotence` validation in `KafkaProducer.configureAcks`).
+    pub fn new(client: Client, mut config: ProducerConfig) -> Result<Self> {
+        if config.enable_idempotence {
+            // Java rejects this combo because the broker can't dedup an ack=0
+            // produce — there is no response carrying the sequence ack.
+            if matches!(config.acks, Acks::None) {
+                return Err(Error::Config(
+                    "enable_idempotence=true requires acks!=None".into(),
+                ));
+            }
+            // Coerce the same knobs the Java client coerces in
+            // ProducerConfig.maybeOverrideEnableIdempotence so users get a
+            // consistent guarantee regardless of how they built the config.
+            if !matches!(config.acks, Acks::All) {
+                tracing::info!("enable_idempotence=true coerces acks to All");
+                config.acks = Acks::All;
+            }
+            if config.max_in_flight_per_broker > 5 {
+                tracing::info!(
+                    previous = config.max_in_flight_per_broker,
+                    "enable_idempotence=true caps max_in_flight_per_broker at 5",
+                );
+                config.max_in_flight_per_broker = 5;
+            }
+            if config.retries == 0 {
+                tracing::info!(
+                    "enable_idempotence=true raises retries from 0 to u32::MAX",
+                );
+                config.retries = u32::MAX;
+            }
+        }
+
         let max_block = config.max_block;
+        let enable_idempotence = config.enable_idempotence;
         let config = Arc::new(config);
         let (acc, ready_rx) = Accumulator::new(config.clone());
         let accumulator = Arc::new(acc);
         let sticky = Arc::new(StickyState::new());
+        let idempotent = enable_idempotence.then(|| Arc::new(IdempotentState::new()));
 
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let handle = sender::spawn_sender(
             client.clone(),
             accumulator.clone(),
             config.clone(),
+            idempotent.clone(),
             ready_rx,
             shutdown_rx,
         );
 
-        Self {
+        Ok(Self {
             client,
             accumulator,
             sticky,
             max_block,
             shutdown_tx: Some(shutdown_tx),
             sender_handle: Some(handle),
-        }
+            #[cfg(test)]
+            effective_config: config,
+        })
     }
 
     /// Enqueue `record` for delivery. Resolves once the record is
@@ -526,6 +613,8 @@ mod tests {
         assert_eq!(cfg.max_in_flight_per_broker, 5);
         assert_eq!(cfg.retries, 0);
         assert_eq!(cfg.max_block, Duration::from_secs(60));
+        assert!(!cfg.enable_idempotence);
+        assert_eq!(cfg.delivery_timeout, Duration::from_secs(120));
     }
 
     #[test]
@@ -537,7 +626,9 @@ mod tests {
             .with_compression(Compression::Gzip)
             .with_max_in_flight_per_broker(1)
             .with_retries(3)
-            .with_max_block(Duration::from_secs(5));
+            .with_max_block(Duration::from_secs(5))
+            .with_enable_idempotence(true)
+            .with_delivery_timeout(Duration::from_secs(7));
 
         assert_eq!(cfg.acks, Acks::Leader);
         assert_eq!(cfg.linger, Duration::from_millis(20));
@@ -546,5 +637,7 @@ mod tests {
         assert_eq!(cfg.max_in_flight_per_broker, 1);
         assert_eq!(cfg.retries, 3);
         assert_eq!(cfg.max_block, Duration::from_secs(5));
+        assert!(cfg.enable_idempotence);
+        assert_eq!(cfg.delivery_timeout, Duration::from_secs(7));
     }
 }

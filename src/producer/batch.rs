@@ -28,12 +28,18 @@ pub(crate) struct RecordPayload {
 }
 
 /// A RecordBatch shares the below fields. See `PartitionBatch::freeze` method.
+#[derive(Clone, Copy)]
 pub(crate) struct BatchProducerState {
     pub transactional: bool,
     pub control: bool,
     pub partition_leader_epoch: i32,
     pub producer_id: i64,
     pub producer_epoch: i16,
+    /// First record's sequence id. Successive records are stamped with
+    /// `base_sequence.wrapping_add(i)` so the encoder's
+    /// `(offset - sequence) == constant` invariant holds. For the
+    /// non-idempotent variant this is `0`.
+    pub base_sequence: i32,
 }
 
 impl Default for BatchProducerState {
@@ -43,8 +49,7 @@ impl Default for BatchProducerState {
 }
 
 impl BatchProducerState {
-    /// Non-idempotent, non-transactional v1 producer. The only variant the
-    /// Sender will use until idempotence/transactions land.
+    /// Non-idempotent, non-transactional v1 producer. Sequence stays at 0.
     pub(crate) fn non_idempotent() -> Self {
         Self {
             transactional: false,
@@ -52,6 +57,22 @@ impl BatchProducerState {
             partition_leader_epoch: 0,
             producer_id: NO_PRODUCER_ID,
             producer_epoch: NO_PRODUCER_EPOCH,
+            base_sequence: 0,
+        }
+    }
+
+    /// Idempotent, non-transactional KIP-98 producer. `producer_id` and
+    /// `producer_epoch` are returned by the broker on `InitProducerId`;
+    /// `base_sequence` is per-partition and assigned monotonically by
+    /// [`crate::producer::idempotent::IdempotentState`].
+    pub(crate) fn idempotent(producer_id: i64, producer_epoch: i16, base_sequence: i32) -> Self {
+        Self {
+            transactional: false,
+            control: false,
+            partition_leader_epoch: 0,
+            producer_id,
+            producer_epoch,
+            base_sequence,
         }
     }
 }
@@ -65,6 +86,10 @@ pub(crate) struct FrozenBatch {
     pub record_count: usize,
     pub first_send_at: Option<Instant>,
     pub attempt: u32,
+    /// Producer-state stamped into the encoded bytes. Carried so the
+    /// idempotent path can register `(producer_id, producer_epoch,
+    /// base_sequence)` into its in-flight queue without re-deriving them.
+    pub state: BatchProducerState,
 }
 
 /// Buffer of records for `(topic, partition)` pair.
@@ -179,13 +204,18 @@ impl PartitionBatch {
         state: BatchProducerState,
         compression: Compression,
     ) -> Result<FrozenBatch> {
-        // Force the v2-batch invariants uniformly across every record.
-        for r in self.records.iter_mut() {
+        // Force the v2-batch invariants uniformly across every record. The
+        // per-record `sequence` runs `base_sequence + i`; the encoder reads
+        // the first record's `sequence` as the batch-level `base_sequence`,
+        // and verifies `(offset - sequence) == constant` for every record
+        // in the batch (see kafka-protocol-0.17.0/src/records.rs:287).
+        for (i, r) in self.records.iter_mut().enumerate() {
             r.producer_id = state.producer_id;
             r.producer_epoch = state.producer_epoch;
             r.partition_leader_epoch = state.partition_leader_epoch;
             r.transactional = state.transactional;
             r.control = state.control;
+            r.sequence = state.base_sequence.wrapping_add(i as i32);
         }
 
         let options = RecordEncodeOptions {
@@ -201,6 +231,7 @@ impl PartitionBatch {
             record_count: self.records.len(),
             first_send_at: self.first_send_at,
             attempt: self.attempt,
+            state,
         })
     }
 }
@@ -450,6 +481,32 @@ mod tests {
         let later = first + Duration::from_secs(5);
         batch.mark_dispatched(later);
         assert_eq!(batch.first_send_at, Some(first));
+    }
+
+    #[test]
+    fn freeze_idempotent_sets_producer_id_epoch_and_sequence() {
+        let mut batch = PartitionBatch::new(Instant::now());
+        let _ = batch.append(sample_payload(None, Some(b"a")), usize::MAX);
+        let _ = batch.append(sample_payload(None, Some(b"b")), usize::MAX);
+        let _ = batch.append(sample_payload(None, Some(b"c")), usize::MAX);
+
+        let frozen = batch
+            .freeze(
+                BatchProducerState::idempotent(123, 7, 100),
+                Compression::None,
+            )
+            .expect("encode");
+        assert_eq!(frozen.record_count, 3);
+
+        let mut cursor = Cursor::new(frozen.encoded.as_ref());
+        let decoded = RecordBatchDecoder::decode(&mut cursor).expect("decode");
+        assert_eq!(decoded.records.len(), 3);
+        for (i, r) in decoded.records.iter().enumerate() {
+            assert_eq!(r.producer_id, 123, "record {i} producer_id");
+            assert_eq!(r.producer_epoch, 7, "record {i} producer_epoch");
+            assert_eq!(r.sequence, 100 + i as i32, "record {i} sequence");
+            assert_eq!(r.offset, i as i64, "record {i} offset");
+        }
     }
 
     #[test]

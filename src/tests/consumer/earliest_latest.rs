@@ -32,7 +32,8 @@ async fn reset_earliest_reads_pre_existing() {
     let producer = crate::Producer::new(
         client.clone(),
         crate::ProducerConfig::default().with_linger(Duration::from_millis(0)),
-    );
+    )
+    .expect("producer config");
 
     const N: usize = 5;
     let mut futures = Vec::with_capacity(N);
@@ -88,7 +89,8 @@ async fn reset_latest_skips_pre_existing() {
     let producer = crate::Producer::new(
         client.clone(),
         crate::ProducerConfig::default().with_linger(Duration::from_millis(0)),
-    );
+    )
+    .expect("producer config");
 
     // Produce the pre-existing batch and block until every record
     // is acked: Latest resolves the high-water mark at assign time,

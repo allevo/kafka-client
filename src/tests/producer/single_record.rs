@@ -30,7 +30,8 @@ async fn single_record_round_trip() {
     let producer = crate::Producer::new(
         client,
         crate::ProducerConfig::default().with_linger(Duration::from_millis(0)),
-    );
+    )
+    .expect("producer config");
 
     let fut = producer
         .send(

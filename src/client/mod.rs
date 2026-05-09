@@ -798,6 +798,19 @@ impl Client {
         self.inner.metadata.load().controller_id
     }
 
+    /// Base retry backoff configured at bootstrap. Read by the producer's
+    /// per-batch retry loop so a transient broker error doesn't busy-loop
+    /// at linger cadence; mirrors Java's `retry.backoff.ms`.
+    pub(crate) fn retry_backoff(&self) -> Duration {
+        self.inner.retry_backoff
+    }
+
+    /// Upper bound on the exponential retry backoff. Mirrors Java's
+    /// `retry.backoff.max.ms`.
+    pub(crate) fn retry_backoff_max(&self) -> Duration {
+        self.inner.retry_backoff_max
+    }
+
     /// Signal shutdown on every pooled broker connection and clear the pool.
     ///
     /// Idempotent. After `close()` returns, background read/write

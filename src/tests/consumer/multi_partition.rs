@@ -53,7 +53,8 @@ async fn round_trip_three_partitions() {
     let producer = crate::Producer::new(
         client.clone(),
         crate::ProducerConfig::default().with_linger(Duration::from_millis(0)),
-    );
+    )
+    .expect("producer config");
 
     // Pin records to specific partitions via `with_partition` rather than
     // relying on key-hashing to land them on all 3 partitions: the murmur2

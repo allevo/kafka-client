@@ -29,7 +29,8 @@ async fn close_joins_fetcher_when_backpressured() {
     let producer = crate::Producer::new(
         client.clone(),
         crate::ProducerConfig::default().with_linger(Duration::from_millis(0)),
-    );
+    )
+    .expect("producer config");
 
     // Produce many more records than the consumer's `channel_capacity`
     // so the fetcher fills the internal record channel, then parks on

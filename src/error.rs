@@ -33,6 +33,12 @@ pub enum Error {
         topic: TopicName,
         direction: PropagationDirection,
     },
+    /// The idempotent producer was fenced by the broker
+    /// (`InvalidProducerEpoch` / `ProducerFenced`), or hit a sequence
+    /// state from which it cannot recover automatically. Terminal:
+    /// every subsequent `Producer::send` resolves with this same
+    /// error. Classified as `Fatal`.
+    IdempotenceFenced(String),
 }
 
 /// Direction of a metadata-propagation wait.
@@ -95,6 +101,7 @@ impl Error {
             // metadata refresh would not unblock anything that another
             // poll round won't unblock on its own.
             Error::TopicPropagationTimeout { .. } => RetryAction::Retry,
+            Error::IdempotenceFenced(_) => RetryAction::Fatal,
         }
     }
 
@@ -216,6 +223,7 @@ impl fmt::Display for Error {
                 "topic '{}' did not become {direction} on every broker before the deadline",
                 topic.as_str()
             ),
+            Error::IdempotenceFenced(msg) => write!(f, "idempotence fenced: {msg}"),
         }
     }
 }

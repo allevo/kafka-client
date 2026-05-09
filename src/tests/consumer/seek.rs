@@ -31,7 +31,8 @@ async fn seek_replays_from_offset_zero() {
     let producer = crate::Producer::new(
         client.clone(),
         crate::ProducerConfig::default().with_linger(Duration::from_millis(0)),
-    );
+    )
+    .expect("producer config");
 
     const N: usize = 10;
     let mut futures = Vec::with_capacity(N);

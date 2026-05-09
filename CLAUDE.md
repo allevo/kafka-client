@@ -21,6 +21,8 @@ cargo test                           # run all tests
 
 NB: Tests use `testcontainers` with the `apache/kafka:3.7.0` image. Docker must be running. Broker startup timeout is 120 seconds.
 
+Don't lint and format the code, it will be perform manually.
+
 ### Conventions
 
 - Tests live in `src/tests/`, one file per scenario. Shared helpers live in `src/tests/helpers/`.

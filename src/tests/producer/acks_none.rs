@@ -54,7 +54,8 @@ async fn acks_none_round_trip() {
         crate::ProducerConfig::default()
             .with_acks(crate::Acks::None)
             .with_linger(Duration::from_millis(0)),
-    );
+    )
+    .expect("producer config");
 
     const N: usize = 5;
     let mut futures = Vec::with_capacity(N);

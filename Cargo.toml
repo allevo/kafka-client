@@ -19,6 +19,7 @@ zeropool = "0.3"
 socket2 = "0.6.3"
 murmur2 = "0.1"
 futures-core = "0.3"
+crc32c = "0.6"
 
 [dev-dependencies]
 kafka-protocol = { version = "0.17", default-features = false, features = ["client", "broker", "gzip"] }
