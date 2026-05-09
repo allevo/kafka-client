@@ -278,7 +278,7 @@ impl BrokerClient {
         request: &Req,
     ) -> Result<ResponseFuture<Resp>>
     where
-        Req: Encodable + HeaderVersion + Send + 'static,
+        Req: Encodable + HeaderVersion,
         Resp: Decodable + HeaderVersion,
     {
         // Fast-path rejection once `read_task` has decided to exit.
@@ -358,7 +358,7 @@ impl BrokerClient {
         request: &Req,
     ) -> Result<()>
     where
-        Req: Encodable + HeaderVersion + Send + 'static,
+        Req: Encodable + HeaderVersion,
     {
         if self.inner.shutdown.load(Ordering::Acquire) {
             return Err(Error::Io(std::io::Error::new(
