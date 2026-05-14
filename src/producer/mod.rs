@@ -16,7 +16,7 @@ use tokio::task::JoinHandle;
 use crate::client::{Client, PartitionId, TopicMetadata};
 use crate::error::{Error, Result, RetryAction};
 use crate::producer::accumulator::Accumulator;
-use crate::producer::batch::RecordPayload;
+use crate::producer::batch::{RecordPayload, estimate_record_size};
 use crate::producer::idempotent::IdempotentState;
 use crate::producer::partitioner::{StickyState, partition_for};
 
@@ -124,6 +124,31 @@ impl Acks {
     }
 }
 
+/// What [`Producer::send`] does when a record cannot reserve
+/// `buffer_memory` budget because the accumulator is already holding
+/// `buffer_memory` bytes the sender has not drained yet.
+///
+/// This governs *only* the buffer-memory reservation. `send` can still
+/// block up to `max_block` resolving topic metadata regardless of this
+/// setting — `Error` does not make `send` unconditionally non-blocking.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BufferFullPolicy {
+    /// Park the `send` until the sender drains enough buffered batches
+    /// to make room, then fail with [`Error::BufferFull`] if the
+    /// `max_block` deadline passes first. Mirrors Java's `buffer.memory`
+    /// + `max.block.ms` behaviour. The default.
+    Block,
+    /// Fail the `send` immediately with [`Error::BufferFull`] the moment
+    /// the reservation does not fit — never park waiting for room.
+    /// Mirrors librdkafka's default `queue.buffering.max.*` →
+    /// `RD_KAFKA_RESP_ERR__QUEUE_FULL`, for callers that would rather
+    /// shed load synchronously than wait. (Java has no dedicated knob:
+    /// `max.block.ms = 0` is its closest analog, but our `max_block` is
+    /// shared with the metadata wait, so a separate policy is needed to
+    /// avoid coupling the two.)
+    Error,
+}
+
 /// Tunables for the producer. Use [`ProducerConfig::default`] for reasonable
 /// starting values and refine via the `with_*` builders.
 #[non_exhaustive]
@@ -167,6 +192,33 @@ pub struct ProducerConfig {
     /// exceeded, the in-flight batch fails with `Error::RequestTimeout`.
     /// Only consulted when `enable_idempotence = true`.
     pub delivery_timeout: Duration,
+    /// Hard cap on the encoded size of a single record-batch frame, in
+    /// bytes. A frozen batch larger than this is rejected before it
+    /// reaches the broker (which would itself answer `MESSAGE_TOO_LARGE`).
+    /// Mirrors Java's `max.request.size`. [`Producer::new`] coerces
+    /// `batch_size_bytes` down to this value if it was set higher.
+    /// Default 1 MiB.
+    pub max_request_size: usize,
+    /// Hard cap on the estimated size of a single record. [`Producer::send`]
+    /// fast-fails with [`Error::RecordTooLarge`] before buffering a record
+    /// whose estimated wire size exceeds this. Must not exceed
+    /// `max_request_size` ([`Producer::new`] rejects the combination).
+    /// Defaults to `max_request_size` (1 MiB).
+    pub max_record_size: usize,
+    /// Total bytes of un-drained record payloads the accumulator may hold
+    /// before [`Producer::send`] applies backpressure. Once the buffer is
+    /// full, `send` parks (up to `max_block`) until the sender drains
+    /// enough batches to make room, then fails with [`Error::BufferFull`].
+    /// Mirrors Java's `buffer.memory`. Must be at least `max_record_size`
+    /// ([`Producer::new`] rejects the combination — a record larger than
+    /// the whole buffer could never be reserved). Default 32 MiB.
+    pub buffer_memory: usize,
+    /// What [`Producer::send`] does when a record cannot reserve
+    /// `buffer_memory` budget. [`BufferFullPolicy::Block`] (default)
+    /// parks the call up to `max_block`; [`BufferFullPolicy::Error`]
+    /// fails it synchronously with [`Error::BufferFull`] without
+    /// waiting. See [`BufferFullPolicy`].
+    pub buffer_full_policy: BufferFullPolicy,
 }
 
 impl Default for ProducerConfig {
@@ -181,6 +233,10 @@ impl Default for ProducerConfig {
             max_block: Duration::from_secs(60),
             enable_idempotence: false,
             delivery_timeout: Duration::from_secs(120),
+            max_request_size: 1 << 20,  // 1 MiB
+            max_record_size: 1 << 20,   // = max_request_size
+            buffer_memory: 32 << 20,    // 32 MiB
+            buffer_full_policy: BufferFullPolicy::Block,
         }
     }
 }
@@ -249,6 +305,34 @@ impl ProducerConfig {
         self.delivery_timeout = d;
         self
     }
+
+    /// Set the hard cap on a single encoded record-batch frame, in
+    /// bytes. See [`ProducerConfig::max_request_size`].
+    pub fn with_max_request_size(mut self, bytes: usize) -> Self {
+        self.max_request_size = bytes;
+        self
+    }
+
+    /// Set the hard cap on a single record's estimated wire size, in
+    /// bytes. See [`ProducerConfig::max_record_size`].
+    pub fn with_max_record_size(mut self, bytes: usize) -> Self {
+        self.max_record_size = bytes;
+        self
+    }
+
+    /// Set the total accumulator buffer budget, in bytes. See
+    /// [`ProducerConfig::buffer_memory`].
+    pub fn with_buffer_memory(mut self, bytes: usize) -> Self {
+        self.buffer_memory = bytes;
+        self
+    }
+
+    /// Set the behaviour when `buffer_memory` is exhausted. See
+    /// [`BufferFullPolicy`].
+    pub fn with_buffer_full_policy(mut self, policy: BufferFullPolicy) -> Self {
+        self.buffer_full_policy = policy;
+        self
+    }
 }
 
 /// Resolves to the broker's acknowledgement for a single record. The
@@ -302,6 +386,10 @@ pub struct Producer {
     /// Cached from `ProducerConfig::max_block` so `send` doesn't pay the
     /// `Arc<ProducerConfig>` deref on every call.
     max_block: Duration,
+    /// Cached from `ProducerConfig::max_record_size`: `send`'s
+    /// synchronous oversized-record fast-fail consults it before
+    /// reserving any `buffer_memory` budget.
+    max_record_size: usize,
     // `Option<_>` so `close(self)` can take the sender / handle exactly
     // once and `Drop` can no-op when close already ran. No mutex needed:
     // `close(self)` has owned access and `Drop` has `&mut self`.
@@ -361,13 +449,54 @@ impl Producer {
             }
         }
 
+        // A record larger than the request cap could never be shipped in
+        // any batch — reject the combination up front rather than letting
+        // every `send` of a max-size record fail later.
+        if config.max_record_size > config.max_request_size {
+            return Err(Error::Config(format!(
+                "max_record_size ({}) must not exceed max_request_size ({})",
+                config.max_record_size, config.max_request_size,
+            )));
+        }
+        // A record larger than the whole buffer could never be reserved
+        // against `buffer_memory`: `Producer::send` would park in
+        // `reserve` until `max_block` and then surface `BufferFull` for
+        // every such record. Reject the combination up front — mirrors
+        // Java's `BufferPool.allocate` hard-limit check.
+        if config.max_record_size > config.buffer_memory {
+            return Err(Error::Config(format!(
+                "max_record_size ({}) must not exceed buffer_memory ({})",
+                config.max_record_size, config.buffer_memory,
+            )));
+        }
+        // `batch_size_bytes` is the per-partition fill threshold; a value
+        // above `max_request_size` would let `append` keep growing a
+        // batch past the size every frozen frame is checked against,
+        // guaranteeing a `MessageTooLarge` rejection at freeze. Coerce it
+        // down (Java clamps the same way in `RecordAccumulator`).
+        if config.batch_size_bytes > config.max_request_size {
+            tracing::warn!(
+                batch_size_bytes = config.batch_size_bytes,
+                max_request_size = config.max_request_size,
+                "batch_size_bytes exceeds max_request_size; coercing batch_size_bytes down to max_request_size",
+            );
+            config.batch_size_bytes = config.max_request_size;
+        }
+
         let max_block = config.max_block;
+        let max_record_size = config.max_record_size;
         let enable_idempotence = config.enable_idempotence;
         let config = Arc::new(config);
-        let (acc, ready_rx) = Accumulator::new(config.clone());
-        let accumulator = Arc::new(acc);
+        let (mut acc, ready_rx) = Accumulator::new(config.clone());
         let sticky = Arc::new(StickyState::new());
         let idempotent = enable_idempotence.then(|| Arc::new(IdempotentState::new()));
+        // T2c: let the accumulator's `reserve` see the idempotent
+        // in-flight queue, so a stalled broker can't hoard `buffer_memory`
+        // through retried batches that have already left `bytes_in_use`.
+        if let Some(idem) = &idempotent {
+            acc.attach_idempotent(idem.clone());
+        }
+        let accumulator = Arc::new(acc);
 
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let handle = sender::spawn_sender(
@@ -384,6 +513,7 @@ impl Producer {
             accumulator,
             sticky,
             max_block,
+            max_record_size,
             shutdown_tx: Some(shutdown_tx),
             sender_handle: Some(handle),
             #[cfg(test)]
@@ -392,27 +522,80 @@ impl Producer {
     }
 
     /// Enqueue `record` for delivery. Resolves once the record is
-    /// appended to the accumulator (after a metadata refresh if
-    /// needed). Awaiting the returned [`SendFuture`] then waits for the
-    /// broker ack.
+    /// appended to the accumulator (after a `buffer_memory` reservation
+    /// and a metadata refresh if needed). Awaiting the returned
+    /// [`SendFuture`] then waits for the broker ack.
     ///
     /// `timeout` is a whole-broker-round-trip budget.
-    /// `None` falls back to per-stage bounds (`max_block` for metadata,
-    /// the sender's per-attempt timeouts for the dispatch path).
+    /// `None` falls back to per-stage bounds (`max_block` for the
+    /// combined buffer-reservation + metadata wait, the sender's
+    /// per-attempt timeouts for the dispatch path).
     pub async fn send(
         &self,
         record: ProducerRecord,
         timeout: Option<Duration>,
     ) -> Result<SendFuture> {
-        let deadline = timeout.map(|t| tokio::time::Instant::now() + t);
-        let meta = self.resolve_topic_metadata(&record.topic, deadline).await?;
+        let now = tokio::time::Instant::now();
+        // The caller's `timeout` is the whole-round-trip budget; it also
+        // arms the post-enqueue ack wait via `SendFuture::sleep`.
+        let user_deadline = timeout.map(|t| now + t);
+        // N4: the `buffer_memory` reservation wait and the
+        // metadata-resolution wait share ONE budget — `max_block`,
+        // capped by `timeout` when that is tighter. Computed once here
+        // so the two stages cannot each spend a fresh `max_block`.
+        let block_deadline = {
+            let max_block_deadline = now + self.max_block;
+            match user_deadline {
+                Some(u) => u.min(max_block_deadline),
+                None => max_block_deadline,
+            }
+        };
 
-        let partition = partition_for(&record, &meta, &self.sticky).ok_or_else(|| {
-            Error::NoBrokerAvailable(format!(
+        // The record's estimated wire footprint is both the
+        // `max_record_size` guard input and the `buffer_memory` amount
+        // to reserve — taken once, off the `ProducerRecord` (no
+        // `RecordPayload` exists yet).
+        let est =
+            estimate_record_size(record.key.as_ref(), record.value.as_ref(), &record.headers);
+        // Fast-fail an oversized record before touching the buffer
+        // budget: it can never ship, so reserving (then releasing)
+        // budget for it is pointless — and a record larger than
+        // `buffer_memory` itself would otherwise park in `reserve` until
+        // `max_block` only to surface a misleading `BufferFull`.
+        // `Accumulator::append` re-checks; this is the user-facing fast
+        // path.
+        if est > self.max_record_size {
+            return Err(Error::RecordTooLarge {
+                size: est,
+                limit: self.max_record_size,
+            });
+        }
+
+        // Reserve `buffer_memory` budget first (N4: shares
+        // `block_deadline` with the metadata wait below). From here
+        // until `append` succeeds, every early return MUST
+        // `release(est)` or the reserved budget leaks — the record never
+        // reaches a `PartitionBatch`, so no drain would ever release it.
+        self.accumulator.reserve(est, block_deadline).await?;
+
+        let meta = match self
+            .resolve_topic_metadata(&record.topic, Some(block_deadline))
+            .await
+        {
+            Ok(m) => m,
+            Err(e) => {
+                self.accumulator.release(est);
+                return Err(e);
+            }
+        };
+
+        let Some(partition) = partition_for(&record, &meta, &self.sticky) else {
+            self.accumulator.release(est);
+            return Err(Error::NoBrokerAvailable(format!(
                 "no partitions available for topic '{}'",
                 record.topic.as_str()
-            ))
-        })?;
+            )));
+        };
 
         let topic = record.topic;
         let payload = RecordPayload {
@@ -422,8 +605,14 @@ impl Producer {
             headers: record.headers,
         };
 
-        let outcome = self.accumulator.append(topic, partition, payload);
-        let sleep = deadline.map(|d| Box::pin(tokio::time::sleep_until(d)));
+        let outcome = match self.accumulator.append(topic, partition, payload) {
+            Ok(o) => o,
+            Err(e) => {
+                self.accumulator.release(est);
+                return Err(e);
+            }
+        };
+        let sleep = user_deadline.map(|d| Box::pin(tokio::time::sleep_until(d)));
         Ok(SendFuture {
             rx: outcome.rx,
             sleep,
@@ -524,6 +713,10 @@ impl Producer {
     /// Signal the sender task to drain the accumulator one last time
     /// and exit, then await its completion.
     pub async fn close(mut self) -> Result<()> {
+        // Wake any `Producer::send` parked on the buffer cap so it
+        // returns with `Error::Protocol` instead of waiting out
+        // `max_block` (N9).
+        self.accumulator.mark_closed();
         if let Some(tx) = self.shutdown_tx.take() {
             let _ = tx.send(());
         }
@@ -545,6 +738,9 @@ impl Drop for Producer {
         // sender exits and drops the FrozenBatch waiters.
         if let Some(tx) = self.shutdown_tx.take() {
             tracing::warn!("producer dropped without close()");
+            // Wake any send parked on the buffer cap (N9) — same reason
+            // as close(), Drop just can't await the sender afterwards.
+            self.accumulator.mark_closed();
             let _ = tx.send(());
             // sender_handle deliberately leaked: Drop can't await it.
         }
@@ -615,6 +811,10 @@ mod tests {
         assert_eq!(cfg.max_block, Duration::from_secs(60));
         assert!(!cfg.enable_idempotence);
         assert_eq!(cfg.delivery_timeout, Duration::from_secs(120));
+        assert_eq!(cfg.max_request_size, 1 << 20);
+        assert_eq!(cfg.max_record_size, 1 << 20);
+        assert_eq!(cfg.buffer_memory, 32 << 20);
+        assert_eq!(cfg.buffer_full_policy, BufferFullPolicy::Block);
     }
 
     #[test]
@@ -628,7 +828,11 @@ mod tests {
             .with_retries(3)
             .with_max_block(Duration::from_secs(5))
             .with_enable_idempotence(true)
-            .with_delivery_timeout(Duration::from_secs(7));
+            .with_delivery_timeout(Duration::from_secs(7))
+            .with_max_request_size(2 << 20)
+            .with_max_record_size(512 * 1024)
+            .with_buffer_memory(8 << 20)
+            .with_buffer_full_policy(BufferFullPolicy::Error);
 
         assert_eq!(cfg.acks, Acks::Leader);
         assert_eq!(cfg.linger, Duration::from_millis(20));
@@ -639,5 +843,9 @@ mod tests {
         assert_eq!(cfg.max_block, Duration::from_secs(5));
         assert!(cfg.enable_idempotence);
         assert_eq!(cfg.delivery_timeout, Duration::from_secs(7));
+        assert_eq!(cfg.max_request_size, 2 << 20);
+        assert_eq!(cfg.max_record_size, 512 * 1024);
+        assert_eq!(cfg.buffer_memory, 8 << 20);
+        assert_eq!(cfg.buffer_full_policy, BufferFullPolicy::Error);
     }
 }

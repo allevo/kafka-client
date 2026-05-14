@@ -22,6 +22,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -123,6 +124,75 @@ pub(crate) enum AssignError {
     PartitionBlocked,
 }
 
+/// How the epoch-bump pass must treat a flagged partition (T3a).
+///
+/// The distinction guards the exactly-once invariant once multi-head
+/// dispatch puts more than the head batch on the wire per partition:
+/// the producer must never transmit a record under a fresh
+/// `(producer_id, producer_epoch)` while a prior transmission of that
+/// record under the old epoch could still be accepted by the broker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BumpMode {
+    /// The broker explicitly rejected the partition's head with a
+    /// sequence-coherent error (`OutOfOrderSequence`, `UnknownProducerId`
+    /// with predecessors, `MessageTooLarge`, a fatal produce code). A
+    /// rejected head implies every higher-sequence successor is also
+    /// rejected, so *nothing* currently in the in-flight queue can have
+    /// been accepted — the bump pass re-stamps the whole queue from
+    /// `base_sequence = 0` immediately (Java's `partitionsToRewriteSequences`).
+    Eager,
+    /// The head was given up on *without* a broker rejection: a
+    /// `delivery_timeout` / retries-exceeded pop, a metadata loss, or a
+    /// sibling batch's drain-time `freeze` failure. A successor — or the
+    /// timed-out head itself — may already have been accepted by the
+    /// broker (its response merely lost), so the bump pass must NOT
+    /// re-stamp: it acquires a fresh `(pid, epoch)`, parks it as the
+    /// partition's `pending_epoch_reset`, and lets the old-epoch
+    /// in-flight queue drain under the old epoch before applying the
+    /// reset. Mirrors librdkafka's `RD_KAFKA_IDEMP_STATE_DRAIN_BUMP` and
+    /// Java's `hasStaleProducerIdAndEpoch` + `maybeUpdateProducerIdAndEpoch`.
+    Deferred,
+}
+
+/// Merge a bump request into the pending set. `Eager` always wins over
+/// `Deferred`: an eager request means the broker provably rejected the
+/// head, so the whole queue is provably unsent and an immediate
+/// re-stamp is sound even if a deferred trigger also fired for the same
+/// partition.
+fn upsert_pending_bump(
+    map: &mut HashMap<(TopicName, PartitionId), BumpMode>,
+    key: (TopicName, PartitionId),
+    mode: BumpMode,
+) {
+    match map.entry(key) {
+        std::collections::hash_map::Entry::Occupied(mut e) => {
+            if matches!(mode, BumpMode::Eager) {
+                e.insert(BumpMode::Eager);
+            }
+        }
+        std::collections::hash_map::Entry::Vacant(e) => {
+            e.insert(mode);
+        }
+    }
+}
+
+/// Apply a parked deferred epoch reset the moment a partition's
+/// in-flight queue empties: every old-epoch batch has now been acked or
+/// terminally failed, so swapping in the fresh `(pid, epoch)` and
+/// rewinding `next_sequence` to 0 can no longer duplicate an
+/// accepted-but-unconfirmed record. Mirrors Java's
+/// `maybeUpdateProducerIdAndEpoch` (`!hasInflightBatches` guard).
+fn maybe_apply_pending_reset(part: &mut PartitionState) {
+    if part.in_flight.is_empty()
+        && let Some((new_pid, new_epoch)) = part.pending_epoch_reset.take()
+    {
+        part.producer_id = new_pid;
+        part.producer_epoch = new_epoch;
+        part.next_sequence = 0;
+        part.last_acked_sequence = NO_LAST_ACKED;
+    }
+}
+
 #[derive(Debug)]
 enum InitState {
     Uninitialized,
@@ -143,6 +213,17 @@ struct PartitionState {
     next_sequence: i32,
     last_acked_sequence: i32,
     in_flight: VecDeque<InFlightBatch>,
+    /// When `Some((new_pid, new_epoch))`, a [`BumpMode::Deferred`] epoch
+    /// bump has been acquired from the broker but not yet applied: the
+    /// partition is draining its old-epoch in-flight queue under the
+    /// *old* `(producer_id, producer_epoch)`. While this is `Some`,
+    /// `assign` is blocked and the accumulator leaves the partition's
+    /// buffered batches un-drained (the `shouldStopDrainBatchesForPartition`
+    /// analog) — a fresh seq-0 batch under the new epoch must not be
+    /// written ahead of unresolved old-epoch batches. The moment
+    /// `in_flight` empties, [`maybe_apply_pending_reset`] swaps in the
+    /// new `(pid, epoch)`, rewinds `next_sequence` to 0, and clears this.
+    pending_epoch_reset: Option<(i64, i16)>,
 }
 
 /// One in-flight produce batch held until the broker acks (or the
@@ -175,7 +256,11 @@ pub(crate) struct InFlightBatch {
 struct Inner {
     init: InitState,
     partitions: HashMap<(TopicName, PartitionId), PartitionState>,
-    pending_bumps: HashSet<(TopicName, PartitionId)>,
+    /// Partitions awaiting an epoch bump on the next dispatch tick, each
+    /// tagged with how the bump pass must treat it ([`BumpMode`]). A
+    /// partition already mid-deferred-reset (`pending_epoch_reset` set)
+    /// is never (re-)added — it has a fresh epoch acquired already.
+    pending_bumps: HashMap<(TopicName, PartitionId), BumpMode>,
 }
 
 pub(crate) struct IdempotentState {
@@ -183,6 +268,14 @@ pub(crate) struct IdempotentState {
     /// Wakes every parked `ensure_ready` caller when init transitions
     /// out of `Initializing`.
     init_done: Notify,
+    /// Sum of `encoded.len()` across every batch currently sitting in a
+    /// per-partition in-flight queue. Maintained on every queue mutation
+    /// so `Accumulator::reserve` can charge in-flight bytes against
+    /// `buffer_memory` (T2c / N8): a batch that has drained out of the
+    /// accumulator is no longer counted in `bytes_in_use`, so without
+    /// this a stalled broker would hoard arbitrary memory through
+    /// retried in-flight batches even with a cap configured.
+    total_inflight_bytes: AtomicUsize,
 }
 
 impl IdempotentState {
@@ -191,9 +284,45 @@ impl IdempotentState {
             inner: Mutex::new(Inner {
                 init: InitState::Uninitialized,
                 partitions: HashMap::new(),
-                pending_bumps: HashSet::new(),
+                pending_bumps: HashMap::new(),
             }),
             init_done: Notify::new(),
+            total_inflight_bytes: AtomicUsize::new(0),
+        }
+    }
+
+    /// Total bytes of encoded record-batches sitting in every
+    /// per-partition in-flight queue. Read by `Accumulator::reserve` to
+    /// charge in-flight batches against `buffer_memory` (T2c / N8).
+    pub(crate) fn inflight_bytes(&self) -> usize {
+        self.total_inflight_bytes.load(Ordering::Relaxed)
+    }
+
+    /// A batch entered an in-flight queue — add its encoded size to the
+    /// accounting. Paired 1:1 with [`Self::release_inflight_bytes`]:
+    /// every batch is counted on insertion and uncounted exactly once
+    /// on removal.
+    fn track_inflight_bytes(&self, n: usize) {
+        self.total_inflight_bytes.fetch_add(n, Ordering::Relaxed);
+    }
+
+    /// A batch left an in-flight queue — subtract its encoded size. The
+    /// `saturating_sub`-via-CAS keeps the counter sane even if the
+    /// accounting were ever miscounted; in correct use it never
+    /// saturates (every batch is uncounted exactly once), mirroring the
+    /// defensive stance of the accumulator's `bytes_in_use` book-keeping.
+    fn release_inflight_bytes(&self, n: usize) {
+        let mut cur = self.total_inflight_bytes.load(Ordering::Relaxed);
+        loop {
+            match self.total_inflight_bytes.compare_exchange_weak(
+                cur,
+                cur.saturating_sub(n),
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(observed) => cur = observed,
+            }
         }
     }
 
@@ -272,17 +401,30 @@ impl IdempotentState {
             InitState::Uninitialized | InitState::Initializing => return Err(AssignError::NotReady),
         };
 
-        if guard.pending_bumps.contains(&(topic.clone(), partition)) {
+        let key = (topic.clone(), partition);
+        // Blocked while a bump is pending (either flavour) or a deferred
+        // reset is mid-flight — the drain skips these partitions, so in
+        // the normal flow `assign` is never even called for one; the
+        // check stays as a fail-safe (and backs the `assign`-level unit
+        // tests).
+        if guard.pending_bumps.contains_key(&key) {
+            return Err(AssignError::PartitionBlocked);
+        }
+        if guard
+            .partitions
+            .get(&key)
+            .is_some_and(|p| p.pending_epoch_reset.is_some())
+        {
             return Err(AssignError::PartitionBlocked);
         }
 
-        let key = (topic.clone(), partition);
         let part = guard.partitions.entry(key).or_insert_with(|| PartitionState {
             producer_id: global_pid,
             producer_epoch: global_epoch,
             next_sequence: 0,
             last_acked_sequence: NO_LAST_ACKED,
             in_flight: VecDeque::new(),
+            pending_epoch_reset: None,
         });
 
         let base_sequence = part.next_sequence;
@@ -305,6 +447,7 @@ impl IdempotentState {
     /// settles it, so retries can re-dispatch the same encoded bytes.
     pub(crate) fn register_inflight(&self, batch: InFlightBatch) {
         let key = (batch.topic.clone(), batch.partition);
+        let batch_bytes = batch.encoded.len();
         let mut guard = self.inner.lock().unwrap();
         let Some(part) = guard.partitions.get_mut(&key) else {
             // assign() must precede register_inflight, so the partition
@@ -317,6 +460,10 @@ impl IdempotentState {
             return;
         };
         part.in_flight.push_back(batch);
+        // Count the batch against `buffer_memory` only after it is
+        // actually queued — the early return above drops the batch, so
+        // its bytes must not be tracked.
+        self.track_inflight_bytes(batch_bytes);
     }
 
     /// Settle a successful response: drop the head batch (assumed to
@@ -344,11 +491,16 @@ impl IdempotentState {
             return None;
         }
         let batch = part.in_flight.pop_front()?;
+        self.release_inflight_bytes(batch.encoded.len());
         // last_acked is the *last record's* sequence in this batch;
         // record_count is at least 1 by construction.
         let last_in_batch =
             increment_sequence(batch.base_sequence, batch.record_count.saturating_sub(1));
         part.last_acked_sequence = last_in_batch;
+        // This pop may have drained the last old-epoch batch on a
+        // partition with a parked deferred epoch reset — apply it now
+        // that nothing accepted-but-unconfirmed remains (T3a).
+        maybe_apply_pending_reset(part);
         Some(batch)
     }
 
@@ -362,13 +514,18 @@ impl IdempotentState {
     ) -> Option<InFlightBatch> {
         let mut guard = self.inner.lock().unwrap();
         let part = guard.partitions.get_mut(&(topic.clone(), partition))?;
-        part.in_flight.pop_front()
+        let popped = part.in_flight.pop_front();
+        if let Some(batch) = &popped {
+            self.release_inflight_bytes(batch.encoded.len());
+        }
+        popped
     }
 
     /// Fail the head in-flight batch on `(topic, partition)`: pop it,
-    /// flag the partition for an epoch bump (atomically with the pop, so
-    /// no in-between `assign` can hand out a poisoned `base_sequence`),
-    /// and notify the popped batch's waiters via `make_err`.
+    /// flag the partition for an epoch bump with the given [`BumpMode`]
+    /// (atomically with the pop, so no in-between `assign` can hand out
+    /// a poisoned `base_sequence`), and notify the popped batch's
+    /// waiters via `make_err`.
     ///
     /// `assign()` advances `next_sequence` eagerly, so any non-success
     /// pop leaves the partition's sequence space ahead of what the
@@ -377,10 +534,18 @@ impl IdempotentState {
     /// `TransactionManager.handleFailedBatch` (which calls
     /// `requestIdempotentEpochBumpForPartition` for non-transactional
     /// idempotent producers; see `TransactionManager.java:819-841`).
+    ///
+    /// `mode` is [`BumpMode::Eager`] when the broker provably rejected
+    /// the head (a fatal produce code) and [`BumpMode::Deferred`] when
+    /// it was given up on without a rejection (`delivery_timeout`,
+    /// retries-exceeded, metadata loss) — see [`BumpMode`]. A partition
+    /// already mid-deferred-reset is left alone: the pop just advances
+    /// its drain toward the parked reset.
     pub(crate) fn fail_inflight_head(
         &self,
         topic: &TopicName,
         partition: PartitionId,
+        mode: BumpMode,
         make_err: impl Fn() -> Error,
     ) {
         let popped = {
@@ -390,12 +555,25 @@ impl IdempotentState {
                 .partitions
                 .get_mut(&key)
                 .and_then(|p| p.in_flight.pop_front());
-            // Only request a bump if we owned a head to pop. An empty
-            // queue means there's nothing to recover — flagging would
-            // trigger a no-op bump pass (or, pre-Step-15, a needless
-            // global-fatal short-circuit).
-            if popped.is_some() {
-                guard.pending_bumps.insert(key);
+            // Only act if we owned a head to pop. An empty queue means
+            // there's nothing to recover — flagging would trigger a
+            // no-op bump pass.
+            if let Some(batch) = &popped {
+                self.release_inflight_bytes(batch.encoded.len());
+                let already_resetting = guard
+                    .partitions
+                    .get(&key)
+                    .is_some_and(|p| p.pending_epoch_reset.is_some());
+                if already_resetting {
+                    // A fresh epoch is already acquired and parked; the
+                    // pop above may have drained the last old-epoch
+                    // batch — apply the reset now if so.
+                    if let Some(p) = guard.partitions.get_mut(&key) {
+                        maybe_apply_pending_reset(p);
+                    }
+                } else {
+                    upsert_pending_bump(&mut guard.pending_bumps, key, mode);
+                }
             }
             popped
         };
@@ -407,11 +585,12 @@ impl IdempotentState {
     }
 
     /// Push a batch back onto the front of the partition's in-flight
-    /// queue. Used when a retryable error wants the same batch
-    /// re-dispatched on the next tick without losing its position.
-    #[allow(dead_code)] // wired up when the bump-pass slice lands
+    /// queue. Used by the `MessageTooLarge` split-and-requeue recovery
+    /// to re-insert both halves of an oversized batch ahead of its
+    /// successors without losing per-partition FIFO order.
     pub(crate) fn requeue_inflight_front(&self, batch: InFlightBatch) {
         let key = (batch.topic.clone(), batch.partition);
+        let batch_bytes = batch.encoded.len();
         let mut guard = self.inner.lock().unwrap();
         let part = guard.partitions.entry(key).or_insert_with(|| PartitionState {
             producer_id: batch.producer_id,
@@ -422,8 +601,10 @@ impl IdempotentState {
             next_sequence: increment_sequence(batch.base_sequence, batch.record_count),
             last_acked_sequence: NO_LAST_ACKED,
             in_flight: VecDeque::new(),
+            pending_epoch_reset: None,
         });
         part.in_flight.push_front(batch);
+        self.track_inflight_bytes(batch_bytes);
     }
 
     /// Drain every in-flight batch on `(topic, partition)` so the
@@ -437,7 +618,10 @@ impl IdempotentState {
         let Some(part) = guard.partitions.get_mut(&(topic.clone(), partition)) else {
             return Vec::new();
         };
-        part.in_flight.drain(..).collect()
+        let drained: Vec<InFlightBatch> = part.in_flight.drain(..).collect();
+        let freed: usize = drained.iter().map(|b| b.encoded.len()).sum();
+        self.release_inflight_bytes(freed);
+        drained
     }
 
     /// Reset a partition's sequence space (`next_sequence = 0`,
@@ -453,17 +637,116 @@ impl IdempotentState {
     }
 
     /// Mark `(topic, partition)` as needing an epoch bump on the next
-    /// dispatch tick. The sender drains pending bumps via
-    /// [`Self::take_pending_bumps`].
-    pub(crate) fn request_partition_bump(&self, topic: &TopicName, partition: PartitionId) {
+    /// dispatch tick, tagged with `mode` ([`BumpMode`]). The sender
+    /// drains pending bumps via [`Self::take_pending_bumps`].
+    ///
+    /// A no-op when the partition is already mid-deferred-reset: a fresh
+    /// `(pid, epoch)` is already parked, and its old-epoch in-flight
+    /// batches keep retransmitting under the old epoch until the queue
+    /// drains. `Eager` upgrades a previously-`Deferred` request for the
+    /// same partition (see [`upsert_pending_bump`]).
+    pub(crate) fn request_partition_bump(
+        &self,
+        topic: &TopicName,
+        partition: PartitionId,
+        mode: BumpMode,
+    ) {
         let mut guard = self.inner.lock().unwrap();
-        guard.pending_bumps.insert((topic.clone(), partition));
+        let key = (topic.clone(), partition);
+        if guard
+            .partitions
+            .get(&key)
+            .is_some_and(|p| p.pending_epoch_reset.is_some())
+        {
+            return;
+        }
+        upsert_pending_bump(&mut guard.pending_bumps, key, mode);
     }
 
-    /// Take and clear the set of partitions awaiting an epoch bump.
-    pub(crate) fn take_pending_bumps(&self) -> Vec<(TopicName, PartitionId)> {
+    /// Take and clear the set of partitions awaiting an epoch bump, each
+    /// tagged with the [`BumpMode`] the bump pass must apply.
+    pub(crate) fn take_pending_bumps(&self) -> Vec<((TopicName, PartitionId), BumpMode)> {
         let mut guard = self.inner.lock().unwrap();
         guard.pending_bumps.drain().collect()
+    }
+
+    /// Park a [`BumpMode::Deferred`] epoch bump: the broker has handed
+    /// back a fresh `(new_pid, new_epoch)`, but the partition's
+    /// old-epoch in-flight batches must keep retransmitting under the
+    /// *old* `(pid, epoch)` until the queue drains — only then is it
+    /// safe to swap in the new state and rewind `next_sequence` to 0
+    /// (T3a's exactly-once guard). If the queue is already empty (every
+    /// old-epoch batch acked or terminally failed while the bump request
+    /// was waiting for the pass), the reset is applied immediately.
+    /// Clears any stale `pending_bumps` entry for the partition.
+    pub(crate) fn begin_deferred_epoch_reset(
+        &self,
+        topic: &TopicName,
+        partition: PartitionId,
+        new_pid: i64,
+        new_epoch: i16,
+    ) {
+        let mut guard = self.inner.lock().unwrap();
+        let key = (topic.clone(), partition);
+        guard.pending_bumps.remove(&key);
+        let Some(part) = guard.partitions.get_mut(&key) else {
+            // Partition entry vanished — nothing in flight to drain, and
+            // a later `assign` will start it fresh from the global state.
+            return;
+        };
+        part.pending_epoch_reset = Some((new_pid, new_epoch));
+        // The old-epoch queue may already have drained while the bump
+        // request was waiting for this pass — apply the reset now if so.
+        maybe_apply_pending_reset(part);
+    }
+
+    /// Snapshot every partition the accumulator must NOT drain new
+    /// batches for: one with a pending epoch bump (the next tick's bump
+    /// pass will re-stamp / re-acquire its state) or a parked deferred
+    /// reset (its old-epoch in-flight queue is still draining). The
+    /// `shouldStopDrainBatchesForPartition` analog — see
+    /// [`PartitionState::pending_epoch_reset`].
+    pub(crate) fn drain_blocked_partitions(&self) -> HashSet<(TopicName, PartitionId)> {
+        let guard = self.inner.lock().unwrap();
+        let mut set: HashSet<(TopicName, PartitionId)> =
+            guard.pending_bumps.keys().cloned().collect();
+        for (key, part) in &guard.partitions {
+            if part.pending_epoch_reset.is_some() {
+                set.insert(key.clone());
+            }
+        }
+        set
+    }
+
+    /// True iff `(topic, partition)` is flagged for a [`BumpMode::Eager`]
+    /// bump. The multi-head dispatch loop skips such partitions: their
+    /// in-flight queue is about to be re-stamped wholesale by the next
+    /// tick's bump pass, so re-dispatching the (rejected) head this tick
+    /// would only draw another rejection. A [`BumpMode::Deferred`]
+    /// partition is *not* skipped — its old-epoch batches must keep
+    /// retransmitting to drain the queue toward the parked reset.
+    pub(crate) fn is_eager_bump_pending(&self, topic: &TopicName, partition: PartitionId) -> bool {
+        matches!(
+            self.inner
+                .lock()
+                .unwrap()
+                .pending_bumps
+                .get(&(topic.clone(), partition)),
+            Some(BumpMode::Eager),
+        )
+    }
+
+    /// Drop every in-progress recovery — pending bumps and parked
+    /// deferred resets alike. Called on the fatal-shutdown path
+    /// (`drain_and_fail_everything`) so the subsequent `drain_all` is
+    /// not blocked from flushing a partition's buffered waiters: once
+    /// the producer is fatal, sequence-space recovery is moot.
+    pub(crate) fn abort_all_recovery(&self) {
+        let mut guard = self.inner.lock().unwrap();
+        guard.pending_bumps.clear();
+        for part in guard.partitions.values_mut() {
+            part.pending_epoch_reset = None;
+        }
     }
 
     /// Are there any partitions awaiting a bump? Cheap probe so the
@@ -537,7 +820,15 @@ impl IdempotentState {
         part.producer_epoch = new_epoch;
         part.next_sequence = 0;
         part.last_acked_sequence = NO_LAST_ACKED;
-        part.in_flight.drain(..).collect()
+        // An eager bump fully re-stamps the queue here; a partition can
+        // never be both eager-flagged and mid-deferred-reset (a deferred
+        // reset no-ops any later bump request), but clear it defensively
+        // so a stale `Some` can't wedge `assign` after the rewrite.
+        part.pending_epoch_reset = None;
+        let drained: Vec<InFlightBatch> = part.in_flight.drain(..).collect();
+        let freed: usize = drained.iter().map(|b| b.encoded.len()).sum();
+        self.release_inflight_bytes(freed);
+        drained
     }
 
     /// Snapshot every (topic, partition) the state has seen, so a
@@ -672,6 +963,7 @@ impl IdempotentState {
     /// rewrite has produced new encoded bytes.
     pub(crate) fn install_rewritten_inflight(&self, batch: InFlightBatch) {
         let key = (batch.topic.clone(), batch.partition);
+        let batch_bytes = batch.encoded.len();
         let mut guard = self.inner.lock().unwrap();
         let part = guard.partitions.entry(key).or_insert_with(|| PartitionState {
             producer_id: batch.producer_id,
@@ -679,10 +971,12 @@ impl IdempotentState {
             next_sequence: 0,
             last_acked_sequence: NO_LAST_ACKED,
             in_flight: VecDeque::new(),
+            pending_epoch_reset: None,
         });
         part.next_sequence =
             increment_sequence(batch.base_sequence, batch.record_count);
         part.in_flight.push_back(batch);
+        self.track_inflight_bytes(batch_bytes);
     }
 }
 
@@ -988,7 +1282,7 @@ mod tests {
             producer_id: 1,
             producer_epoch: 0,
         };
-        s.request_partition_bump(&topic("t"), PartitionId(0));
+        s.request_partition_bump(&topic("t"), PartitionId(0), BumpMode::Eager);
         let err = s.assign(&topic("t"), PartitionId(0), 1).unwrap_err();
         assert_eq!(err, AssignError::PartitionBlocked);
         // Other partitions still go through.
@@ -1050,6 +1344,76 @@ mod tests {
         assert_eq!(p.in_flight.front().unwrap().base_sequence, 3);
     }
 
+    /// T2c: the in-flight byte counter tracks `encoded.len()` across
+    /// every queued batch — `register_inflight` adds, `complete`
+    /// subtracts exactly the popped batch's bytes — so
+    /// `Accumulator::reserve` can charge in-flight batches against
+    /// `buffer_memory` (N8). A `complete` that finds no matching head
+    /// must leave the counter untouched.
+    #[test]
+    fn inflight_bytes_tracks_register_and_complete() {
+        let s = IdempotentState::new();
+        s.force_ready_for_test(1, 0);
+        assert_eq!(s.inflight_bytes(), 0, "no in-flight batches yet");
+
+        let _ = s.assign(&topic("t"), PartitionId(0), 3).unwrap();
+        let _ = s.assign(&topic("t"), PartitionId(0), 2).unwrap();
+
+        // register_inflight charges each batch's encoded length.
+        s.register_inflight(InFlightBatch {
+            topic: topic("t"),
+            partition: PartitionId(0),
+            base_sequence: 0,
+            record_count: 3,
+            producer_id: 1,
+            producer_epoch: 0,
+            encoded: Bytes::from_static(b"0123456789"), // 10 bytes
+            waiters: Vec::new(),
+            first_send_at: Instant::now(),
+            attempt: 0,
+            next_attempt_at: Instant::now(),
+        });
+        assert_eq!(s.inflight_bytes(), 10);
+        s.register_inflight(InFlightBatch {
+            topic: topic("t"),
+            partition: PartitionId(0),
+            base_sequence: 3,
+            record_count: 2,
+            producer_id: 1,
+            producer_epoch: 0,
+            encoded: Bytes::from_static(b"abcd"), // 4 bytes
+            waiters: Vec::new(),
+            first_send_at: Instant::now(),
+            attempt: 0,
+            next_attempt_at: Instant::now(),
+        });
+        assert_eq!(s.inflight_bytes(), 14, "counter sums every queued batch");
+
+        // complete pops the head and uncounts exactly its bytes; the
+        // tail batch stays charged.
+        let head = s.complete(&topic("t"), PartitionId(0), 0).unwrap();
+        assert_eq!(head.base_sequence, 0);
+        assert_eq!(
+            s.inflight_bytes(),
+            4,
+            "head's 10 bytes released, tail's 4 remain",
+        );
+
+        // A base_sequence mismatch is a no-op pop — the counter must
+        // not move.
+        assert!(s.complete(&topic("t"), PartitionId(0), 999).is_none());
+        assert_eq!(
+            s.inflight_bytes(),
+            4,
+            "a no-op complete leaves the counter alone",
+        );
+
+        // Completing the last in-flight batch returns the counter to 0.
+        let tail = s.complete(&topic("t"), PartitionId(0), 3).unwrap();
+        assert_eq!(tail.base_sequence, 3);
+        assert_eq!(s.inflight_bytes(), 0, "all batches drained, counter back to 0");
+    }
+
     #[test]
     fn complete_refuses_out_of_order_ack() {
         let s = IdempotentState::new();
@@ -1083,16 +1447,163 @@ mod tests {
     fn pending_bumps_take_clears() {
         let s = IdempotentState::new();
         assert!(!s.has_pending_bumps());
-        s.request_partition_bump(&topic("t"), PartitionId(0));
-        s.request_partition_bump(&topic("u"), PartitionId(2));
+        s.request_partition_bump(&topic("t"), PartitionId(0), BumpMode::Eager);
+        s.request_partition_bump(&topic("u"), PartitionId(2), BumpMode::Deferred);
         assert!(s.has_pending_bumps());
         let mut taken = s.take_pending_bumps();
-        taken.sort_by(|a, b| a.0.as_str().cmp(b.0.as_str()));
+        taken.sort_by(|a, b| a.0.0.as_str().cmp(b.0.0.as_str()));
         assert_eq!(
             taken,
-            vec![(topic("t"), PartitionId(0)), (topic("u"), PartitionId(2))]
+            vec![
+                ((topic("t"), PartitionId(0)), BumpMode::Eager),
+                ((topic("u"), PartitionId(2)), BumpMode::Deferred),
+            ]
         );
         assert!(!s.has_pending_bumps());
+    }
+
+    /// `Eager` upgrades a prior `Deferred` request for the same
+    /// partition; `Deferred` never downgrades an `Eager` one — an eager
+    /// request means the broker provably rejected the head, so an
+    /// immediate whole-queue re-stamp stays sound (`upsert_pending_bump`).
+    #[test]
+    fn eager_bump_request_upgrades_deferred() {
+        let s = IdempotentState::new();
+        s.request_partition_bump(&topic("t"), PartitionId(0), BumpMode::Deferred);
+        s.request_partition_bump(&topic("t"), PartitionId(0), BumpMode::Eager);
+        assert_eq!(
+            s.take_pending_bumps(),
+            vec![((topic("t"), PartitionId(0)), BumpMode::Eager)],
+        );
+
+        // The reverse order does not downgrade.
+        s.request_partition_bump(&topic("u"), PartitionId(1), BumpMode::Eager);
+        s.request_partition_bump(&topic("u"), PartitionId(1), BumpMode::Deferred);
+        assert_eq!(
+            s.take_pending_bumps(),
+            vec![((topic("u"), PartitionId(1)), BumpMode::Eager)],
+        );
+    }
+
+    /// A [`BumpMode::Deferred`] reset parks a fresh `(pid, epoch)` while
+    /// the old-epoch in-flight queue is non-empty: `assign` stays
+    /// blocked, the in-flight head's encoded bytes are untouched, and
+    /// the partition reports as drain-blocked. The moment the last
+    /// old-epoch batch settles via `complete`, the reset applies — the
+    /// partition swaps to the new `(pid, epoch)`, rewinds
+    /// `next_sequence` to 0, and unblocks. Mirrors Java's
+    /// `maybeUpdateProducerIdAndEpoch` `!hasInflightBatches` guard.
+    #[test]
+    fn deferred_reset_parks_then_applies_when_inflight_drains() {
+        let s = IdempotentState::new();
+        s.force_ready_for_test(1, 0);
+        let t = topic("deferred");
+        let p = PartitionId(0);
+
+        // One in-flight batch under the original (pid=1, epoch=0).
+        let _ = s.assign(&t, p, 3).unwrap();
+        let original = Bytes::from_static(b"old-epoch-frame");
+        let original_ptr = original.as_ptr();
+        s.register_inflight(InFlightBatch {
+            topic: t.clone(),
+            partition: p,
+            base_sequence: 0,
+            record_count: 3,
+            producer_id: 1,
+            producer_epoch: 0,
+            encoded: original,
+            waiters: Vec::new(),
+            first_send_at: Instant::now(),
+            attempt: 1,
+            next_attempt_at: Instant::now(),
+        });
+
+        // Park a deferred reset to (pid=99, epoch=7).
+        s.begin_deferred_epoch_reset(&t, p, 99, 7);
+
+        // The in-flight head is byte-for-byte unchanged — a deferred
+        // reset must never re-stamp a batch that may already be on the
+        // broker log.
+        let head = s.snapshot_inflight().into_iter().next().unwrap();
+        assert_eq!(head.encoded.as_ptr(), original_ptr, "head must not be rewritten");
+        assert_eq!(head.base_sequence, 0);
+
+        // `assign` is blocked and the partition is drain-blocked while
+        // the reset is parked.
+        assert_eq!(
+            s.assign(&t, p, 1).unwrap_err(),
+            AssignError::PartitionBlocked,
+        );
+        assert!(s.drain_blocked_partitions().contains(&(t.clone(), p)));
+
+        // Settle the last old-epoch batch — the queue empties, so the
+        // parked reset fires.
+        let _ = s.complete(&t, p, 0).expect("head completes");
+
+        // Reset applied: new (pid, epoch), next_sequence rewound to 0.
+        let assigned = s.assign(&t, p, 2).expect("partition unblocked after drain");
+        assert_eq!(assigned.producer_id, 99);
+        assert_eq!(assigned.producer_epoch, 7);
+        assert_eq!(assigned.base_sequence, 0);
+        assert!(!s.drain_blocked_partitions().contains(&(t, p)));
+    }
+
+    /// If a partition's old-epoch in-flight queue has *already* drained
+    /// by the time the bump pass runs `begin_deferred_epoch_reset`, the
+    /// reset is applied immediately rather than parked — there is
+    /// nothing accepted-but-unconfirmed left to wait for.
+    #[test]
+    fn deferred_reset_applies_immediately_when_inflight_already_empty() {
+        let s = IdempotentState::new();
+        s.force_ready_for_test(1, 0);
+        let t = topic("deferred-empty");
+        let p = PartitionId(0);
+        // Touch the partition entry (empty in-flight queue).
+        let _ = s.assign(&t, p, 4).unwrap();
+
+        s.begin_deferred_epoch_reset(&t, p, 55, 3);
+
+        // No parked reset — `assign` is immediately unblocked under the
+        // new state with `next_sequence` rewound to 0.
+        assert!(!s.drain_blocked_partitions().contains(&(t.clone(), p)));
+        let assigned = s.assign(&t, p, 1).expect("unblocked");
+        assert_eq!(assigned.producer_id, 55);
+        assert_eq!(assigned.producer_epoch, 3);
+        assert_eq!(assigned.base_sequence, 0);
+    }
+
+    /// While a deferred reset is parked, a further bump request (eager
+    /// or deferred) is a no-op: the partition already has a fresh epoch
+    /// acquired, and its old-epoch in-flight batches must keep
+    /// retransmitting under the old epoch until the queue drains.
+    #[test]
+    fn bump_request_is_noop_while_deferred_reset_parked() {
+        let s = IdempotentState::new();
+        s.force_ready_for_test(1, 0);
+        let t = topic("noop");
+        let p = PartitionId(0);
+        let _ = s.assign(&t, p, 1).unwrap();
+        s.register_inflight(InFlightBatch {
+            topic: t.clone(),
+            partition: p,
+            base_sequence: 0,
+            record_count: 1,
+            producer_id: 1,
+            producer_epoch: 0,
+            encoded: Bytes::from_static(b"x"),
+            waiters: Vec::new(),
+            first_send_at: Instant::now(),
+            attempt: 0,
+            next_attempt_at: Instant::now(),
+        });
+        s.begin_deferred_epoch_reset(&t, p, 2, 1);
+
+        s.request_partition_bump(&t, p, BumpMode::Eager);
+        s.request_partition_bump(&t, p, BumpMode::Deferred);
+        assert!(
+            !s.has_pending_bumps(),
+            "a bump request must be a no-op while a deferred reset is parked",
+        );
     }
 
     #[test]
@@ -1214,7 +1725,7 @@ mod tests {
             next_attempt_at: Instant::now(),
         });
 
-        s.fail_inflight_head(&topic("t"), PartitionId(0), || {
+        s.fail_inflight_head(&topic("t"), PartitionId(0), BumpMode::Deferred, || {
             Error::RequestTimeout("synthetic-delivery-timeout".into())
         });
 
@@ -1243,7 +1754,7 @@ mod tests {
         // Touch the partition entry so it exists but has no in-flight.
         let _ = s.assign(&topic("t"), PartitionId(0), 0).unwrap();
 
-        s.fail_inflight_head(&topic("t"), PartitionId(0), || {
+        s.fail_inflight_head(&topic("t"), PartitionId(0), BumpMode::Deferred, || {
             Error::RequestTimeout("nothing to pop".into())
         });
 

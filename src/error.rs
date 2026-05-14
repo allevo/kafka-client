@@ -39,6 +39,25 @@ pub enum Error {
     /// every subsequent `Producer::send` resolves with this same
     /// error. Classified as `Fatal`.
     IdempotenceFenced(String),
+    /// A single record's estimated wire size exceeds the configured
+    /// `max_record_size`. Raised synchronously by `Producer::send`
+    /// before the record is buffered, so no batch is mutated and no
+    /// waiter is allocated. Mirrors Java's `RecordTooLargeException`.
+    /// Classified as `Fatal`: the record can never fit, so retrying
+    /// the same payload is pointless.
+    RecordTooLarge {
+        size: usize,
+        limit: usize,
+    },
+    /// `Producer::send` could not reserve `buffer_memory` budget for a
+    /// record within the `max_block` deadline: the accumulator is
+    /// holding `buffer_memory` bytes the sender has not drained yet.
+    /// Raised synchronously by `send` before the record is buffered, so
+    /// no batch is mutated and no waiter is allocated. Mirrors Java's
+    /// `BufferExhaustedException`. Classified as `Retry`: the cap is a
+    /// transient client-side condition, so the same record may succeed
+    /// once the sender drains buffered batches.
+    BufferFull(String),
 }
 
 /// Direction of a metadata-propagation wait.
@@ -102,6 +121,13 @@ impl Error {
             // poll round won't unblock on its own.
             Error::TopicPropagationTimeout { .. } => RetryAction::Retry,
             Error::IdempotenceFenced(_) => RetryAction::Fatal,
+            // The payload is over the size cap; no retry of the same
+            // record can ever succeed.
+            Error::RecordTooLarge { .. } => RetryAction::Fatal,
+            // The local buffer is full, not the cluster — a metadata
+            // refresh would not free a byte. Plain `Retry`: the same
+            // record can succeed once the sender drains buffered work.
+            Error::BufferFull(_) => RetryAction::Retry,
         }
     }
 
@@ -224,6 +250,11 @@ impl fmt::Display for Error {
                 topic.as_str()
             ),
             Error::IdempotenceFenced(msg) => write!(f, "idempotence fenced: {msg}"),
+            Error::RecordTooLarge { size, limit } => write!(
+                f,
+                "record too large: estimated {size} bytes exceeds max_record_size of {limit} bytes"
+            ),
+            Error::BufferFull(msg) => write!(f, "buffer full: {msg}"),
         }
     }
 }
@@ -400,6 +431,26 @@ mod tests {
     }
 
     #[test]
+    fn record_too_large_is_fatal() {
+        assert_eq!(
+            Error::RecordTooLarge {
+                size: 4096,
+                limit: 1024,
+            }
+            .classify(),
+            RetryAction::Fatal,
+        );
+    }
+
+    #[test]
+    fn buffer_full_is_retry() {
+        assert_eq!(
+            Error::BufferFull("buffer_memory exhausted".into()).classify(),
+            RetryAction::Retry,
+        );
+    }
+
+    #[test]
     fn topic_propagation_timeout_is_retry() {
         let e = Error::TopicPropagationTimeout {
             topic: TopicName::from(kafka_protocol::protocol::StrBytes::from_static_str("t")),
@@ -423,6 +474,11 @@ mod tests {
                 topic: TopicName::from(kafka_protocol::protocol::StrBytes::from_static_str("t")),
                 direction: PropagationDirection::Gone,
             },
+            Error::RecordTooLarge {
+                size: 4096,
+                limit: 1024,
+            },
+            Error::BufferFull("x".into()),
             broker(ResponseError::NotLeaderOrFollower),
             broker(ResponseError::RequestTimedOut),
             broker(ResponseError::TransactionAbortable),

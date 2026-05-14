@@ -17,7 +17,9 @@ pub use consumer::{
     Consumer, ConsumerConfig, ConsumerRecord, IsolationLevel, OffsetReset, TopicPartition,
 };
 pub use error::{Error, PropagationDirection};
-pub use producer::{Acks, Producer, ProducerConfig, ProducerRecord, RecordMetadata, SendFuture};
+pub use producer::{
+    Acks, BufferFullPolicy, Producer, ProducerConfig, ProducerRecord, RecordMetadata, SendFuture,
+};
 pub use secret::SecretString;
 
 pub use kafka_protocol::messages::{BrokerId, TopicName};

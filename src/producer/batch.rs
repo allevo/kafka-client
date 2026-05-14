@@ -1,6 +1,7 @@
 use std::time::{Duration, Instant};
 
 use bytes::{Bytes, BytesMut};
+use kafka_protocol::ResponseError;
 use kafka_protocol::indexmap::IndexMap;
 use kafka_protocol::protocol::StrBytes;
 use kafka_protocol::records::{
@@ -77,6 +78,18 @@ impl BatchProducerState {
     }
 }
 
+/// A [`PartitionBatch::freeze`] that failed *after* the batch was
+/// drained out of the accumulator. Carries the per-record `waiters`
+/// back to the caller so the drain path can resolve them with `error`
+/// (the real cause) instead of dropping the oneshot senders — a
+/// dropped sender surfaces to the user as a misleading
+/// `Error::Protocol("producer closed")`.
+#[derive(Debug)]
+pub(crate) struct FreezeError {
+    pub error: Error,
+    pub waiters: Vec<oneshot::Sender<Result<RecordMetadata>>>,
+}
+
 /// When it is the time, the `PartitionBatch` is
 /// transformed into `FrozenBatch` so it is ready
 /// to send to the broker
@@ -104,6 +117,14 @@ pub(crate) struct PartitionBatch {
     size_estimator: SizeEstimator,
     attempt: u32,
     full: bool,
+    /// Sum of `estimate_record_size` over every appended record — i.e.
+    /// the exact `buffer_memory` budget `Producer::send` reserved for
+    /// this batch's records. When the accumulator drains the batch, it
+    /// releases this many bytes back to the budget, keeping `reserve`
+    /// and the drain-time release symmetric (the batch-header overhead
+    /// the `SizeEstimator` adds is deliberately *not* counted here —
+    /// `reserve` never claimed it).
+    reserved_bytes: usize,
 }
 
 impl PartitionBatch {
@@ -116,6 +137,7 @@ impl PartitionBatch {
             size_estimator: SizeEstimator::new(),
             attempt: 0,
             full: false,
+            reserved_bytes: 0,
         }
     }
 
@@ -124,6 +146,16 @@ impl PartitionBatch {
         payload: RecordPayload,
         max_batch_bytes: usize,
     ) -> AppendOutcome {
+        // Estimate before the payload's `Bytes` are moved into `record` —
+        // the running batch estimate is uncompressed bytes, same unit the
+        // accumulator's `max_record_size` guard uses.
+        let record_size =
+            estimate_record_size(payload.key.as_ref(), payload.value.as_ref(), &payload.headers);
+        // Same number `Producer::send` reserved against `buffer_memory`
+        // for this record; tracked so the accumulator can release it on
+        // drain.
+        self.reserved_bytes += record_size;
+
         // Per-record positional fields are bound here:
         //   - `sequence = offset` keeps `(offset - sequence)` constant so
         //     the `kafka_protocol` encoder packs every record into a single
@@ -149,7 +181,7 @@ impl PartitionBatch {
             control: false,
         };
 
-        self.size_estimator.add_record_estimation(&record);
+        self.size_estimator.add(record_size);
         let is_full = self.size_estimator.is_full(max_batch_bytes);
         self.full = is_full;
 
@@ -197,13 +229,33 @@ impl PartitionBatch {
         now.saturating_duration_since(self.created_at)
     }
 
+    /// Total `buffer_memory` budget reserved for this batch's records —
+    /// the amount the accumulator releases when it drains the batch.
+    pub(crate) fn reserved_bytes(&self) -> usize {
+        self.reserved_bytes
+    }
+
     /// Encode the batch into a single RecordBatch v2 frame, suitable for
     /// `ProduceRequest.topic_data[_].partition_data[_].records`.
+    ///
+    /// `max_request_size` caps the *encoded* frame: the accumulator's
+    /// `batch_size_bytes` estimate is uncompressed and approximate, so a
+    /// frame can still land over the cap (compression amplification on
+    /// incompressible data, or estimator undershoot). Such a frame would
+    /// be rejected by the broker as `MESSAGE_TOO_LARGE`; surface it here
+    /// as `Error::Broker { MessageTooLarge }` instead.
+    ///
+    /// On *any* failure the batch's `waiters` are handed back inside the
+    /// [`FreezeError`] rather than dropped: the drain path is the only
+    /// thing still holding them, so dropping the senders here would
+    /// strand every `Producer::send` for this batch on a misleading
+    /// `producer closed` error (F4).
     pub(crate) fn freeze(
         mut self,
         state: BatchProducerState,
         compression: Compression,
-    ) -> Result<FrozenBatch> {
+        max_request_size: usize,
+    ) -> std::result::Result<FrozenBatch, FreezeError> {
         // Force the v2-batch invariants uniformly across every record. The
         // per-record `sequence` runs `base_sequence + i`; the encoder reads
         // the first record's `sequence` as the batch-level `base_sequence`,
@@ -223,10 +275,28 @@ impl PartitionBatch {
             compression,
         };
         let mut buf = BytesMut::new();
-        RecordBatchEncoder::encode(&mut buf, self.records.iter(), &options)
-            .map_err(|e| Error::Protocol(format!("record batch encode: {e}")))?;
+        if let Err(e) = RecordBatchEncoder::encode(&mut buf, self.records.iter(), &options) {
+            return Err(FreezeError {
+                error: Error::Protocol(format!("record batch encode: {e}")),
+                waiters: self.waiters,
+            });
+        }
+        let encoded = buf.freeze();
+
+        // Post-encode guard: check the real (post-compression) frame, not
+        // the uncompressed `append`-time estimate. An over-cap frame is
+        // refused here rather than handed to the broker.
+        if encoded.len() > max_request_size {
+            return Err(FreezeError {
+                error: Error::Broker {
+                    error: ResponseError::MessageTooLarge,
+                },
+                waiters: self.waiters,
+            });
+        }
+
         Ok(FrozenBatch {
-            encoded: buf.freeze(),
+            encoded,
             waiters: self.waiters,
             record_count: self.records.len(),
             first_send_at: self.first_send_at,
@@ -236,7 +306,41 @@ impl PartitionBatch {
     }
 }
 
-/// Make size estimation for v2 PartitionBatch
+/// Estimate the uncompressed v2 wire footprint of a single record: a
+/// fixed per-record overhead plus key, value, and header bytes. This is
+/// the unit the accumulator's batch-size estimator sums, the unit
+/// `Accumulator::append` checks against `max_record_size`, and the unit
+/// `Producer::send` reserves against `buffer_memory` — so it is taken on
+/// both the `ProducerRecord` (in `send`, before a `RecordPayload`
+/// exists) and the `RecordPayload` (in `append`). It is an estimate, not
+/// the exact encoded length — varint field widths and compression are
+/// not modelled — so it is only ever compared against approximate caps.
+pub(crate) fn estimate_record_size(
+    key: Option<&Bytes>,
+    value: Option<&Bytes>,
+    headers: &IndexMap<StrBytes, Option<Bytes>>,
+) -> usize {
+    const PER_RECORD_OVERHEAD: usize = 24;
+    const PER_HEADER_OVERHEAD: usize = 8;
+
+    let mut size = PER_RECORD_OVERHEAD;
+    if let Some(k) = key {
+        size += k.len();
+    }
+    if let Some(v) = value {
+        size += v.len();
+    }
+    for (hk, hv) in headers {
+        size += PER_HEADER_OVERHEAD + hk.len();
+        if let Some(v) = hv.as_ref() {
+            size += v.len();
+        }
+    }
+    size
+}
+
+/// Running uncompressed-size estimate for a v2 `PartitionBatch`, seeded
+/// with the fixed batch-header overhead.
 struct SizeEstimator(usize);
 impl SizeEstimator {
     fn new() -> Self {
@@ -246,25 +350,9 @@ impl SizeEstimator {
         Self(BATCH_HEADER_OVERHEAD)
     }
 
-    /// Update self estimation
-    fn add_record_estimation(&mut self, record: &Record) {
-        const PER_RECORD_OVERHEAD: usize = 24;
-        const PER_HEADER_OVERHEAD: usize = 8;
-
-        let mut size = PER_RECORD_OVERHEAD;
-        if let Some(k) = record.key.as_ref() {
-            size += k.len();
-        }
-        if let Some(v) = record.value.as_ref() {
-            size += v.len();
-        }
-        for (hk, hv) in &record.headers {
-            size += PER_HEADER_OVERHEAD + hk.len();
-            if let Some(v) = hv.as_ref() {
-                size += v.len();
-            }
-        }
-        self.0 += size
+    /// Add one record's estimated size (see [`estimate_record_size`]).
+    fn add(&mut self, record_size: usize) {
+        self.0 += record_size;
     }
 
     fn is_full(&self, threshold: usize) -> bool {
@@ -357,7 +445,11 @@ mod tests {
         let _ = batch.append(with_header, usize::MAX);
 
         let frozen = batch
-            .freeze(BatchProducerState::non_idempotent(), Compression::None)
+            .freeze(
+                BatchProducerState::non_idempotent(),
+                Compression::None,
+                usize::MAX,
+            )
             .expect("encode");
         assert_eq!(frozen.record_count, 3);
 
@@ -420,10 +512,18 @@ mod tests {
         }
 
         let frozen_plain = plain
-            .freeze(BatchProducerState::non_idempotent(), Compression::None)
+            .freeze(
+                BatchProducerState::non_idempotent(),
+                Compression::None,
+                usize::MAX,
+            )
             .expect("encode plain");
         let frozen_gz = gzipped
-            .freeze(BatchProducerState::non_idempotent(), Compression::Gzip)
+            .freeze(
+                BatchProducerState::non_idempotent(),
+                Compression::Gzip,
+                usize::MAX,
+            )
             .expect("encode gzip");
         assert_ne!(
             frozen_plain.encoded, frozen_gz.encoded,
@@ -444,6 +544,51 @@ mod tests {
         }
     }
 
+    #[test]
+    fn freeze_rejects_batch_exceeding_max_request_size() {
+        // Variant 1 — Compression::None: a single 4 KiB record encodes
+        // to a frame well over a 1 KiB cap, so freeze must reject it as
+        // MessageTooLarge rather than hand an oversized frame to the
+        // broker.
+        let mut over = PartitionBatch::new(Instant::now());
+        let _ = over.append(big_value_payload(4096), usize::MAX);
+        match over.freeze(
+            BatchProducerState::non_idempotent(),
+            Compression::None,
+            1024,
+        ) {
+            Err(FreezeError {
+                error: Error::Broker { error },
+                ..
+            }) => assert_eq!(error, ResponseError::MessageTooLarge),
+            Err(FreezeError { error, .. }) => {
+                panic!("expected Broker(MessageTooLarge), got {error}")
+            }
+            Ok(_) => panic!("over-cap uncompressed frame must be rejected"),
+        }
+
+        // Variant 2 — Compression::Gzip: the same highly repetitive
+        // payload, four copies of it, compresses far below the 1 KiB
+        // cap. freeze succeeds — proving the guard measures the real
+        // post-compression frame, not the uncompressed append estimate.
+        let mut compressible = PartitionBatch::new(Instant::now());
+        for _ in 0..4 {
+            let _ = compressible.append(big_value_payload(4096), usize::MAX);
+        }
+        let frozen = compressible
+            .freeze(
+                BatchProducerState::non_idempotent(),
+                Compression::Gzip,
+                1024,
+            )
+            .expect("gzip of a repetitive payload fits under the cap");
+        assert!(
+            frozen.encoded.len() <= 1024,
+            "gzip frame {} B should be under the 1 KiB cap",
+            frozen.encoded.len(),
+        );
+    }
+
     #[tokio::test]
     async fn waiters_survive_freeze() {
         let mut batch = PartitionBatch::new(Instant::now());
@@ -451,7 +596,11 @@ mod tests {
         let out2 = batch.append(sample_payload(None, Some(b"b")), usize::MAX);
 
         let frozen = batch
-            .freeze(BatchProducerState::non_idempotent(), Compression::None)
+            .freeze(
+                BatchProducerState::non_idempotent(),
+                Compression::None,
+                usize::MAX,
+            )
             .expect("encode");
         assert_eq!(frozen.waiters.len(), 2);
 
@@ -494,6 +643,7 @@ mod tests {
             .freeze(
                 BatchProducerState::idempotent(123, 7, 100),
                 Compression::None,
+                usize::MAX,
             )
             .expect("encode");
         assert_eq!(frozen.record_count, 3);

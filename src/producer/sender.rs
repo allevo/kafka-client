@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -6,17 +6,22 @@ use bytes::{Bytes, BytesMut};
 use kafka_protocol::ResponseError;
 use kafka_protocol::messages::produce_request::{PartitionProduceData, TopicProduceData};
 use kafka_protocol::messages::{ApiKey, BrokerId, ProduceRequest, ProduceResponse, TopicName};
+use kafka_protocol::records::{
+    Compression, Record, RecordBatchDecoder, RecordBatchEncoder, RecordEncodeOptions,
+};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
 
 use crate::client::{CallOptions, Client, NodeTarget, PartitionId, find_partition};
 use crate::error::{Error, Result, RetryAction};
-use crate::producer::accumulator::{Accumulator, PendingBatch, ReadyBatch};
+use crate::producer::accumulator::{
+    Accumulator, DrainOutcome, FreezeFailure, PendingBatch, ReadyBatch,
+};
 use crate::producer::batch::BatchProducerState;
 use crate::producer::batch_rewrite::rewrite_producer_state;
 use crate::producer::idempotent::{
-    Assigned, IdempotentState, InFlightBatch, increment_sequence, request_epoch_bump,
+    Assigned, BumpMode, IdempotentState, InFlightBatch, increment_sequence, request_epoch_bump,
 };
 use crate::producer::{Acks, ProducerConfig};
 
@@ -114,17 +119,21 @@ async fn dispatch_non_idempotent(
     config: &ProducerConfig,
     is_final: bool,
 ) {
-    let drained = drain(accumulator, is_final, |_, _, _| {
+    let DrainOutcome { ready, failed } = drain(accumulator, is_final, |_, _, _| {
         BatchProducerState::non_idempotent()
     });
-    let ready = match drained {
-        Ok(r) if r.is_empty() => return,
-        Ok(r) => r,
-        Err(e) => {
-            tracing::error!(error = %e, "accumulator drain failed");
-            return;
-        }
-    };
+
+    // Drain-time freeze failures: resolve each batch's waiters with the
+    // real cause instead of letting the oneshot senders drop — a
+    // dropped sender would surface to the caller as a misleading
+    // `producer closed` error (F4).
+    for FreezeFailure { waiters, error, .. } in failed {
+        notify_waiters_the_failure(waiters, || clone_error(&error));
+    }
+
+    if ready.is_empty() {
+        return;
+    }
 
     // Group by leader
     let by_leader = group_by_leader(client, ready);
@@ -187,7 +196,7 @@ async fn dispatch_idempotent(
     // `Sender.maybeWaitForProducerId` flips the producer to a terminal
     // state on equivalent control-flow violations; mirror that here.
     let mut assign_failure: Option<String> = None;
-    let drained = drain(accumulator, is_final, |topic, partition, count| {
+    let DrainOutcome { ready, failed } = drain(accumulator, is_final, |topic, partition, count| {
         if assign_failure.is_some() {
             // Producer is on its way to fatal; the post-drain handler
             // below fails every drained batch's waiters. The state we
@@ -203,13 +212,13 @@ async fn dispatch_idempotent(
         }
     });
 
-    let ready = match drained {
-        Ok(r) => r,
-        Err(e) => {
-            tracing::error!(error = %e, "accumulator drain failed");
-            return;
-        }
-    };
+    // Drain-time freeze failures surface here instead of being dropped
+    // (F4): resolve each batch's waiters with the real cause and flag
+    // its partition for the epoch bump that repairs the sequence gap
+    // (N1). Done before the `assign_failure` check so these waiters
+    // learn the *freeze* cause; if `assign_failure` is also set the
+    // producer goes fatal next and the bump flags are inert.
+    handle_idempotent_freeze_failures(idem, failed);
 
     if let Some(reason) = assign_failure {
         // mark_fatal already fired inside assign_or_fail. Resolve the
@@ -251,23 +260,40 @@ async fn dispatch_idempotent(
         });
     }
 
-    // Build the list of in-flight batches to dispatch, per partition.
-    // We re-dispatch every in-flight entry every tick: the broker dedups
-    // on (producer_id, base_sequence) so retransmits are safe. The
-    // dispatch loop is bounded in practice by `delivery_timeout`;
+    // Multi-head dispatch (T3a): ship up to `max_in_flight_per_broker`
+    // rounds this tick. Each round re-snapshots the in-flight heads,
+    // dispatches them, and fully settles before the next round runs —
+    // so a round that acks pops the heads and the next round's snapshot
+    // advances to each partition's *next* in-flight batch. The effect is
+    // up to N batches per partition reaching the broker per tick without
+    // waiting a full linger interval between a partition's consecutive
+    // batches. Because rounds are strictly sequential, every recovery op
+    // stays head-targeted: `complete` / `fail_inflight_head` always act
+    // on the batch the round actually shipped. The broker dedups on
+    // `(producer_id, base_sequence)`, so retransmits are safe;
     // `retries` is a no-op in the idempotent path (auto-coerced to
-    // u32::MAX and only the wall clock advances `attempt`).
-    let to_dispatch = collect_dispatchable(config, idem, now);
-
-    if to_dispatch.is_empty() {
-        return;
+    // `u32::MAX`, only the wall clock advances `attempt`).
+    let rounds = config.max_in_flight_per_broker.max(1);
+    for _ in 0..rounds {
+        let now = Instant::now();
+        let to_dispatch = collect_dispatchable(config, idem, now);
+        if to_dispatch.is_empty() {
+            break;
+        }
+        let by_leader = group_inflight_by_leader(client, idem, to_dispatch);
+        for (leader, partition_batches) in by_leader {
+            send_to_leader_idempotent(client, accumulator, idem, config, leader, partition_batches)
+                .await;
+        }
     }
 
-    // Group by leader and dispatch.
-    let by_leader = group_inflight_by_leader(client, idem, to_dispatch);
-    for (leader, partition_batches) in by_leader {
-        send_to_leader_idempotent(client, idem, config, leader, partition_batches).await;
-    }
+    // `collect_dispatchable` may have failed expired / over-retry heads
+    // without dispatching anything, freeing in-flight bytes. Wake any
+    // `Producer::send` parked on the buffer cap so it re-checks against
+    // the freed budget instead of waiting out a linger tick (T2c / N8).
+    // Harmless when a round did dispatch — `send_to_leader_idempotent`
+    // already notifies, and a spurious wake just re-checks and re-parks.
+    accumulator.notify_room();
 }
 
 /// Snapshot of one in-flight batch needed by the per-leader
@@ -281,12 +307,15 @@ struct InflightSnapshot {
 }
 
 /// Drain — same API for both paths so the closure-driven freeze stays
-/// in one place.
+/// in one place. Returns a [`DrainOutcome`]: cleanly frozen batches in
+/// `ready`, plus any whose `freeze` failed in `failed`. The caller must
+/// resolve the `failed` waiters — silently dropping them is no longer a
+/// tolerated path (T2b).
 fn drain(
     accumulator: &Accumulator,
     is_final: bool,
     state_for: impl FnMut(&TopicName, PartitionId, usize) -> BatchProducerState,
-) -> Result<Vec<ReadyBatch>> {
+) -> DrainOutcome {
     if is_final {
         accumulator.drain_all(state_for)
     } else {
@@ -338,30 +367,50 @@ fn collect_dispatchable(
     let snapshots = idem.snapshot_inflight();
     let mut out = Vec::with_capacity(snapshots.len());
     for snap in snapshots {
+        // T3a: skip a partition flagged for an *eager* bump — its
+        // in-flight queue is about to be re-stamped wholesale by the
+        // next tick's bump pass, so re-dispatching the (provably
+        // rejected) head would only draw another rejection. Eager flags
+        // are normally cleared by `run_bump_pass` before this runs; one
+        // survives here only when the multi-head loop's prior round
+        // flagged it, or a bump request failed transiently. A
+        // *deferred*-flagged partition is NOT skipped — its old-epoch
+        // batches must keep retransmitting to drain the queue toward the
+        // parked reset.
+        if idem.is_eager_bump_pending(&snap.topic, snap.partition) {
+            continue;
+        }
         if snap.attempt as u32 > config.retries {
             // Exceeded retries — fail and drop. Flag the partition for
             // an epoch bump in the same step: `assign()` advanced
             // `next_sequence` eagerly when this batch was frozen, so
             // popping without bumping leaves a sequence gap the broker
-            // would reject as `OutOfOrderSequence` on the next send.
+            // would reject as `OutOfOrderSequence` on the next send. The
+            // bump is `Deferred`: the head is given up on without a
+            // broker rejection, so — once multi-head dispatch is in
+            // play — a successor may already have been accepted; the
+            // queue must drain under the old epoch before the reset.
             let reason = format!(
                 "exceeded {} retries for {}-{}",
                 config.retries,
                 snap.topic.as_str(),
                 snap.partition.0
             );
-            idem.fail_inflight_head(&snap.topic, snap.partition, || {
+            idem.fail_inflight_head(&snap.topic, snap.partition, BumpMode::Deferred, || {
                 Error::RequestTimeout(reason.clone())
             });
             continue;
         }
         if now.saturating_duration_since(snap.first_send_at) > config.delivery_timeout {
+            // Same `Deferred` rationale as the retries-exceeded arm: a
+            // timed-out head may have been accepted-but-unconfirmed
+            // (its response merely lost), so the bump must not re-stamp.
             let reason = format!(
                 "delivery_timeout exceeded for {}-{}",
                 snap.topic.as_str(),
                 snap.partition.0
             );
-            idem.fail_inflight_head(&snap.topic, snap.partition, || {
+            idem.fail_inflight_head(&snap.topic, snap.partition, BumpMode::Deferred, || {
                 Error::RequestTimeout(reason.clone())
             });
             continue;
@@ -411,9 +460,13 @@ fn group_inflight_by_leader(
             // partition for a bump. The encoded bytes carry sequence
             // numbers we can't reuse with a different leader cleanly,
             // and `assign()` already advanced `next_sequence` past
-            // them, so the bump is what closes the resulting gap.
+            // them, so the bump is what closes the resulting gap. The
+            // bump is `Deferred`: the head couldn't dispatch this tick,
+            // but it (or a successor) may have been dispatched and
+            // accepted on a prior tick — no broker rejection was seen,
+            // so the queue must drain under the old epoch first.
             let topic_str = snap.topic.as_str().to_string();
-            idem.fail_inflight_head(&snap.topic, snap.partition, || {
+            idem.fail_inflight_head(&snap.topic, snap.partition, BumpMode::Deferred, || {
                 Error::NoBrokerAvailable(format!("topic '{topic_str}' metadata gone"))
             });
             continue;
@@ -421,7 +474,7 @@ fn group_inflight_by_leader(
         let Some(part) = find_partition(&meta.partitions, snap.partition) else {
             let topic_str = snap.topic.as_str().to_string();
             let partition_index = snap.partition.0;
-            idem.fail_inflight_head(&snap.topic, snap.partition, || {
+            idem.fail_inflight_head(&snap.topic, snap.partition, BumpMode::Deferred, || {
                 Error::NoBrokerAvailable(format!(
                     "no leader for {topic_str}-{partition_index}"
                 ))
@@ -433,10 +486,60 @@ fn group_inflight_by_leader(
     by_leader
 }
 
-/// Non-idempotent send-to-leader: today's behaviour preserved verbatim
-/// for `enable_idempotence = false`. No per-batch retry, no in-flight
-/// tracking.
+/// Non-idempotent send-to-leader. Ships a leader's drained batches in
+/// successive rounds — one batch per partition per `ProduceRequest` —
+/// because the broker rejects a request carrying more than one v2
+/// record batch for the same partition (`LogValidator`:
+/// "Compressed outer record has more than one batch"). Mirrors Java's
+/// `RecordAccumulator.drainBatchesForOneNode`, which polls a single
+/// `ProducerBatch` per partition per drain. No per-batch retry, no
+/// in-flight tracking.
 async fn send_to_leader_basic(
+    client: &Client,
+    leader: BrokerId,
+    acks: Acks,
+    batches: Vec<ReadyBatch>,
+) {
+    for round in rounds_by_partition(batches) {
+        send_one_round_basic(client, leader, acks, round).await;
+    }
+}
+
+/// Split a leader's drained batches into successive dispatch rounds,
+/// each carrying at most one batch per partition. Per-partition FIFO
+/// order is preserved: a partition's first-drained batch lands in
+/// round 0, its second in round 1, and so on. The accumulator rotates
+/// a hot partition into several batches per drain, so without this
+/// they would have to ship in one request — which the broker refuses.
+fn rounds_by_partition(batches: Vec<ReadyBatch>) -> Vec<Vec<ReadyBatch>> {
+    let mut by_partition: HashMap<(TopicName, PartitionId), VecDeque<ReadyBatch>> =
+        HashMap::new();
+    for batch in batches {
+        by_partition
+            .entry((batch.topic.clone(), batch.partition))
+            .or_default()
+            .push_back(batch);
+    }
+    let mut rounds: Vec<Vec<ReadyBatch>> = Vec::new();
+    loop {
+        // One batch off the front of every partition still holding
+        // batches — that is exactly one dispatch round.
+        let round: Vec<ReadyBatch> = by_partition
+            .values_mut()
+            .filter_map(VecDeque::pop_front)
+            .collect();
+        if round.is_empty() {
+            break;
+        }
+        rounds.push(round);
+    }
+    rounds
+}
+
+/// Ship one round — at most one batch per partition — as a single
+/// `ProduceRequest` and settle its waiters. `batches` must already be
+/// deduplicated to one entry per partition (see `rounds_by_partition`).
+async fn send_one_round_basic(
     client: &Client,
     leader: BrokerId,
     acks: Acks,
@@ -545,6 +648,7 @@ async fn send_to_leader_basic(
 /// the recovery state machine.
 async fn send_to_leader_idempotent(
     client: &Client,
+    accumulator: &Accumulator,
     idem: &Arc<IdempotentState>,
     config: &ProducerConfig,
     leader: BrokerId,
@@ -611,6 +715,14 @@ async fn send_to_leader_idempotent(
             idem.bump_attempts(&keys, client.retry_backoff(), client.retry_backoff_max());
         }
     }
+
+    // T2c / N8: settling the response above may have dropped batches
+    // out of the in-flight queue — completed acks, terminal failures,
+    // `MessageTooLarge` splits all change `idem.inflight_bytes()`. Wake
+    // any `Producer::send` parked on the buffer cap so it re-checks
+    // against the freed budget instead of waiting out a linger tick.
+    // (Harmless on the transport-error path, where nothing was popped.)
+    accumulator.notify_room();
 }
 
 /// Match the broker's per-partition response against the in-flight
@@ -715,7 +827,11 @@ fn settle_response_idempotent(
                     base_sequence,
                     "OutOfOrderSequence — flagging partition for epoch bump",
                 );
-                idem.request_partition_bump(&topic, partition);
+                // Eager: a rejected head implies every higher-sequence
+                // successor is also rejected, so nothing in the queue
+                // can have been accepted — the bump pass re-stamps it
+                // all from `base_sequence = 0` immediately.
+                idem.request_partition_bump(&topic, partition, BumpMode::Eager);
             }
             Some(ResponseError::UnknownProducerId) => {
                 // Broker forgot us. If the head is also the only
@@ -742,7 +858,10 @@ fn settle_response_idempotent(
                             partition = partition.0,
                             "UnknownProducerId with predecessors in flight — flagging for bump",
                         );
-                        idem.request_partition_bump(&topic, partition);
+                        // Eager: the broker has no state for this
+                        // producer-id, so nothing under it was accepted
+                        // — re-stamp the whole queue immediately.
+                        idem.request_partition_bump(&topic, partition, BumpMode::Eager);
                     }
                     None => {
                         // No in-flight batch carries this base_sequence:
@@ -783,6 +902,19 @@ fn settle_response_idempotent(
                 drain_all_partition_waiters(idem, &reason);
                 return;
             }
+            Some(ResponseError::MessageTooLarge) => {
+                // The frozen frame exceeded the broker's
+                // `message.max.bytes`. Split the in-flight head into
+                // two halves under the same `(pid, epoch)` — sequences
+                // preserved, not reallocated — and requeue both for the
+                // next dispatch tick. A single-record batch can't be
+                // split and fails its waiter (see
+                // `recover_message_too_large`). This must precede the
+                // generic arm below: `MessageTooLarge` classifies as
+                // `Fatal`, which would otherwise route it through
+                // `fail_inflight_head`.
+                recover_message_too_large(idem, &topic, partition, base_sequence);
+            }
             Some(response_error) => {
                 let action = (Error::Broker {
                     error: response_error,
@@ -807,9 +939,15 @@ fn settle_response_idempotent(
                         );
                         // Single-step pop + bump-flag so a concurrent
                         // assign can't slip in a poisoned base_sequence
-                        // between the two.
-                        idem.fail_inflight_head(&topic, partition, || Error::Broker {
-                            error: response_error,
+                        // between the two. Eager: the broker explicitly
+                        // rejected this head with a fatal produce code,
+                        // so every higher-sequence successor is rejected
+                        // too — the queue is provably unsent and a
+                        // whole-queue re-stamp is sound.
+                        idem.fail_inflight_head(&topic, partition, BumpMode::Eager, || {
+                            Error::Broker {
+                                error: response_error,
+                            }
                         });
                     }
                 }
@@ -895,6 +1033,259 @@ fn recover_unknown_pid_at_head(
     });
 }
 
+/// Recover from a `MessageTooLarge` ack on the in-flight head: the
+/// frozen frame exceeded the broker's `message.max.bytes`. Pop the
+/// head, decode it, split its records into two halves, and requeue
+/// both at the front of the in-flight queue — split-0 keeps the
+/// original `base_sequence`, split-1 starts at `base_sequence +
+/// halve`, so every record keeps the exact sequence the broker dedups
+/// against and the partition's `next_sequence` is left unchanged (the
+/// two halves cover the same range the original head did — no gap, so
+/// no bump). The next dispatch tick re-sends the smaller frames; a
+/// half still over the cap simply splits again on its own
+/// `MessageTooLarge`. Mirrors Java's `Sender.splitAndReenqueueBatch`
+/// (`RecordAccumulator.splitAndReenqueue`).
+///
+/// A single-record batch can't be halved — the payload itself is over
+/// the limit. It fails its waiter with `Error::Broker { MessageTooLarge }`
+/// and flags the partition for an epoch bump (`assign` advanced
+/// `next_sequence` eagerly when the batch was stamped, so the pop
+/// leaves a gap the bump pass closes — same shape as
+/// `fail_inflight_head`).
+///
+/// A decode/re-encode failure on these own-encoded bytes is
+/// corruption-level, but it stays a *per-partition* failure (fail
+/// waiters + flag bump), never a global-fatal: a data condition on one
+/// partition must not block sends on every other partition (the C2
+/// per-partition isolation invariant).
+fn recover_message_too_large(
+    idem: &Arc<IdempotentState>,
+    topic: &TopicName,
+    partition: PartitionId,
+    base_sequence: i32,
+) {
+    // Only act when the batch carrying `base_sequence` is actually at
+    // the head — a stale or duplicated broker response must not
+    // dequeue an unrelated batch. Mirrors the `UnknownProducerId`
+    // arm's predecessor-count guard.
+    if idem.partition_inflight_predecessor_count(topic, partition, base_sequence) != Some(0) {
+        tracing::warn!(
+            topic = topic.as_str(),
+            partition = partition.0,
+            base_sequence,
+            "MessageTooLarge for non-head sequence — ignoring stale response",
+        );
+        return;
+    }
+    let Some(head) = idem.pop_inflight_head(topic, partition) else {
+        return;
+    };
+
+    // A single record can't be split below one.
+    if head.record_count <= 1 {
+        tracing::error!(
+            topic = topic.as_str(),
+            partition = partition.0,
+            base_sequence,
+            "MessageTooLarge on a single-record batch — cannot split; failing batch",
+        );
+        // Eager: the broker rejected this head with `MessageTooLarge`,
+        // so it (and every successor) is provably unsent — see the fn
+        // doc. The bump pass re-stamps the remaining queue from 0.
+        idem.request_partition_bump(topic, partition, BumpMode::Eager);
+        notify_waiters_the_failure(head.waiters, || Error::Broker {
+            error: ResponseError::MessageTooLarge,
+        });
+        return;
+    }
+
+    // Decode the frozen frame back into records. These bytes came out
+    // of our own `RecordBatchEncoder::encode` in `freeze`, so a decode
+    // failure is corruption-level — handled per-partition (see fn doc).
+    let mut cursor = std::io::Cursor::new(head.encoded.as_ref());
+    let decoded = match RecordBatchDecoder::decode(&mut cursor) {
+        Ok(d) => d,
+        Err(e) => {
+            let reason = format!(
+                "MessageTooLarge split: decode of in-flight batch failed for {}-{}: {e}",
+                topic.as_str(),
+                partition.0,
+            );
+            tracing::error!("{reason}");
+            // Eager: the broker rejected this head with `MessageTooLarge`,
+        // so it (and every successor) is provably unsent — see the fn
+        // doc. The bump pass re-stamps the remaining queue from 0.
+        idem.request_partition_bump(topic, partition, BumpMode::Eager);
+            notify_waiters_the_failure(head.waiters, move || Error::Protocol(reason.clone()));
+            return;
+        }
+    };
+
+    // The decoded record count is the authority for the split point.
+    // `head.record_count >= 2` was checked above, and `append` pushes
+    // one waiter per record, so `waiters.len() == records.len() >= 2`
+    // by construction — but guard it anyway: a mismatch would mean a
+    // corrupt round-trip, and `Vec::split_off` below would *panic* the
+    // sender task rather than fail gracefully. Treated per-partition,
+    // not global-fatal (see fn doc).
+    let records = decoded.records;
+    let total = records.len();
+    if total < 2 || head.waiters.len() != total {
+        tracing::error!(
+            topic = topic.as_str(),
+            partition = partition.0,
+            base_sequence,
+            decoded_count = total,
+            waiter_count = head.waiters.len(),
+            "MessageTooLarge split: batch shape inconsistent (need >= 2 records with one waiter each) — cannot split; failing batch",
+        );
+        // Eager: the broker rejected this head with `MessageTooLarge`,
+        // so it (and every successor) is provably unsent — see the fn
+        // doc. The bump pass re-stamps the remaining queue from 0.
+        idem.request_partition_bump(topic, partition, BumpMode::Eager);
+        notify_waiters_the_failure(head.waiters, || Error::Broker {
+            error: ResponseError::MessageTooLarge,
+        });
+        return;
+    }
+    let halve = total / 2;
+    let split1_base = increment_sequence(base_sequence, halve as i32);
+
+    // Re-encode both halves before touching the in-flight queue or the
+    // waiters, so an encode failure leaves `head` intact to fail.
+    let encoded0 = encode_record_split(
+        &records[..halve],
+        head.producer_id,
+        head.producer_epoch,
+        base_sequence,
+        decoded.compression,
+    );
+    let encoded1 = encode_record_split(
+        &records[halve..],
+        head.producer_id,
+        head.producer_epoch,
+        split1_base,
+        decoded.compression,
+    );
+    let (encoded0, encoded1) = match (encoded0, encoded1) {
+        (Ok(a), Ok(b)) => (a, b),
+        (a, b) => {
+            let cause = a.err().or(b.err()).map_or_else(String::new, |e| e.to_string());
+            let reason = format!(
+                "MessageTooLarge split: re-encode failed for {}-{}: {cause}",
+                topic.as_str(),
+                partition.0,
+            );
+            tracing::error!("{reason}");
+            // Eager: the broker rejected this head with `MessageTooLarge`,
+        // so it (and every successor) is provably unsent — see the fn
+        // doc. The bump pass re-stamps the remaining queue from 0.
+        idem.request_partition_bump(topic, partition, BumpMode::Eager);
+            notify_waiters_the_failure(head.waiters, move || Error::Protocol(reason.clone()));
+            return;
+        }
+    };
+
+    // Split the waiters by record index: waiter `i` belongs to record
+    // `i`, and the records were partitioned `0..halve` / `halve..`.
+    let mut waiters = head.waiters;
+    let split1_waiters = waiters.split_off(halve);
+    let split0_waiters = waiters;
+
+    // Bump the attempt so the retry budget makes progress; the splits
+    // are immediately dispatchable — the fault was a size condition we
+    // just fixed, not a transient broker problem, so no backoff.
+    let attempt = head.attempt.saturating_add(1);
+    let now = Instant::now();
+    let split0 = InFlightBatch {
+        topic: topic.clone(),
+        partition,
+        base_sequence,
+        record_count: halve as i32,
+        producer_id: head.producer_id,
+        producer_epoch: head.producer_epoch,
+        encoded: encoded0,
+        waiters: split0_waiters,
+        first_send_at: head.first_send_at,
+        attempt,
+        next_attempt_at: now,
+    };
+    let split1 = InFlightBatch {
+        topic: topic.clone(),
+        partition,
+        base_sequence: split1_base,
+        record_count: (total - halve) as i32,
+        producer_id: head.producer_id,
+        producer_epoch: head.producer_epoch,
+        encoded: encoded1,
+        waiters: split1_waiters,
+        first_send_at: head.first_send_at,
+        attempt,
+        next_attempt_at: now,
+    };
+
+    // Requeue split-1 first, then split-0: `requeue_inflight_front`
+    // pushes to the front, so this leaves the queue ordered
+    // [split0, split1, ..unchanged successors..] — per-partition FIFO
+    // with a dense sequence space across the two halves.
+    idem.requeue_inflight_front(split1);
+    idem.requeue_inflight_front(split0);
+
+    tracing::warn!(
+        topic = topic.as_str(),
+        partition = partition.0,
+        base_sequence,
+        record_count = total,
+        halve,
+        "MessageTooLarge — splitting in-flight batch and requeuing both halves",
+    );
+}
+
+/// Re-encode a contiguous slice of decoded records into a fresh v2
+/// RecordBatch frame stamped with `(producer_id, producer_epoch)` and
+/// `base_sequence`. Per-record relative offsets are renumbered `0..N`
+/// and per-record sequences `base_sequence + i` — the same numbering
+/// `PartitionBatch::freeze` applies — so the encoder's
+/// `(offset - sequence) == const` invariant holds and the broker
+/// rebases offsets against the base it assigns on append.
+fn encode_record_split(
+    records: &[Record],
+    producer_id: i64,
+    producer_epoch: i16,
+    base_sequence: i32,
+    compression: Compression,
+) -> Result<Bytes> {
+    let rebuilt: Vec<Record> = records
+        .iter()
+        .enumerate()
+        .map(|(i, r)| Record {
+            transactional: r.transactional,
+            control: r.control,
+            partition_leader_epoch: r.partition_leader_epoch,
+            producer_id,
+            producer_epoch,
+            timestamp_type: r.timestamp_type,
+            offset: i as i64,
+            sequence: base_sequence.wrapping_add(i as i32),
+            timestamp: r.timestamp,
+            key: r.key.clone(),
+            value: r.value.clone(),
+            headers: r.headers.clone(),
+        })
+        .collect();
+    let mut buf = BytesMut::new();
+    RecordBatchEncoder::encode(
+        &mut buf,
+        rebuilt.iter(),
+        &RecordEncodeOptions {
+            version: 2,
+            compression,
+        },
+    )
+    .map_err(|e| Error::Protocol(format!("MessageTooLarge split re-encode: {e}")))?;
+    Ok(buf.freeze())
+}
+
 /// Run one bump pass: for every partition flagged via
 /// `request_partition_bump`, fetch a fresh `(producer_id, producer_epoch)`
 /// from the broker, drain that partition's in-flight queue, and rewrite
@@ -917,7 +1308,7 @@ async fn run_bump_pass(
     accumulator: &Accumulator,
 ) -> bool {
     let pending = idem.take_pending_bumps();
-    for (topic, partition) in pending {
+    for ((topic, partition), mode) in pending {
         let Some((current_pid, current_epoch)) = idem.partition_state(&topic, partition) else {
             // The partition entry vanished between flagging and running
             // the pass. Nothing in-flight to recover; drop the flag.
@@ -943,24 +1334,51 @@ async fn run_bump_pass(
                     drain_and_fail_everything(accumulator, idem, &reason);
                     return false;
                 }
-                // Transient: re-flag so the next tick retries. The
-                // paused batches stay in the in-flight queue under the
-                // *old* (pid, epoch). The `delivery_timeout` clock keeps
-                // running and `fail_inflight_head` will pop them if the
-                // bump never succeeds.
+                // Transient: re-flag (preserving the mode) so the next
+                // tick retries. The paused batches stay in the in-flight
+                // queue under the *old* (pid, epoch). The `delivery_timeout`
+                // clock keeps running and `fail_inflight_head` will pop
+                // them if the bump never succeeds.
                 tracing::warn!(
                     topic = topic.as_str(),
                     partition = partition.0,
                     error = %e,
                     "epoch bump failed transiently; will retry next tick",
                 );
-                idem.request_partition_bump(&topic, partition);
+                idem.request_partition_bump(&topic, partition, mode);
                 continue;
             }
         };
 
-        if !rewrite_paused_batches(idem, accumulator, &topic, partition, new_state) {
-            return false;
+        match mode {
+            // Provably-rejected partition (`OutOfOrderSequence`,
+            // `UnknownProducerId`, a fatal produce code, `MessageTooLarge`):
+            // nothing in the in-flight queue can have been accepted, so
+            // re-stamp it all from `base_sequence = 0` under the fresh
+            // `(pid, epoch)` right now.
+            BumpMode::Eager => {
+                if !rewrite_paused_batches(idem, accumulator, &topic, partition, new_state) {
+                    return false;
+                }
+            }
+            // Possibly-accepted partition (`delivery_timeout`,
+            // retries-exceeded, metadata loss, a sibling's drain-time
+            // `freeze` failure): a batch in the queue — or the timed-out
+            // head itself — may already be on the broker log with its
+            // response merely lost. Re-stamping it under the new epoch
+            // would land it a *second* time (F7). Park the fresh
+            // `(pid, epoch)` instead and let the old-epoch queue drain
+            // under the old epoch; the reset applies once it empties.
+            BumpMode::Deferred => {
+                tracing::warn!(
+                    topic = topic.as_str(),
+                    partition = partition.0,
+                    new_producer_id = new_state.0,
+                    new_producer_epoch = new_state.1,
+                    "bump-pass: parked deferred epoch reset; old-epoch in-flight queue must drain first",
+                );
+                idem.begin_deferred_epoch_reset(&topic, partition, new_state.0, new_state.1);
+            }
         }
     }
     true
@@ -1072,6 +1490,46 @@ fn drain_all_partition_waiters(idem: &Arc<IdempotentState>, reason: &str) {
     }
 }
 
+/// Resolve the waiters of every batch whose `freeze` failed during the
+/// drain pass, and flag each one's partition for an epoch bump.
+///
+/// `freeze` failures are rare — an encode error, or a
+/// compression-amplified frame over `max_request_size` — but must not
+/// be swallowed (F4): the waiters are resolved here with the real
+/// cause instead of their oneshot senders being dropped (which the
+/// caller would see as a misleading `producer closed` error).
+///
+/// The bump flag keeps the per-partition sequence space sound (N1).
+/// The drain's `state_for` closure runs the idempotent `assign` for
+/// each batch *before* `freeze` is attempted, so a freeze failure
+/// leaves `next_sequence` already advanced past records the broker
+/// never saw — a gap the next dispatch tick's bump pass closes by
+/// rewriting the partition's remaining in-flight batches from
+/// sequence 0. (In the one case where `assign` was *not* committed —
+/// a mid-drain `assign_failure` that is itself driving the producer
+/// to a fatal state — the extra flag is inert: `is_fatal` short-
+/// circuits every later tick before the bump set is ever read.)
+fn handle_idempotent_freeze_failures(
+    idem: &Arc<IdempotentState>,
+    failed: Vec<FreezeFailure>,
+) {
+    for FreezeFailure {
+        topic,
+        partition,
+        waiters,
+        error,
+    } in failed
+    {
+        notify_waiters_the_failure(waiters, || clone_error(&error));
+        // Deferred: a *sibling* batch on this partition drained the same
+        // tick, froze fine, and may already have been dispatched and
+        // accepted by the broker. Re-stamping it under a fresh epoch
+        // would duplicate it (F7), so the bump pass parks the new
+        // `(pid, epoch)` and lets the old-epoch queue drain first.
+        idem.request_partition_bump(&topic, partition, BumpMode::Deferred);
+    }
+}
+
 /// Drain the accumulator and the idempotent state's queues, failing
 /// every waiter with the same reason. Used when a fatal transition is
 /// detected (e.g. ensure_ready failed) so callers don't park forever.
@@ -1080,17 +1538,30 @@ fn drain_and_fail_everything(
     idem: &Arc<IdempotentState>,
     reason: &str,
 ) {
+    // Once the producer is fatal, sequence-space recovery is moot —
+    // drop every pending bump and parked deferred reset so the
+    // `drain_all` below isn't blocked from flushing a partition's
+    // buffered waiters (T3a: `drain_all` honours `drain_blocked_partitions`).
+    idem.abort_all_recovery();
     // The accumulator can't be frozen meaningfully (we have no producer
     // state), so flush its open batches with `non_idempotent` and just
     // notify the waiters. Bytes are discarded.
-    let drained = accumulator.drain_all(|_, _, _| BatchProducerState::non_idempotent());
-    if let Ok(batches) = drained {
-        for b in batches {
-            let owned = reason.to_string();
-            notify_waiters_the_failure(b.frozen.waiters, move || {
-                Error::IdempotenceFenced(owned.clone())
-            });
-        }
+    let DrainOutcome { ready, failed } =
+        accumulator.drain_all(|_, _, _| BatchProducerState::non_idempotent());
+    for b in ready {
+        let owned = reason.to_string();
+        notify_waiters_the_failure(b.frozen.waiters, move || {
+            Error::IdempotenceFenced(owned.clone())
+        });
+    }
+    // A batch that also failed to freeze on the way out still holds
+    // live waiters — fail them with the same fatal reason rather than
+    // letting the oneshot senders drop.
+    for FreezeFailure { waiters, .. } in failed {
+        let owned = reason.to_string();
+        notify_waiters_the_failure(waiters, move || {
+            Error::IdempotenceFenced(owned.clone())
+        });
     }
     drain_all_partition_waiters(idem, reason);
 }
@@ -1108,6 +1579,9 @@ fn settle_response_basic(resp: ProduceResponse, pending: Vec<PendingBatch>) {
         }
     }
 
+    // Each round carries at most one batch per partition (see
+    // `rounds_by_partition`), so one partition response settles exactly
+    // one pending batch.
     for batch in pending {
         let key = (batch.topic.clone(), batch.partition.0);
         let Some(pr) = response_index.get(&key).copied() else {
@@ -1179,6 +1653,11 @@ fn clone_error(e: &Error) -> Error {
             direction: *direction,
         },
         Error::IdempotenceFenced(s) => Error::IdempotenceFenced(s.clone()),
+        Error::RecordTooLarge { size, limit } => Error::RecordTooLarge {
+            size: *size,
+            limit: *limit,
+        },
+        Error::BufferFull(s) => Error::BufferFull(s.clone()),
     }
 }
 
@@ -1221,20 +1700,39 @@ fn assign_or_fail(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::producer::batch::FrozenBatch;
     use kafka_protocol::indexmap::IndexMap;
     use kafka_protocol::messages::produce_response::{
         PartitionProduceResponse, TopicProduceResponse,
     };
     use kafka_protocol::protocol::StrBytes;
-    use kafka_protocol::records::{
-        Compression, Record, RecordBatchDecoder, RecordBatchEncoder, RecordEncodeOptions,
-        TimestampType,
-    };
+    // `Compression`, `Record`, `RecordBatchDecoder`, `RecordBatchEncoder`,
+    // and `RecordEncodeOptions` come in via `use super::*`; only
+    // `TimestampType` is test-local.
+    use kafka_protocol::records::TimestampType;
     use std::io::Cursor;
     use tokio::sync::oneshot;
 
     fn topic(s: &'static str) -> TopicName {
         TopicName(StrBytes::from_static_str(s))
+    }
+
+    /// Minimal `ReadyBatch` for routing/grouping tests — `marker` is
+    /// stashed as the lone encoded byte so a test can track which batch
+    /// landed where without encoding a real frame.
+    fn ready_batch(t: &TopicName, partition: i32, marker: u8) -> ReadyBatch {
+        ReadyBatch {
+            topic: t.clone(),
+            partition: PartitionId(partition),
+            frozen: FrozenBatch {
+                encoded: Bytes::from(vec![marker]),
+                waiters: Vec::new(),
+                record_count: 1,
+                first_send_at: None,
+                attempt: 0,
+                state: BatchProducerState::non_idempotent(),
+            },
+        }
     }
 
     /// Build a 2-record v2 batch with the given producer state, for
@@ -1301,6 +1799,54 @@ mod tests {
             .with_name(topic.clone())
             .with_partition_responses(vec![pr]);
         ProduceResponse::default().with_responses(vec![tr])
+    }
+
+    /// The accumulator rotates a hot partition into several batches per
+    /// drain, but the broker rejects a `ProduceRequest` carrying more
+    /// than one v2 record batch for the same partition. `send_to_leader_basic`
+    /// therefore ships them in rounds — this checks the round split
+    /// keeps each round single-batch-per-partition and preserves the
+    /// per-partition FIFO order across rounds.
+    #[test]
+    fn rounds_by_partition_splits_multi_batch_partitions_into_fifo_rounds() {
+        let t = topic("rounds");
+        // p0 drained three batches (markers 1,2,3 in FIFO order); p1
+        // drained one (marker 9).
+        let batches = vec![
+            ready_batch(&t, 0, 1),
+            ready_batch(&t, 0, 2),
+            ready_batch(&t, 1, 9),
+            ready_batch(&t, 0, 3),
+        ];
+
+        let rounds = rounds_by_partition(batches);
+
+        // Three rounds — bounded by p0's depth.
+        assert_eq!(rounds.len(), 3, "round count must equal the deepest partition");
+        // No round may carry two batches for one partition.
+        for round in &rounds {
+            let mut seen = std::collections::HashSet::new();
+            for b in round {
+                assert!(
+                    seen.insert(b.partition),
+                    "a round must hold at most one batch per partition",
+                );
+            }
+        }
+        // p0's batches come out in FIFO (drain) order across rounds.
+        let p0_markers: Vec<u8> = rounds
+            .iter()
+            .filter_map(|r| r.iter().find(|b| b.partition == PartitionId(0)))
+            .map(|b| b.frozen.encoded[0])
+            .collect();
+        assert_eq!(p0_markers, vec![1, 2, 3], "p0 must keep FIFO order across rounds");
+        // p1 appears exactly once — it only had one batch.
+        let p1_count = rounds
+            .iter()
+            .flat_map(|r| r.iter())
+            .filter(|b| b.partition == PartitionId(1))
+            .count();
+        assert_eq!(p1_count, 1, "p1 had one batch, so it appears in exactly one round");
     }
 
     /// B2: an `UnknownProducerId` ack on the in-flight head with no
@@ -1471,7 +2017,7 @@ mod tests {
         // `PartitionBlocked` — a synthetic stand-in for the gate that
         // is meant to be unreachable but, per H1, must still fail-fast
         // if it is ever hit.
-        idem.request_partition_bump(&topic("t"), PartitionId(3));
+        idem.request_partition_bump(&topic("t"), PartitionId(3), BumpMode::Eager);
 
         let outcome = assign_or_fail(&idem, &topic("t"), PartitionId(3), 1);
         let reason = outcome.expect_err("blocked partition must surface as Err");
@@ -1517,7 +2063,7 @@ mod tests {
         let b = idem.assign(&t, p, 2).unwrap();
         assert_eq!(b.base_sequence, 10);
         // Trigger the bump (the OutOfOrderSequence path on the head).
-        idem.request_partition_bump(&t, p);
+        idem.request_partition_bump(&t, p, BumpMode::Eager);
 
         let (tx_a, mut rx_a) = oneshot::channel();
         idem.register_inflight(InFlightBatch {
@@ -1615,7 +2161,7 @@ mod tests {
         // Register one in-flight batch (base=0, count=3), then flag for
         // bump as if the broker returned OutOfOrderSequence on it.
         let _ = idem.assign(&t, p, 3).unwrap();
-        idem.request_partition_bump(&t, p);
+        idem.request_partition_bump(&t, p, BumpMode::Eager);
         let (tx, _rx) = oneshot::channel();
         idem.register_inflight(InFlightBatch {
             topic: t.clone(),
@@ -1686,7 +2232,7 @@ mod tests {
         let idem = Arc::new(IdempotentState::new());
         // Don't force-ready and don't assign — `partition_state` will
         // return `None` for an unknown partition.
-        idem.request_partition_bump(&topic("ghost"), PartitionId(9));
+        idem.request_partition_bump(&topic("ghost"), PartitionId(9), BumpMode::Eager);
         assert!(idem.has_pending_bumps());
 
         // Direct probe — `run_bump_pass` would short-circuit via this
@@ -1878,9 +2424,12 @@ mod tests {
             rxs.push((part, rx));
         }
 
-        // InvalidRecord + MessageTooLarge are both Fatal; the third
-        // partition gets success (code 0). `.code()` keeps the test
-        // honest if the protocol re-numbers either variant.
+        // InvalidRecord routes through `fail_inflight_head`;
+        // MessageTooLarge on a *single-record* batch can't be split, so
+        // `recover_message_too_large` also fails the waiter + flags a
+        // bump — same observable outcome here. The third partition gets
+        // success (code 0). `.code()` keeps the test honest if the
+        // protocol re-numbers either variant.
         let pr_bad = PartitionProduceResponse::default()
             .with_index(p_bad.0)
             .with_error_code(ResponseError::InvalidRecord.code())
@@ -1940,9 +2489,19 @@ mod tests {
         // Both failing partitions are now flagged for a bump; the
         // healthy one is not (a successful complete clears nothing —
         // there was no flag to clear).
+        // Both failures route through the eager path: `InvalidRecord`
+        // via `fail_inflight_head(Eager)`, and a single-record
+        // `MessageTooLarge` via `recover_message_too_large`'s eager
+        // `request_partition_bump` — the broker provably rejected each.
         let mut bumps = idem.take_pending_bumps();
-        bumps.sort_by_key(|(_, p)| p.0);
-        assert_eq!(bumps, vec![(t.clone(), p_bad), (t.clone(), p_mid)]);
+        bumps.sort_by_key(|((_, p), _mode)| p.0);
+        assert_eq!(
+            bumps,
+            vec![
+                ((t.clone(), p_bad), BumpMode::Eager),
+                ((t.clone(), p_mid), BumpMode::Eager),
+            ],
+        );
 
         // No in-flight batches remain on the failed partitions (popped
         // by `fail_inflight_head`); the healthy partition's queue was
@@ -2034,6 +2593,355 @@ mod tests {
             Ok(Err(Error::IdempotenceFenced(_))) => {}
             other => panic!("expected IdempotenceFenced on B, got {other:?}"),
         }
+    }
+
+    /// T2a: a `MessageTooLarge` ack on a multi-record in-flight head
+    /// pops the head and requeues two halves at the front of the
+    /// queue, under the *same* `(producer_id, producer_epoch)`,
+    /// preserving each record's sequence: split-0 keeps the original
+    /// `base_sequence`, split-1 starts at `base_sequence + halve`. The
+    /// original waiters are partitioned by record index across the two
+    /// splits, so completing both halves resolves every waiter in
+    /// record order. No bump is flagged — the halves cover the same
+    /// sequence range the head did, so there is no gap.
+    #[test]
+    fn message_too_large_splits_and_requeues_under_same_pid_epoch() {
+        let idem = Arc::new(IdempotentState::new());
+        idem.force_ready_for_test(9, 2);
+        let t = topic("mtl-split");
+        let p = PartitionId(0);
+
+        // Reserve sequence space 0..4 and register a 4-record in-flight
+        // head with real v2-encoded bytes so the split path can decode
+        // it back into records.
+        let _ = idem.assign(&t, p, 4).unwrap();
+        let mut rxs = Vec::new();
+        let waiters: Vec<_> = (0..4)
+            .map(|_| {
+                let (tx, rx) = oneshot::channel();
+                rxs.push(rx);
+                tx
+            })
+            .collect();
+        idem.register_inflight(InFlightBatch {
+            topic: t.clone(),
+            partition: p,
+            base_sequence: 0,
+            record_count: 4,
+            producer_id: 9,
+            producer_epoch: 2,
+            encoded: encode_test_batch_with_count(9, 2, 0, 4),
+            waiters,
+            first_send_at: Instant::now() - Duration::from_secs(1),
+            attempt: 3,
+            next_attempt_at: Instant::now(),
+        });
+
+        let resp = produce_response_with_code(&t, p, ResponseError::MessageTooLarge.code());
+        let config = ProducerConfig::default();
+        settle_response_idempotent(
+            resp,
+            &idem,
+            vec![(t.clone(), p, 0)],
+            &config,
+            Duration::from_millis(100),
+            Duration::from_secs(1),
+        );
+
+        // Two batches now sit in the queue; the producer is not fatal,
+        // and no bump was requested (the halves leave no sequence gap).
+        assert!(!idem.is_fatal());
+        assert!(!idem.has_pending_bumps(), "a clean split must not flag a bump");
+        let head = idem.snapshot_inflight();
+        assert_eq!(head.len(), 1, "snapshot exposes only the head");
+        assert_eq!(head[0].base_sequence, 0);
+        assert_eq!(head[0].attempt, 4, "split inherits head.attempt + 1");
+
+        // Complete split-0: 2 waiters, base_sequence 0, decodes under
+        // the original (pid, epoch) with sequences 0,1.
+        let split0 = idem.complete(&t, p, 0).expect("split-0 at head");
+        assert_eq!(split0.base_sequence, 0);
+        assert_eq!(split0.record_count, 2);
+        assert_eq!(split0.producer_id, 9);
+        assert_eq!(split0.producer_epoch, 2);
+        {
+            let mut cursor = Cursor::new(split0.encoded.as_ref());
+            let decoded = RecordBatchDecoder::decode(&mut cursor).expect("split-0 decodes");
+            assert_eq!(decoded.records.len(), 2);
+            for (i, r) in decoded.records.iter().enumerate() {
+                assert_eq!(r.producer_id, 9);
+                assert_eq!(r.producer_epoch, 2);
+                assert_eq!(r.sequence, i as i32);
+            }
+        }
+        for (i, tx) in split0.waiters.into_iter().enumerate() {
+            let _ = tx.send(Ok(RecordMetadata {
+                topic: t.clone(),
+                partition: p,
+                offset: 100 + i as i64,
+                timestamp: None,
+            }));
+        }
+
+        // Complete split-1: 2 waiters, base_sequence 2, sequences 2,3.
+        let split1 = idem.complete(&t, p, 2).expect("split-1 now at head");
+        assert_eq!(split1.base_sequence, 2);
+        assert_eq!(split1.record_count, 2);
+        assert_eq!(split1.producer_id, 9);
+        assert_eq!(split1.producer_epoch, 2);
+        {
+            let mut cursor = Cursor::new(split1.encoded.as_ref());
+            let decoded = RecordBatchDecoder::decode(&mut cursor).expect("split-1 decodes");
+            assert_eq!(decoded.records.len(), 2);
+            for (i, r) in decoded.records.iter().enumerate() {
+                assert_eq!(r.producer_id, 9);
+                assert_eq!(r.producer_epoch, 2);
+                assert_eq!(r.sequence, 2 + i as i32);
+            }
+        }
+        for (i, tx) in split1.waiters.into_iter().enumerate() {
+            let _ = tx.send(Ok(RecordMetadata {
+                topic: t.clone(),
+                partition: p,
+                offset: 102 + i as i64,
+                timestamp: None,
+            }));
+        }
+
+        // Every original waiter resolved, in record order, across the
+        // split boundary — proof the waiter-by-index partition is
+        // consistent with the record-by-index split.
+        let offsets: Vec<i64> = rxs
+            .into_iter()
+            .map(|mut rx| match rx.try_recv() {
+                Ok(Ok(meta)) => meta.offset,
+                other => panic!("waiter must resolve with success, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(offsets, vec![100, 101, 102, 103]);
+    }
+
+    /// T2a: a `MessageTooLarge` ack on a *single-record* in-flight head
+    /// can't be split — the payload itself is over the broker limit.
+    /// The waiter fails with the broker's `MessageTooLarge` and the
+    /// partition is flagged for an epoch bump (the head pop left a
+    /// sequence gap the bump pass closes). It must stay per-partition:
+    /// no global-fatal transition.
+    #[test]
+    fn message_too_large_with_single_record_fails() {
+        let idem = Arc::new(IdempotentState::new());
+        idem.force_ready_for_test(1, 0);
+        let t = topic("mtl-single");
+        let p = PartitionId(0);
+
+        let _ = idem.assign(&t, p, 1).unwrap();
+        let (tx, mut rx) = oneshot::channel();
+        idem.register_inflight(InFlightBatch {
+            topic: t.clone(),
+            partition: p,
+            base_sequence: 0,
+            record_count: 1,
+            producer_id: 1,
+            producer_epoch: 0,
+            encoded: encode_test_batch_with_count(1, 0, 0, 1),
+            waiters: vec![tx],
+            first_send_at: Instant::now(),
+            attempt: 0,
+            next_attempt_at: Instant::now(),
+        });
+
+        let resp = produce_response_with_code(&t, p, ResponseError::MessageTooLarge.code());
+        let config = ProducerConfig::default();
+        settle_response_idempotent(
+            resp,
+            &idem,
+            vec![(t.clone(), p, 0)],
+            &config,
+            Duration::from_millis(100),
+            Duration::from_secs(1),
+        );
+
+        match rx.try_recv() {
+            Ok(Err(Error::Broker {
+                error: ResponseError::MessageTooLarge,
+            })) => {}
+            other => panic!("expected Broker(MessageTooLarge), got {other:?}"),
+        }
+        assert!(
+            idem.has_pending_bumps(),
+            "single-record MessageTooLarge must flag a bump to repair the sequence gap",
+        );
+        assert!(
+            idem.snapshot_inflight().is_empty(),
+            "head popped, nothing requeued for an unsplittable batch",
+        );
+        assert!(
+            !idem.is_fatal(),
+            "single-record MessageTooLarge is per-partition, not global-fatal",
+        );
+    }
+
+    /// T2b: a drain-time `freeze` failure on the idempotent path must
+    /// resolve the batch's waiters with the real cause *and* flag the
+    /// partition for an epoch bump. `assign` ran in the drain's
+    /// `state_for` closure before `freeze` was attempted, so the
+    /// dropped batch left the partition's `next_sequence` advanced past
+    /// records the broker never saw — the bump pass closes that gap.
+    #[test]
+    fn freeze_failure_on_idempotent_path_flags_bump() {
+        let idem = Arc::new(IdempotentState::new());
+        idem.force_ready_for_test(1, 0);
+        let t = topic("freeze-fail");
+        let p = PartitionId(0);
+
+        // Mirror the drain: `assign` is committed for this batch (the
+        // `state_for` closure ran), then its `freeze` failed.
+        let _ = idem.assign(&t, p, 2).unwrap();
+        let (tx, mut rx) = oneshot::channel();
+        let failed = vec![FreezeFailure {
+            topic: t.clone(),
+            partition: p,
+            waiters: vec![tx],
+            error: Error::Broker {
+                error: ResponseError::MessageTooLarge,
+            },
+        }];
+
+        handle_idempotent_freeze_failures(&idem, failed);
+
+        // The waiter learns the real freeze cause — not a dropped-sender
+        // `producer closed`.
+        match rx.try_recv() {
+            Ok(Err(Error::Broker {
+                error: ResponseError::MessageTooLarge,
+            })) => {}
+            other => panic!("expected Broker(MessageTooLarge), got {other:?}"),
+        }
+
+        // The partition is flagged so the next dispatch tick's bump
+        // pass repairs the sequence gap before any further send. The
+        // bump is `Deferred`: a sibling batch on this partition may
+        // already have been dispatched and accepted by the broker, so
+        // the bump pass must not re-stamp the in-flight queue (F7).
+        assert!(idem.has_pending_bumps());
+        assert_eq!(idem.take_pending_bumps(), vec![((t, p), BumpMode::Deferred)]);
+    }
+
+    /// T3a: a [`BumpMode::Deferred`] bump pass must NOT re-stamp the
+    /// in-flight head — re-stamping a batch the broker may already have
+    /// accepted would duplicate it under the new epoch (F7). Register a
+    /// healthy in-flight head, park a deferred epoch reset (the
+    /// broker-call half of the bump pass, factored out so the unit test
+    /// needs no broker), and assert the head's encoded bytes and its
+    /// `(producer_id, producer_epoch, base_sequence)` are byte-for-byte
+    /// unchanged — the rewrite is deferred until the queue drains.
+    #[test]
+    fn bump_pass_defers_rewrite_while_inflight_unconfirmed() {
+        let idem = Arc::new(IdempotentState::new());
+        idem.force_ready_for_test(7, 0);
+        let t = topic("defer-rewrite");
+        let p = PartitionId(0);
+
+        // A healthy in-flight head under the original (pid=7, epoch=0),
+        // as if a sibling batch on the same partition had freeze-failed
+        // and flagged a deferred bump.
+        let _ = idem.assign(&t, p, 2).unwrap();
+        let original = encode_test_batch(7, 0, 0);
+        let original_ptr = original.as_ptr();
+        idem.register_inflight(InFlightBatch {
+            topic: t.clone(),
+            partition: p,
+            base_sequence: 0,
+            record_count: 2,
+            producer_id: 7,
+            producer_epoch: 0,
+            encoded: original,
+            waiters: Vec::new(),
+            first_send_at: Instant::now(),
+            attempt: 1,
+            next_attempt_at: Instant::now(),
+        });
+
+        // The deferred half of the bump pass: a fresh (pid, epoch) was
+        // acquired from the broker, but the in-flight queue is non-empty
+        // so the reset is parked, not applied.
+        idem.begin_deferred_epoch_reset(&t, p, 999, 5);
+
+        // The head is byte-for-byte the original — same allocation, same
+        // base_sequence, same (pid, epoch).
+        let snap = idem.snapshot_inflight().into_iter().next().unwrap();
+        assert_eq!(
+            snap.encoded.as_ptr(),
+            original_ptr,
+            "deferred bump must not re-encode the in-flight head",
+        );
+        assert_eq!(snap.base_sequence, 0, "base_sequence must be untouched");
+        let mut cursor = Cursor::new(snap.encoded.as_ref());
+        let decoded = RecordBatchDecoder::decode(&mut cursor).expect("head still decodes");
+        for r in &decoded.records {
+            assert_eq!(r.producer_id, 7, "producer_id must stay the old epoch's");
+            assert_eq!(r.producer_epoch, 0, "producer_epoch must stay the old epoch's");
+        }
+
+        // `assign` stays blocked while the old-epoch queue drains.
+        assert_eq!(
+            idem.assign(&t, p, 1).unwrap_err(),
+            crate::producer::idempotent::AssignError::PartitionBlocked,
+        );
+    }
+
+    /// T3a: once the last old-epoch in-flight batch settles, the parked
+    /// deferred reset fires — the partition swaps to the new
+    /// `(pid, epoch)`, rewinds `next_sequence` to 0, and unblocks
+    /// draining. Mirrors Java's `maybeUpdateProducerIdAndEpoch`
+    /// `!hasInflightBatches` guard.
+    #[test]
+    fn bump_resets_sequence_once_inflight_drains() {
+        let idem = Arc::new(IdempotentState::new());
+        idem.force_ready_for_test(3, 1);
+        let t = topic("defer-reset");
+        let p = PartitionId(0);
+
+        let _ = idem.assign(&t, p, 2).unwrap();
+        idem.register_inflight(InFlightBatch {
+            topic: t.clone(),
+            partition: p,
+            base_sequence: 0,
+            record_count: 2,
+            producer_id: 3,
+            producer_epoch: 1,
+            encoded: encode_test_batch(3, 1, 0),
+            waiters: Vec::new(),
+            first_send_at: Instant::now(),
+            attempt: 1,
+            next_attempt_at: Instant::now(),
+        });
+        idem.begin_deferred_epoch_reset(&t, p, 888, 9);
+
+        // Still blocked while the old-epoch batch is in flight.
+        assert!(idem.drain_blocked_partitions().contains(&(t.clone(), p)));
+
+        // The broker acks the old-epoch batch (success, or — if the
+        // earlier attempt's send had landed — DuplicateSequenceNumber);
+        // either way `complete` pops it and the queue empties.
+        let resp = produce_response_with_code(&t, p, 0);
+        let config = ProducerConfig::default();
+        settle_response_idempotent(
+            resp,
+            &idem,
+            vec![(t.clone(), p, 0)],
+            &config,
+            Duration::from_millis(100),
+            Duration::from_secs(1),
+        );
+
+        // The deferred reset fired: new (pid, epoch), next_sequence
+        // rewound to 0, partition unblocked.
+        assert!(!idem.drain_blocked_partitions().contains(&(t.clone(), p)));
+        let assigned = idem.assign(&t, p, 1).expect("partition unblocked after drain");
+        assert_eq!(assigned.producer_id, 888);
+        assert_eq!(assigned.producer_epoch, 9);
+        assert_eq!(assigned.base_sequence, 0);
     }
 }
 
