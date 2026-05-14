@@ -597,6 +597,13 @@ impl Producer {
             )));
         };
 
+        // Capture the sticky-routing inputs before `record` is consumed
+        // into `payload`: a record with neither an explicit partition nor
+        // a key took the sticky branch in `partition_for`, the same
+        // condition checked here.
+        let used_sticky = record.partition.is_none() && record.key.is_none();
+        let num_partitions = i32::try_from(meta.partitions.len()).ok();
+
         let topic = record.topic;
         let payload = RecordPayload {
             key: record.key,
@@ -605,13 +612,27 @@ impl Producer {
             headers: record.headers,
         };
 
-        let outcome = match self.accumulator.append(topic, partition, payload) {
+        let outcome = match self.accumulator.append(topic.clone(), partition, payload) {
             Ok(o) => o,
             Err(e) => {
                 self.accumulator.release(est);
                 return Err(e);
             }
         };
+
+        // KIP-480 sticky partitioning: once the sticky batch fills, the
+        // record just appended sealed it — advance the sticky partition so
+        // the next keyless record spreads to a fresh partition instead of
+        // re-pinning partition 0. Two concurrent keyless `send`s can both
+        // observe `is_full` and rotate twice (skipping a partition);
+        // records still spread, so we don't lock across the whole
+        // `partition_for` + `append` + `rotate` span for that.
+        if used_sticky && outcome.is_full {
+            if let Some(n) = num_partitions {
+                self.sticky.rotate(&topic, n);
+            }
+        }
+
         let sleep = user_deadline.map(|d| Box::pin(tokio::time::sleep_until(d)));
         Ok(SendFuture {
             rx: outcome.rx,

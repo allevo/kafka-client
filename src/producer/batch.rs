@@ -97,8 +97,6 @@ pub(crate) struct FrozenBatch {
     pub encoded: Bytes,
     pub waiters: Vec<oneshot::Sender<Result<RecordMetadata>>>,
     pub record_count: usize,
-    pub first_send_at: Option<Instant>,
-    pub attempt: u32,
     /// Producer-state stamped into the encoded bytes. Carried so the
     /// idempotent path can register `(producer_id, producer_epoch,
     /// base_sequence)` into its in-flight queue without re-deriving them.
@@ -113,9 +111,7 @@ pub(crate) struct PartitionBatch {
     records: Vec<Record>,
     waiters: Vec<oneshot::Sender<Result<RecordMetadata>>>,
     created_at: Instant,
-    first_send_at: Option<Instant>,
     size_estimator: SizeEstimator,
-    attempt: u32,
     full: bool,
     /// Sum of `estimate_record_size` over every appended record — i.e.
     /// the exact `buffer_memory` budget `Producer::send` reserved for
@@ -133,9 +129,7 @@ impl PartitionBatch {
             records: Vec::new(),
             waiters: Vec::new(),
             created_at: now,
-            first_send_at: None,
             size_estimator: SizeEstimator::new(),
-            attempt: 0,
             full: false,
             reserved_bytes: 0,
         }
@@ -192,30 +186,8 @@ impl PartitionBatch {
         AppendOutcome { rx, is_full }
     }
 
-    /// Record the first-dispatch timestamp. Idempotent across retries: the
-    /// accumulator's requeue path re-invokes this, but we keep the earliest
-    /// instant so `delivery_timeout` measures wall-clock from the first
-    /// attempt.
-    pub(crate) fn mark_dispatched(&mut self, now: Instant) {
-        if self.first_send_at.is_none() {
-            self.first_send_at = Some(now);
-        }
-    }
-
-    pub(crate) fn bump_attempt(&mut self) {
-        self.attempt += 1;
-    }
-
-    pub(crate) fn attempt(&self) -> u32 {
-        self.attempt
-    }
-
     pub(crate) fn len(&self) -> usize {
         self.records.len()
-    }
-
-    pub(crate) fn is_empty(&self) -> bool {
-        self.records.is_empty()
     }
 
     /// True once the size estimator has crossed `max_batch_bytes` on a prior
@@ -299,8 +271,6 @@ impl PartitionBatch {
             encoded,
             waiters: self.waiters,
             record_count: self.records.len(),
-            first_send_at: self.first_send_at,
-            attempt: self.attempt,
             state,
         })
     }
@@ -623,16 +593,6 @@ mod tests {
     }
 
     #[test]
-    fn mark_dispatched_is_idempotent() {
-        let mut batch = PartitionBatch::new(Instant::now());
-        let first = Instant::now();
-        batch.mark_dispatched(first);
-        let later = first + Duration::from_secs(5);
-        batch.mark_dispatched(later);
-        assert_eq!(batch.first_send_at, Some(first));
-    }
-
-    #[test]
     fn freeze_idempotent_sets_producer_id_epoch_and_sequence() {
         let mut batch = PartitionBatch::new(Instant::now());
         let _ = batch.append(sample_payload(None, Some(b"a")), usize::MAX);
@@ -657,14 +617,5 @@ mod tests {
             assert_eq!(r.sequence, 100 + i as i32, "record {i} sequence");
             assert_eq!(r.offset, i as i64, "record {i} offset");
         }
-    }
-
-    #[test]
-    fn bump_attempt_increments() {
-        let mut batch = PartitionBatch::new(Instant::now());
-        assert_eq!(batch.attempt(), 0);
-        batch.bump_attempt();
-        batch.bump_attempt();
-        assert_eq!(batch.attempt(), 2);
     }
 }

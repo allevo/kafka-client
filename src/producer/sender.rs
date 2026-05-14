@@ -1728,8 +1728,6 @@ mod tests {
                 encoded: Bytes::from(vec![marker]),
                 waiters: Vec::new(),
                 record_count: 1,
-                first_send_at: None,
-                attempt: 0,
                 state: BatchProducerState::non_idempotent(),
             },
         }

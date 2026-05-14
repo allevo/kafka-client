@@ -20,8 +20,8 @@ impl StickyState {
     }
 
     /// Advance the sticky partition for `topic` to the next id modulo
-    /// `num_partitions`. Called by the accumulator when the current sticky
-    /// batch freezes (no caller yet in this slice). Deterministic rotation —
+    /// `num_partitions`. Called by `Producer::send` once a keyless record's
+    /// `append` reports the sticky batch full. Deterministic rotation —
     /// v1 trades Java's random reshuffle for simplicity; fine as long as all
     /// producers don't converge on the same partition, which they don't
     /// because each holds its own `StickyState`.

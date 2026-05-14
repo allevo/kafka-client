@@ -1,0 +1,28 @@
+[package]
+name = "kafka-client-bench"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[[bin]]
+name = "producer-bench"
+path = "src/main.rs"
+
+[dependencies]
+kafka-client = { path = ".." }
+# Needed to build the `CreatableTopic` / `TopicName` values the admin path
+# takes; kafka-client re-exports `TopicName`/`StrBytes` but not the request
+# builders. Same crate + version the library itself depends on.
+kafka-protocol = { version = "0.17", default-features = false, features = ["client"] }
+tokio = { version = "1", features = ["full"] }
+bytes = "1"
+anyhow = "1"
+fastrand = "2"
+clap = { version = "4", features = ["derive", "env"] }
+hdrhistogram = "7"
+futures = "0.3"
+# rdkafka wraps the C librdkafka — its cmake/C toolchain is only ever
+# compiled when someone builds this crate, never for the library itself.
+rdkafka = { version = "0.39", default-features = false, features = ["tokio", "libz"] }
+rskafka = "0.6"
+samsa = "0.1"

@@ -1,3 +1,11 @@
+[workspace]
+members = ["bench"]
+# Root `cargo build` / `cargo test` / `cargo doc` stay scoped to the library
+# only, so the bench crate's rdkafka C/cmake toolchain is never pulled in
+# unless someone explicitly targets `-p kafka-client-bench`.
+default-members = ["."]
+resolver = "2"
+
 [package]
 name = "kafka-client"
 version = "0.1.0"
