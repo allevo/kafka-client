@@ -32,7 +32,9 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use samsa::prelude::protocol::ProduceResponse;
-use samsa::prelude::{BrokerAddress, KafkaCode, ProduceMessage, Producer, ProducerBuilder, TcpConnection};
+use samsa::prelude::{
+    BrokerAddress, KafkaCode, ProduceMessage, Producer, ProducerBuilder, TcpConnection,
+};
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;

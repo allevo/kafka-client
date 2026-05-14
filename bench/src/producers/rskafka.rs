@@ -44,7 +44,11 @@ impl RskafkaProducer {
         // orchestrator; tolerate the brief metadata-propagation window.
         let partition_client = Arc::new(
             client
-                .partition_client(workload.topic.clone(), PARTITION, UnknownTopicHandling::Retry)
+                .partition_client(
+                    workload.topic.clone(),
+                    PARTITION,
+                    UnknownTopicHandling::Retry,
+                )
                 .await?,
         );
         let batch_producer = BatchProducerBuilder::new(partition_client)
@@ -68,8 +72,7 @@ impl BenchProducer for RskafkaProducer {
             key: None,
             value: Some(payload.to_vec()),
             headers: BTreeMap::new(),
-            timestamp: rskafka::chrono::DateTime::from_timestamp_millis(now_ms)
-                .unwrap_or_default(),
+            timestamp: rskafka::chrono::DateTime::from_timestamp_millis(now_ms).unwrap_or_default(),
         };
         // `produce` resolves once the batch carrying this record is acked.
         let started = Instant::now();

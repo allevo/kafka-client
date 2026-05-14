@@ -39,8 +39,7 @@ async fn record_too_large_returns_synchronous_error() {
     let oversized = Bytes::from(vec![b'x'; 64 * 1024]);
     let result = producer
         .send(
-            crate::ProducerRecord::new(topic.clone(), oversized)
-                .with_partition(PartitionId(0)),
+            crate::ProducerRecord::new(topic.clone(), oversized).with_partition(PartitionId(0)),
             None,
         )
         .await;
@@ -63,7 +62,10 @@ async fn record_too_large_returns_synchronous_error() {
         .await
         .expect("an in-cap record still enqueues");
     let meta = fut.await.expect("an in-cap record still acks");
-    assert_eq!(meta.offset, 0, "the in-cap record is the first on the partition");
+    assert_eq!(
+        meta.offset, 0,
+        "the in-cap record is the first on the partition"
+    );
 
     producer.close().await.unwrap();
 }

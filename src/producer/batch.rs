@@ -143,8 +143,11 @@ impl PartitionBatch {
         // Estimate before the payload's `Bytes` are moved into `record` —
         // the running batch estimate is uncompressed bytes, same unit the
         // accumulator's `max_record_size` guard uses.
-        let record_size =
-            estimate_record_size(payload.key.as_ref(), payload.value.as_ref(), &payload.headers);
+        let record_size = estimate_record_size(
+            payload.key.as_ref(),
+            payload.value.as_ref(),
+            &payload.headers,
+        );
         // Same number `Producer::send` reserved against `buffer_memory`
         // for this record; tracked so the accumulator can release it on
         // drain.

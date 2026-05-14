@@ -233,9 +233,9 @@ impl Default for ProducerConfig {
             max_block: Duration::from_secs(60),
             enable_idempotence: false,
             delivery_timeout: Duration::from_secs(120),
-            max_request_size: 1 << 20,  // 1 MiB
-            max_record_size: 1 << 20,   // = max_request_size
-            buffer_memory: 32 << 20,    // 32 MiB
+            max_request_size: 1 << 20, // 1 MiB
+            max_record_size: 1 << 20,  // = max_request_size
+            buffer_memory: 32 << 20,   // 32 MiB
             buffer_full_policy: BufferFullPolicy::Block,
         }
     }
@@ -442,9 +442,7 @@ impl Producer {
                 config.max_in_flight_per_broker = 5;
             }
             if config.retries == 0 {
-                tracing::info!(
-                    "enable_idempotence=true raises retries from 0 to u32::MAX",
-                );
+                tracing::info!("enable_idempotence=true raises retries from 0 to u32::MAX",);
                 config.retries = u32::MAX;
             }
         }
@@ -555,8 +553,7 @@ impl Producer {
         // `max_record_size` guard input and the `buffer_memory` amount
         // to reserve — taken once, off the `ProducerRecord` (no
         // `RecordPayload` exists yet).
-        let est =
-            estimate_record_size(record.key.as_ref(), record.value.as_ref(), &record.headers);
+        let est = estimate_record_size(record.key.as_ref(), record.value.as_ref(), &record.headers);
         // Fast-fail an oversized record before touching the buffer
         // budget: it can never ship, so reserving (then releasing)
         // budget for it is pointless — and a record larger than
@@ -627,10 +624,11 @@ impl Producer {
         // observe `is_full` and rotate twice (skipping a partition);
         // records still spread, so we don't lock across the whole
         // `partition_for` + `append` + `rotate` span for that.
-        if used_sticky && outcome.is_full {
-            if let Some(n) = num_partitions {
-                self.sticky.rotate(&topic, n);
-            }
+        if used_sticky
+            && outcome.is_full
+            && let Some(n) = num_partitions
+        {
+            self.sticky.rotate(&topic, n);
         }
 
         let sleep = user_deadline.map(|d| Box::pin(tokio::time::sleep_until(d)));

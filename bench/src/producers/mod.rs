@@ -27,9 +27,7 @@ impl CrateId {
             "rdkafka" => Ok(Self::Rdkafka),
             "rskafka" => Ok(Self::Rskafka),
             "samsa" => Ok(Self::Samsa),
-            other => anyhow::bail!(
-                "unknown crate '{other}' (expected this|rdkafka|rskafka|samsa)"
-            ),
+            other => anyhow::bail!("unknown crate '{other}' (expected this|rdkafka|rskafka|samsa)"),
         }
     }
 

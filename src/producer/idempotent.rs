@@ -197,7 +197,10 @@ fn maybe_apply_pending_reset(part: &mut PartitionState) {
 enum InitState {
     Uninitialized,
     Initializing,
-    Ready { producer_id: i64, producer_epoch: i16 },
+    Ready {
+        producer_id: i64,
+        producer_epoch: i16,
+    },
     Fatal(String),
 }
 
@@ -359,7 +362,11 @@ impl IdempotentState {
                 let mut guard = self.inner.lock().unwrap();
                 match outcome {
                     Ok((pid, epoch)) => {
-                        tracing::info!(producer_id = pid, producer_epoch = epoch, "idempotent producer initialized");
+                        tracing::info!(
+                            producer_id = pid,
+                            producer_epoch = epoch,
+                            "idempotent producer initialized"
+                        );
                         guard.init = InitState::Ready {
                             producer_id: pid,
                             producer_epoch: epoch,
@@ -398,7 +405,9 @@ impl IdempotentState {
                 producer_epoch,
             } => (*producer_id, *producer_epoch),
             InitState::Fatal(_) => return Err(AssignError::Fatal),
-            InitState::Uninitialized | InitState::Initializing => return Err(AssignError::NotReady),
+            InitState::Uninitialized | InitState::Initializing => {
+                return Err(AssignError::NotReady);
+            }
         };
 
         let key = (topic.clone(), partition);
@@ -418,14 +427,17 @@ impl IdempotentState {
             return Err(AssignError::PartitionBlocked);
         }
 
-        let part = guard.partitions.entry(key).or_insert_with(|| PartitionState {
-            producer_id: global_pid,
-            producer_epoch: global_epoch,
-            next_sequence: 0,
-            last_acked_sequence: NO_LAST_ACKED,
-            in_flight: VecDeque::new(),
-            pending_epoch_reset: None,
-        });
+        let part = guard
+            .partitions
+            .entry(key)
+            .or_insert_with(|| PartitionState {
+                producer_id: global_pid,
+                producer_epoch: global_epoch,
+                next_sequence: 0,
+                last_acked_sequence: NO_LAST_ACKED,
+                in_flight: VecDeque::new(),
+                pending_epoch_reset: None,
+            });
 
         let base_sequence = part.next_sequence;
         // Cap record_count at i32::MAX so the `as i32` below cannot
@@ -592,17 +604,20 @@ impl IdempotentState {
         let key = (batch.topic.clone(), batch.partition);
         let batch_bytes = batch.encoded.len();
         let mut guard = self.inner.lock().unwrap();
-        let part = guard.partitions.entry(key).or_insert_with(|| PartitionState {
-            producer_id: batch.producer_id,
-            producer_epoch: batch.producer_epoch,
-            // Conservative: if the partition entry vanished while we
-            // had the in-flight batch, restore next_sequence so it
-            // covers everything we know was sent.
-            next_sequence: increment_sequence(batch.base_sequence, batch.record_count),
-            last_acked_sequence: NO_LAST_ACKED,
-            in_flight: VecDeque::new(),
-            pending_epoch_reset: None,
-        });
+        let part = guard
+            .partitions
+            .entry(key)
+            .or_insert_with(|| PartitionState {
+                producer_id: batch.producer_id,
+                producer_epoch: batch.producer_epoch,
+                // Conservative: if the partition entry vanished while we
+                // had the in-flight batch, restore next_sequence so it
+                // covers everything we know was sent.
+                next_sequence: increment_sequence(batch.base_sequence, batch.record_count),
+                last_acked_sequence: NO_LAST_ACKED,
+                in_flight: VecDeque::new(),
+                pending_epoch_reset: None,
+            });
         part.in_flight.push_front(batch);
         self.track_inflight_bytes(batch_bytes);
     }
@@ -965,16 +980,18 @@ impl IdempotentState {
         let key = (batch.topic.clone(), batch.partition);
         let batch_bytes = batch.encoded.len();
         let mut guard = self.inner.lock().unwrap();
-        let part = guard.partitions.entry(key).or_insert_with(|| PartitionState {
-            producer_id: batch.producer_id,
-            producer_epoch: batch.producer_epoch,
-            next_sequence: 0,
-            last_acked_sequence: NO_LAST_ACKED,
-            in_flight: VecDeque::new(),
-            pending_epoch_reset: None,
-        });
-        part.next_sequence =
-            increment_sequence(batch.base_sequence, batch.record_count);
+        let part = guard
+            .partitions
+            .entry(key)
+            .or_insert_with(|| PartitionState {
+                producer_id: batch.producer_id,
+                producer_epoch: batch.producer_epoch,
+                next_sequence: 0,
+                last_acked_sequence: NO_LAST_ACKED,
+                in_flight: VecDeque::new(),
+                pending_epoch_reset: None,
+            });
+        part.next_sequence = increment_sequence(batch.base_sequence, batch.record_count);
         part.in_flight.push_back(batch);
         self.track_inflight_bytes(batch_bytes);
     }
@@ -1235,9 +1252,7 @@ mod tests {
                 next_attempt_at: Instant::now(),
             });
         }
-        let keys: Vec<_> = (0..3)
-            .map(|p| (topic("t"), PartitionId(p), 0i32))
-            .collect();
+        let keys: Vec<_> = (0..3).map(|p| (topic("t"), PartitionId(p), 0i32)).collect();
         let before = Instant::now();
         s.bump_attempts(&keys, Duration::from_millis(100), Duration::from_secs(1));
         for snap in s.snapshot_inflight() {
@@ -1411,7 +1426,11 @@ mod tests {
         // Completing the last in-flight batch returns the counter to 0.
         let tail = s.complete(&topic("t"), PartitionId(0), 3).unwrap();
         assert_eq!(tail.base_sequence, 3);
-        assert_eq!(s.inflight_bytes(), 0, "all batches drained, counter back to 0");
+        assert_eq!(
+            s.inflight_bytes(),
+            0,
+            "all batches drained, counter back to 0"
+        );
     }
 
     #[test]
@@ -1525,7 +1544,11 @@ mod tests {
         // reset must never re-stamp a batch that may already be on the
         // broker log.
         let head = s.snapshot_inflight().into_iter().next().unwrap();
-        assert_eq!(head.encoded.as_ptr(), original_ptr, "head must not be rewritten");
+        assert_eq!(
+            head.encoded.as_ptr(),
+            original_ptr,
+            "head must not be rewritten"
+        );
         assert_eq!(head.base_sequence, 0);
 
         // `assign` is blocked and the partition is drain-blocked while

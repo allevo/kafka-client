@@ -157,8 +157,7 @@ async fn buffer_memory_full_returns_buffer_full_after_max_block() {
     for _ in 0..1000 {
         match producer
             .send(
-                crate::ProducerRecord::new(topic.clone(), payload())
-                    .with_partition(PartitionId(0)),
+                crate::ProducerRecord::new(topic.clone(), payload()).with_partition(PartitionId(0)),
                 None,
             )
             .await
@@ -227,8 +226,7 @@ async fn buffer_full_policy_error_fails_fast_without_blocking() {
     for _ in 0..1000 {
         match producer
             .send(
-                crate::ProducerRecord::new(topic.clone(), payload())
-                    .with_partition(PartitionId(0)),
+                crate::ProducerRecord::new(topic.clone(), payload()).with_partition(PartitionId(0)),
                 None,
             )
             .await
@@ -331,8 +329,7 @@ async fn idempotent_in_flight_counts_against_buffer_memory() {
     for _ in 0..8 {
         let fut = producer
             .send(
-                crate::ProducerRecord::new(topic.clone(), payload())
-                    .with_partition(PartitionId(0)),
+                crate::ProducerRecord::new(topic.clone(), payload()).with_partition(PartitionId(0)),
                 None,
             )
             .await
@@ -362,8 +359,7 @@ async fn idempotent_in_flight_counts_against_buffer_memory() {
     for _ in 0..1000 {
         match producer
             .send(
-                crate::ProducerRecord::new(topic.clone(), payload())
-                    .with_partition(PartitionId(0)),
+                crate::ProducerRecord::new(topic.clone(), payload()).with_partition(PartitionId(0)),
                 None,
             )
             .await

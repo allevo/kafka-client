@@ -10,13 +10,12 @@ use tokio::sync::{Notify, mpsc, oneshot};
 use crate::client::PartitionId;
 use crate::error::{Error, Result};
 use crate::producer::RecordMetadata;
-use crate::producer::{BufferFullPolicy, ProducerConfig};
 use crate::producer::batch::{
     AppendOutcome, BatchProducerState, FreezeError, FrozenBatch, PartitionBatch, RecordPayload,
     estimate_record_size,
 };
 use crate::producer::idempotent::IdempotentState;
-
+use crate::producer::{BufferFullPolicy, ProducerConfig};
 
 /// A frozen batch ready to ship, paired with the routing key needed to build
 /// a `ProduceRequest`.
@@ -282,9 +281,7 @@ impl Accumulator {
                 // retry) is just as much occupied `buffer_memory` as one
                 // still buffered here. `inflight_bytes()` does not take
                 // the `inner` lock, so calling it under `guard` is safe.
-                if guard.bytes_in_use + self.inflight_bytes() + size
-                    <= self.config.buffer_memory
-                {
+                if guard.bytes_in_use + self.inflight_bytes() + size <= self.config.buffer_memory {
                     guard.bytes_in_use += size;
                     return Ok(());
                 }
@@ -377,8 +374,11 @@ impl Accumulator {
         partition: PartitionId,
         payload: RecordPayload,
     ) -> Result<AppendOutcome> {
-        let estimated_size =
-            estimate_record_size(payload.key.as_ref(), payload.value.as_ref(), &payload.headers);
+        let estimated_size = estimate_record_size(
+            payload.key.as_ref(),
+            payload.value.as_ref(),
+            &payload.headers,
+        );
         if estimated_size > self.config.max_record_size {
             return Err(Error::RecordTooLarge {
                 size: estimated_size,
@@ -593,10 +593,7 @@ impl Accumulator {
 /// dropped. `saturating_sub` is belt-and-braces — a drained batch's
 /// `reserved_bytes` was claimed by a prior `reserve`, so the
 /// subtraction never actually saturates in correct use.
-fn release_drained(
-    inner: &mut Inner,
-    drained: &[((TopicName, PartitionId), PartitionBatch)],
-) {
+fn release_drained(inner: &mut Inner, drained: &[((TopicName, PartitionId), PartitionBatch)]) {
     let released: usize = drained.iter().map(|(_, b)| b.reserved_bytes()).sum();
     inner.bytes_in_use = inner.bytes_in_use.saturating_sub(released);
 }
@@ -641,8 +638,7 @@ mod tests {
     }
 
     /// Default `state_for` closure for tests: always non-idempotent.
-    fn nonid()
-    -> impl FnMut(&TopicName, PartitionId, usize) -> BatchProducerState {
+    fn nonid() -> impl FnMut(&TopicName, PartitionId, usize) -> BatchProducerState {
         |_, _, _| BatchProducerState::non_idempotent()
     }
 
@@ -719,7 +715,11 @@ mod tests {
         }
         // Three appends, three full batches, all queued behind one key.
         let drained = acc.drain_all(nonid()).ready;
-        assert_eq!(drained.len(), 3, "each full tail rotates into its own batch");
+        assert_eq!(
+            drained.len(),
+            3,
+            "each full tail rotates into its own batch"
+        );
         for r in &drained {
             assert_eq!(r.frozen.record_count, 1);
         }
@@ -822,7 +822,10 @@ mod tests {
             .iter()
             .map(|r| {
                 let mut cursor = Cursor::new(r.frozen.encoded.as_ref());
-                RecordBatchDecoder::decode(&mut cursor).expect("decode").records[0].sequence
+                RecordBatchDecoder::decode(&mut cursor)
+                    .expect("decode")
+                    .records[0]
+                    .sequence
             })
             .collect();
         assert_eq!(
@@ -971,7 +974,9 @@ mod tests {
         let (acc, _rx) = Accumulator::new(cfg);
         let acc = Arc::new(acc);
 
-        acc.reserve(est, far()).await.expect("first reserve fits exactly");
+        acc.reserve(est, far())
+            .await
+            .expect("first reserve fits exactly");
         acc.append(topic("t"), PartitionId(0), p).expect("append");
 
         // A second reservation has no room and parks.
@@ -998,7 +1003,9 @@ mod tests {
         let cfg = Arc::new(ProducerConfig::default().with_buffer_memory(100));
         let (acc, _rx) = Accumulator::new(cfg);
         // Fill the buffer; nothing in this test ever drains it.
-        acc.reserve(100, far()).await.expect("first reserve fills the buffer");
+        acc.reserve(100, far())
+            .await
+            .expect("first reserve fills the buffer");
 
         // The second reservation parks and, with no drain ever freeing
         // room, must fail at its deadline rather than hang. Under the
@@ -1017,7 +1024,9 @@ mod tests {
         let (acc, _rx) = Accumulator::new(cfg);
         let acc = Arc::new(acc);
         // Fill the buffer so the next reserve has to park.
-        acc.reserve(100, far()).await.expect("first reserve fills the buffer");
+        acc.reserve(100, far())
+            .await
+            .expect("first reserve fills the buffer");
 
         let acc2 = acc.clone();
         let handle = tokio::spawn(async move { acc2.reserve(64, far()).await });
@@ -1112,7 +1121,10 @@ mod tests {
         // The unfreezable batch must not ship, and — crucially — must
         // not be dropped silently: it surfaces in `failed` carrying the
         // real cause and the live waiter.
-        assert!(drained.ready.is_empty(), "an unfreezable batch must not ship");
+        assert!(
+            drained.ready.is_empty(),
+            "an unfreezable batch must not ship"
+        );
         assert_eq!(drained.failed.len(), 1);
         let failure = drained.failed.into_iter().next().unwrap();
         assert_eq!(failure.partition, PartitionId(0));
@@ -1191,7 +1203,10 @@ mod tests {
             .ready;
         assert_eq!(drained.len(), 1, "only the healthy partition drains");
         assert_eq!(drained[0].topic, healthy);
-        assert!(!acc.is_empty(), "the blocked partition's batch stays buffered");
+        assert!(
+            !acc.is_empty(),
+            "the blocked partition's batch stays buffered"
+        );
 
         // Settle the in-flight batch → the queue empties → the deferred
         // reset applies → the partition unblocks → its buffered batch

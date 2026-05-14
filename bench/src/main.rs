@@ -28,7 +28,11 @@ struct Args {
     bootstrap: String,
 
     /// Crates to exercise: subset of `this,rdkafka,rskafka,samsa`.
-    #[arg(long, value_delimiter = ',', default_value = "this,rdkafka,rskafka,samsa")]
+    #[arg(
+        long,
+        value_delimiter = ',',
+        default_value = "this,rdkafka,rskafka,samsa"
+    )]
     crates: Vec<String>,
 
     /// Record sizes to sweep, in bytes.
@@ -110,19 +114,15 @@ async fn main() -> anyhow::Result<()> {
     // rather than deep inside the first cell. This `Client` is reused for
     // all topic admin (each crate's producer opens its own connection).
     let (host, port) = producers::parse_host_port(&args.bootstrap)?;
-    let admin_client = Client::connect(
-        &[Config::new(host, port)],
-        Security::Plaintext,
-        Auth::None,
-    )
-    .await
-    .with_context(|| {
-        format!(
-            "could not connect to broker at '{}' — is it running, and is \
+    let admin_client = Client::connect(&[Config::new(host, port)], Security::Plaintext, Auth::None)
+        .await
+        .with_context(|| {
+            format!(
+                "could not connect to broker at '{}' — is it running, and is \
              KAFKA_BOOTSTRAP / --bootstrap correct?",
-            args.bootstrap
-        )
-    })?;
+                args.bootstrap
+            )
+        })?;
     admin_client
         .refresh_metadata()
         .await
@@ -172,11 +172,25 @@ async fn main() -> anyhow::Result<()> {
                 unix_nanos,
             );
 
-            let result = run_cell(&admin_client, crate_id, &topic, size, &args, acks, duration, payload.clone()).await;
+            let result = run_cell(
+                &admin_client,
+                crate_id,
+                &topic,
+                size,
+                &args,
+                acks,
+                duration,
+                payload.clone(),
+            )
+            .await;
             results.push((crate_id, result));
         }
 
-        print_result_table(size, &reference_workload(size, &args, acks, duration), &results);
+        print_result_table(
+            size,
+            &reference_workload(size, &args, acks, duration),
+            &results,
+        );
     }
 
     print_footer(&args, cpus);
@@ -257,13 +271,24 @@ fn print_footer(args: &Args, cpus: usize) {
     println!("broker:        {}", args.bootstrap);
     println!(
         "host CPUs:     {}",
-        if cpus == 0 { "unknown".to_string() } else { cpus.to_string() },
+        if cpus == 0 {
+            "unknown".to_string()
+        } else {
+            cpus.to_string()
+        },
     );
     println!(
         "build profile: {}",
-        if cfg!(debug_assertions) { "debug (NUMBERS MEANINGLESS)" } else { "release" },
+        if cfg!(debug_assertions) {
+            "debug (NUMBERS MEANINGLESS)"
+        } else {
+            "release"
+        },
     );
-    println!("warmup:        {} records/cell, discarded", args.warmup_records);
+    println!(
+        "warmup:        {} records/cell, discarded",
+        args.warmup_records
+    );
     println!("topics:        one per (size, crate), wait_for_propagation=true");
     println!("clock:         starts before first measured send, stops after last ack + finalize()");
     println!("asymmetries:");

@@ -183,11 +183,9 @@ async fn dispatch_idempotent(
     // (clients/src/main/java/.../internals/TxnPartitionEntry.java:116-125):
     // sequentially re-stamp every in-flight batch, then advance
     // `next_sequence` past the last one.
-    if idem.has_pending_bumps() {
-        if !run_bump_pass(client, idem, accumulator).await {
-            // run_bump_pass already marked fatal + drained waiters; bail.
-            return;
-        }
+    if idem.has_pending_bumps() && !run_bump_pass(client, idem, accumulator).await {
+        // run_bump_pass already marked fatal + drained waiters; bail.
+        return;
     }
 
     // Capture the first assign failure across the whole drain pass so we
@@ -204,7 +202,9 @@ async fn dispatch_idempotent(
             return BatchProducerState::non_idempotent();
         }
         match assign_or_fail(idem, topic, partition, count) {
-            Ok(a) => BatchProducerState::idempotent(a.producer_id, a.producer_epoch, a.base_sequence),
+            Ok(a) => {
+                BatchProducerState::idempotent(a.producer_id, a.producer_epoch, a.base_sequence)
+            }
             Err(reason) => {
                 assign_failure = Some(reason);
                 BatchProducerState::non_idempotent()
@@ -325,10 +325,7 @@ fn drain(
 
 /// Group `ready` by partition leader, dropping batches whose topic
 /// metadata has gone away (with an error notification to waiters).
-fn group_by_leader(
-    client: &Client,
-    ready: Vec<ReadyBatch>,
-) -> HashMap<BrokerId, Vec<ReadyBatch>> {
+fn group_by_leader(client: &Client, ready: Vec<ReadyBatch>) -> HashMap<BrokerId, Vec<ReadyBatch>> {
     let mut by_leader: HashMap<BrokerId, Vec<ReadyBatch>> = HashMap::new();
     for batch in ready {
         let Some(meta) = client.topic_metadata(&batch.topic) else {
@@ -380,7 +377,7 @@ fn collect_dispatchable(
         if idem.is_eager_bump_pending(&snap.topic, snap.partition) {
             continue;
         }
-        if snap.attempt as u32 > config.retries {
+        if snap.attempt > config.retries {
             // Exceeded retries — fail and drop. Flag the partition for
             // an epoch bump in the same step: `assign()` advanced
             // `next_sequence` eagerly when this batch was frozen, so
@@ -475,9 +472,7 @@ fn group_inflight_by_leader(
             let topic_str = snap.topic.as_str().to_string();
             let partition_index = snap.partition.0;
             idem.fail_inflight_head(&snap.topic, snap.partition, BumpMode::Deferred, || {
-                Error::NoBrokerAvailable(format!(
-                    "no leader for {topic_str}-{partition_index}"
-                ))
+                Error::NoBrokerAvailable(format!("no leader for {topic_str}-{partition_index}"))
             });
             continue;
         };
@@ -512,8 +507,7 @@ async fn send_to_leader_basic(
 /// a hot partition into several batches per drain, so without this
 /// they would have to ship in one request — which the broker refuses.
 fn rounds_by_partition(batches: Vec<ReadyBatch>) -> Vec<Vec<ReadyBatch>> {
-    let mut by_partition: HashMap<(TopicName, PartitionId), VecDeque<ReadyBatch>> =
-        HashMap::new();
+    let mut by_partition: HashMap<(TopicName, PartitionId), VecDeque<ReadyBatch>> = HashMap::new();
     for batch in batches {
         by_partition
             .entry((batch.topic.clone(), batch.partition))
@@ -981,12 +975,7 @@ fn recover_unknown_pid_at_head(
     idem.reset_partition(topic, partition);
 
     let mut buf = BytesMut::from(&head.encoded[..]);
-    if let Err(e) = rewrite_producer_state(
-        &mut buf,
-        head.producer_id,
-        head.producer_epoch,
-        0,
-    ) {
+    if let Err(e) = rewrite_producer_state(&mut buf, head.producer_id, head.producer_epoch, 0) {
         // The encoded bytes were valid when we first stamped them in
         // `freeze`, so a rewrite failure here would mean memory or
         // implementation corruption — surface it as fatal rather than
@@ -999,9 +988,7 @@ fn recover_unknown_pid_at_head(
         );
         tracing::error!("{reason}");
         idem.mark_fatal(reason.clone());
-        notify_waiters_the_failure(head.waiters, || {
-            Error::IdempotenceFenced(reason.clone())
-        });
+        notify_waiters_the_failure(head.waiters, || Error::IdempotenceFenced(reason.clone()));
         drain_all_partition_waiters(idem, &reason);
         return;
     }
@@ -1113,9 +1100,9 @@ fn recover_message_too_large(
             );
             tracing::error!("{reason}");
             // Eager: the broker rejected this head with `MessageTooLarge`,
-        // so it (and every successor) is provably unsent — see the fn
-        // doc. The bump pass re-stamps the remaining queue from 0.
-        idem.request_partition_bump(topic, partition, BumpMode::Eager);
+            // so it (and every successor) is provably unsent — see the fn
+            // doc. The bump pass re-stamps the remaining queue from 0.
+            idem.request_partition_bump(topic, partition, BumpMode::Eager);
             notify_waiters_the_failure(head.waiters, move || Error::Protocol(reason.clone()));
             return;
         }
@@ -1170,7 +1157,10 @@ fn recover_message_too_large(
     let (encoded0, encoded1) = match (encoded0, encoded1) {
         (Ok(a), Ok(b)) => (a, b),
         (a, b) => {
-            let cause = a.err().or(b.err()).map_or_else(String::new, |e| e.to_string());
+            let cause = a
+                .err()
+                .or(b.err())
+                .map_or_else(String::new, |e| e.to_string());
             let reason = format!(
                 "MessageTooLarge split: re-encode failed for {}-{}: {cause}",
                 topic.as_str(),
@@ -1178,9 +1168,9 @@ fn recover_message_too_large(
             );
             tracing::error!("{reason}");
             // Eager: the broker rejected this head with `MessageTooLarge`,
-        // so it (and every successor) is provably unsent — see the fn
-        // doc. The bump pass re-stamps the remaining queue from 0.
-        idem.request_partition_bump(topic, partition, BumpMode::Eager);
+            // so it (and every successor) is provably unsent — see the fn
+            // doc. The bump pass re-stamps the remaining queue from 0.
+            idem.request_partition_bump(topic, partition, BumpMode::Eager);
             notify_waiters_the_failure(head.waiters, move || Error::Protocol(reason.clone()));
             return;
         }
@@ -1421,9 +1411,7 @@ fn rewrite_paused_batches(
             idem.mark_fatal(reason.clone());
             // The just-popped batch's waiters are not held by
             // `drain_all_partition_waiters` (we own them right now).
-            notify_waiters_the_failure(batch.waiters, || {
-                Error::IdempotenceFenced(reason.clone())
-            });
+            notify_waiters_the_failure(batch.waiters, || Error::IdempotenceFenced(reason.clone()));
             drain_and_fail_everything(accumulator, idem, &reason);
             return false;
         }
@@ -1509,10 +1497,7 @@ fn drain_all_partition_waiters(idem: &Arc<IdempotentState>, reason: &str) {
 /// a mid-drain `assign_failure` that is itself driving the producer
 /// to a fatal state — the extra flag is inert: `is_fatal` short-
 /// circuits every later tick before the bump set is ever read.)
-fn handle_idempotent_freeze_failures(
-    idem: &Arc<IdempotentState>,
-    failed: Vec<FreezeFailure>,
-) {
+fn handle_idempotent_freeze_failures(idem: &Arc<IdempotentState>, failed: Vec<FreezeFailure>) {
     for FreezeFailure {
         topic,
         partition,
@@ -1533,11 +1518,7 @@ fn handle_idempotent_freeze_failures(
 /// Drain the accumulator and the idempotent state's queues, failing
 /// every waiter with the same reason. Used when a fatal transition is
 /// detected (e.g. ensure_ready failed) so callers don't park forever.
-fn drain_and_fail_everything(
-    accumulator: &Accumulator,
-    idem: &Arc<IdempotentState>,
-    reason: &str,
-) {
+fn drain_and_fail_everything(accumulator: &Accumulator, idem: &Arc<IdempotentState>, reason: &str) {
     // Once the producer is fatal, sequence-space recovery is moot —
     // drop every pending bump and parked deferred reset so the
     // `drain_all` below isn't blocked from flushing a partition's
@@ -1559,9 +1540,7 @@ fn drain_and_fail_everything(
     // letting the oneshot senders drop.
     for FreezeFailure { waiters, .. } in failed {
         let owned = reason.to_string();
-        notify_waiters_the_failure(waiters, move || {
-            Error::IdempotenceFenced(owned.clone())
-        });
+        notify_waiters_the_failure(waiters, move || Error::IdempotenceFenced(owned.clone()));
     }
     drain_all_partition_waiters(idem, reason);
 }
@@ -1736,11 +1715,7 @@ mod tests {
     /// Build a 2-record v2 batch with the given producer state, for
     /// settle-path tests that need a real frame whose bytes can be
     /// decoded and CRC-verified after the rewrite.
-    fn encode_test_batch(
-        producer_id: i64,
-        producer_epoch: i16,
-        base_sequence: i32,
-    ) -> Bytes {
+    fn encode_test_batch(producer_id: i64, producer_epoch: i16, base_sequence: i32) -> Bytes {
         encode_test_batch_with_count(producer_id, producer_epoch, base_sequence, 2)
     }
 
@@ -1787,7 +1762,11 @@ mod tests {
     /// Build a `ProduceResponse` whose single partition entry carries
     /// `error_code` for `(topic, partition)`. The other fields default
     /// so the settle path treats it as the only partition response.
-    fn produce_response_with_code(topic: &TopicName, partition: PartitionId, error_code: i16) -> ProduceResponse {
+    fn produce_response_with_code(
+        topic: &TopicName,
+        partition: PartitionId,
+        error_code: i16,
+    ) -> ProduceResponse {
         let pr = PartitionProduceResponse::default()
             .with_index(partition.0)
             .with_error_code(error_code)
@@ -1820,7 +1799,11 @@ mod tests {
         let rounds = rounds_by_partition(batches);
 
         // Three rounds — bounded by p0's depth.
-        assert_eq!(rounds.len(), 3, "round count must equal the deepest partition");
+        assert_eq!(
+            rounds.len(),
+            3,
+            "round count must equal the deepest partition"
+        );
         // No round may carry two batches for one partition.
         for round in &rounds {
             let mut seen = std::collections::HashSet::new();
@@ -1837,14 +1820,21 @@ mod tests {
             .filter_map(|r| r.iter().find(|b| b.partition == PartitionId(0)))
             .map(|b| b.frozen.encoded[0])
             .collect();
-        assert_eq!(p0_markers, vec![1, 2, 3], "p0 must keep FIFO order across rounds");
+        assert_eq!(
+            p0_markers,
+            vec![1, 2, 3],
+            "p0 must keep FIFO order across rounds"
+        );
         // p1 appears exactly once — it only had one batch.
         let p1_count = rounds
             .iter()
             .flat_map(|r| r.iter())
             .filter(|b| b.partition == PartitionId(1))
             .count();
-        assert_eq!(p1_count, 1, "p1 had one batch, so it appears in exactly one round");
+        assert_eq!(
+            p1_count, 1,
+            "p1 had one batch, so it appears in exactly one round"
+        );
     }
 
     /// B2: an `UnknownProducerId` ack on the in-flight head with no
@@ -2019,7 +2009,10 @@ mod tests {
 
         let outcome = assign_or_fail(&idem, &topic("t"), PartitionId(3), 1);
         let reason = outcome.expect_err("blocked partition must surface as Err");
-        assert!(reason.contains("t-3"), "reason should name topic-partition: {reason}");
+        assert!(
+            reason.contains("t-3"),
+            "reason should name topic-partition: {reason}"
+        );
         assert!(
             idem.is_fatal(),
             "assign failure must transition the producer to fatal",
@@ -2206,7 +2199,9 @@ mod tests {
             std::io::ErrorKind::ConnectionReset,
             "reset",
         ))));
-        assert!(!is_fatal_bump_error(&Error::NoBrokerAvailable("gone".into())));
+        assert!(!is_fatal_bump_error(&Error::NoBrokerAvailable(
+            "gone".into()
+        )));
         assert!(!is_fatal_bump_error(&Error::RequestTimeout("over".into())));
         assert!(!is_fatal_bump_error(&Error::Broker {
             error: ResponseError::NotCoordinator,
@@ -2214,7 +2209,9 @@ mod tests {
 
         // Fatal: already-fenced, or a broker classification that maps
         // to Fatal / Abortable. `ClusterAuthorizationFailed` is fatal.
-        assert!(is_fatal_bump_error(&Error::IdempotenceFenced("fenced".into())));
+        assert!(is_fatal_bump_error(&Error::IdempotenceFenced(
+            "fenced".into()
+        )));
         assert!(is_fatal_bump_error(&Error::Broker {
             error: ResponseError::ClusterAuthorizationFailed,
         }));
@@ -2235,10 +2232,7 @@ mod tests {
 
         // Direct probe — `run_bump_pass` would short-circuit via this
         // same `partition_state` lookup.
-        assert_eq!(
-            idem.partition_state(&topic("ghost"), PartitionId(9)),
-            None,
-        );
+        assert_eq!(idem.partition_state(&topic("ghost"), PartitionId(9)), None,);
     }
 
     /// Build a `ProduceResponse` carrying distinct `error_code`s for two
@@ -2357,7 +2351,9 @@ mod tests {
         // The bad partition's waiter learns about the failure with the
         // broker's original error code.
         match rx_bad.try_recv() {
-            Ok(Err(Error::Broker { error: ResponseError::InvalidRecord })) => {}
+            Ok(Err(Error::Broker {
+                error: ResponseError::InvalidRecord,
+            })) => {}
             other => panic!("expected Broker(InvalidRecord), got {other:?}"),
         }
 
@@ -2449,7 +2445,11 @@ mod tests {
         let resp = ProduceResponse::default().with_responses(vec![tr]);
 
         let config = ProducerConfig::default();
-        let keys = vec![(t.clone(), p_bad, 0), (t.clone(), p_mid, 5), (t.clone(), p_ok, 11)];
+        let keys = vec![
+            (t.clone(), p_bad, 0),
+            (t.clone(), p_mid, 5),
+            (t.clone(), p_ok, 11),
+        ];
         settle_response_idempotent(
             resp,
             &idem,
@@ -2469,11 +2469,15 @@ mod tests {
         let mut by_part: HashMap<PartitionId, oneshot::Receiver<Result<RecordMetadata>>> =
             rxs.into_iter().collect();
         match by_part.remove(&p_bad).unwrap().try_recv() {
-            Ok(Err(Error::Broker { error: ResponseError::InvalidRecord })) => {}
+            Ok(Err(Error::Broker {
+                error: ResponseError::InvalidRecord,
+            })) => {}
             other => panic!("bad partition expected InvalidRecord, got {other:?}"),
         }
         match by_part.remove(&p_mid).unwrap().try_recv() {
-            Ok(Err(Error::Broker { error: ResponseError::MessageTooLarge })) => {}
+            Ok(Err(Error::Broker {
+                error: ResponseError::MessageTooLarge,
+            })) => {}
             other => panic!("mid partition expected MessageTooLarge, got {other:?}"),
         }
         match by_part.remove(&p_ok).unwrap().try_recv() {
@@ -2649,7 +2653,10 @@ mod tests {
         // Two batches now sit in the queue; the producer is not fatal,
         // and no bump was requested (the halves leave no sequence gap).
         assert!(!idem.is_fatal());
-        assert!(!idem.has_pending_bumps(), "a clean split must not flag a bump");
+        assert!(
+            !idem.has_pending_bumps(),
+            "a clean split must not flag a bump"
+        );
         let head = idem.snapshot_inflight();
         assert_eq!(head.len(), 1, "snapshot exposes only the head");
         assert_eq!(head[0].base_sequence, 0);
@@ -2822,7 +2829,10 @@ mod tests {
         // already have been dispatched and accepted by the broker, so
         // the bump pass must not re-stamp the in-flight queue (F7).
         assert!(idem.has_pending_bumps());
-        assert_eq!(idem.take_pending_bumps(), vec![((t, p), BumpMode::Deferred)]);
+        assert_eq!(
+            idem.take_pending_bumps(),
+            vec![((t, p), BumpMode::Deferred)]
+        );
     }
 
     /// T3a: a [`BumpMode::Deferred`] bump pass must NOT re-stamp the
@@ -2878,7 +2888,10 @@ mod tests {
         let decoded = RecordBatchDecoder::decode(&mut cursor).expect("head still decodes");
         for r in &decoded.records {
             assert_eq!(r.producer_id, 7, "producer_id must stay the old epoch's");
-            assert_eq!(r.producer_epoch, 0, "producer_epoch must stay the old epoch's");
+            assert_eq!(
+                r.producer_epoch, 0,
+                "producer_epoch must stay the old epoch's"
+            );
         }
 
         // `assign` stays blocked while the old-epoch queue drains.
@@ -2936,10 +2949,11 @@ mod tests {
         // The deferred reset fired: new (pid, epoch), next_sequence
         // rewound to 0, partition unblocked.
         assert!(!idem.drain_blocked_partitions().contains(&(t.clone(), p)));
-        let assigned = idem.assign(&t, p, 1).expect("partition unblocked after drain");
+        let assigned = idem
+            .assign(&t, p, 1)
+            .expect("partition unblocked after drain");
         assert_eq!(assigned.producer_id, 888);
         assert_eq!(assigned.producer_epoch, 9);
         assert_eq!(assigned.base_sequence, 0);
     }
 }
-

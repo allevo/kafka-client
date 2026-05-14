@@ -187,8 +187,7 @@ async fn idempotent_rotation_keeps_sequences_monotonic() {
         let payload = Bytes::from(vec![b'x'; PAYLOAD_LEN]);
         let fut = producer
             .send(
-                crate::ProducerRecord::new(topic.clone(), payload)
-                    .with_partition(PartitionId(0)),
+                crate::ProducerRecord::new(topic.clone(), payload).with_partition(PartitionId(0)),
                 None,
             )
             .await
@@ -251,7 +250,10 @@ async fn idempotent_rotation_keeps_sequences_monotonic() {
         }
         expected_base += batch.records.len() as i32;
     }
-    assert_eq!(count, N, "expected exactly {N} records on disk, found {count}");
+    assert_eq!(
+        count, N,
+        "expected exactly {N} records on disk, found {count}"
+    );
 
     producer.close().await.unwrap();
 }
@@ -654,7 +656,10 @@ async fn idempotent_exactly_once_under_proxy_failure() {
             count += 1;
         }
     }
-    assert_eq!(count, N, "expected exactly {N} records on disk, found {count}");
+    assert_eq!(
+        count, N,
+        "expected exactly {N} records on disk, found {count}"
+    );
 
     // The on-disk count proves the *outcome* is exactly-once; these two
     // assertions prove the producer actually *traversed* the recovery
@@ -719,8 +724,7 @@ async fn message_too_large_recovers_via_split() {
         let payload = Bytes::from(vec![b'x'; PAYLOAD_LEN]);
         let fut = producer
             .send(
-                crate::ProducerRecord::new(topic.clone(), payload)
-                    .with_partition(PartitionId(0)),
+                crate::ProducerRecord::new(topic.clone(), payload).with_partition(PartitionId(0)),
                 None,
             )
             .await
@@ -759,7 +763,10 @@ async fn message_too_large_recovers_via_split() {
     let mut seen: HashSet<(i64, i32)> = HashSet::with_capacity(N);
     for batch in &batches {
         for r in &batch.records {
-            assert_eq!(r.offset, expected_offset, "non-monotonic offset at index {count}");
+            assert_eq!(
+                r.offset, expected_offset,
+                "non-monotonic offset at index {count}"
+            );
             expected_offset += 1;
             assert!(
                 r.producer_id != -1,
@@ -774,7 +781,10 @@ async fn message_too_large_recovers_via_split() {
             count += 1;
         }
     }
-    assert_eq!(count, N, "expected exactly {N} records on disk, found {count}");
+    assert_eq!(
+        count, N,
+        "expected exactly {N} records on disk, found {count}"
+    );
 
     // The on-disk count proves the *outcome*; this assertion proves
     // the producer actually traversed the split path. The argument is
@@ -1028,7 +1038,10 @@ async fn epoch_bump_never_duplicates_accepted_batch() {
     let mut ids: Vec<(i64, i16)> = Vec::with_capacity(total_expected);
     for batch in &batches {
         for r in &batch.records {
-            assert_eq!(r.offset, expected_offset, "non-monotonic offset at index {count}");
+            assert_eq!(
+                r.offset, expected_offset,
+                "non-monotonic offset at index {count}"
+            );
             expected_offset += 1;
             assert!(
                 r.producer_id != -1,
@@ -1076,7 +1089,9 @@ async fn epoch_bump_never_duplicates_accepted_batch() {
     // a regression that skipped the bump (or took the eager path) fails
     // here even if the record count happened to look right.
     assert!(
-        logs_contain("bump-pass: parked deferred epoch reset; old-epoch in-flight queue must drain first"),
+        logs_contain(
+            "bump-pass: parked deferred epoch reset; old-epoch in-flight queue must drain first"
+        ),
         "deferred bump-pass log not seen — the epoch-bump duplicate guard did not run",
     );
 

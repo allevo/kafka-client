@@ -75,8 +75,7 @@ pub(crate) fn rewrite_producer_state(
         )));
     }
     buf[PRODUCER_ID_OFFSET..PRODUCER_ID_OFFSET + 8].copy_from_slice(&new_pid.to_be_bytes());
-    buf[PRODUCER_EPOCH_OFFSET..PRODUCER_EPOCH_OFFSET + 2]
-        .copy_from_slice(&new_epoch.to_be_bytes());
+    buf[PRODUCER_EPOCH_OFFSET..PRODUCER_EPOCH_OFFSET + 2].copy_from_slice(&new_epoch.to_be_bytes());
     buf[BASE_SEQUENCE_OFFSET..BASE_SEQUENCE_OFFSET + 4]
         .copy_from_slice(&new_base_seq.to_be_bytes());
     // CRC inputs span attributes through the end of the (possibly
@@ -209,7 +208,12 @@ mod tests {
     /// silently corrupting writes.
     #[test]
     fn encoder_layout_matches_hardcoded_offsets() {
-        let original = encode_batch(0xDEAD_BEEF_CAFE_BABEu64 as i64, 0x1234, 0x5678_9ABC, Compression::None);
+        let original = encode_batch(
+            0xDEAD_BEEF_CAFE_BABEu64 as i64,
+            0x1234,
+            0x5678_9ABC,
+            Compression::None,
+        );
         assert!(original.len() >= RECORDS_OFFSET);
         assert_eq!(original[MAGIC_OFFSET], MAGIC_V2);
         assert_eq!(
@@ -246,6 +250,10 @@ mod tests {
         let original = encode_batch(NO_PRODUCER_ID, NO_PRODUCER_EPOCH, 0, Compression::None);
         let mut buf = BytesMut::from(&original[..]);
         rewrite_producer_state(&mut buf, NO_PRODUCER_ID, NO_PRODUCER_EPOCH, 0).expect("rewrite");
-        assert_eq!(buf.as_ref(), original.as_ref(), "no-op rewrite must be byte-identical");
+        assert_eq!(
+            buf.as_ref(),
+            original.as_ref(),
+            "no-op rewrite must be byte-identical"
+        );
     }
 }

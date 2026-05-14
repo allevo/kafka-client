@@ -52,8 +52,7 @@ async fn single_partition_burst_produces_multiple_wire_batches() {
         let payload = Bytes::from(vec![b'x'; PAYLOAD_LEN]);
         let fut = producer
             .send(
-                crate::ProducerRecord::new(topic.clone(), payload)
-                    .with_partition(PartitionId(0)),
+                crate::ProducerRecord::new(topic.clone(), payload).with_partition(PartitionId(0)),
                 None,
             )
             .await
@@ -87,7 +86,10 @@ async fn single_partition_burst_produces_multiple_wire_batches() {
             count += 1;
         }
     }
-    assert_eq!(count, N, "expected exactly {N} records on disk, found {count}");
+    assert_eq!(
+        count, N,
+        "expected exactly {N} records on disk, found {count}"
+    );
 
     producer.close().await.unwrap();
 }
