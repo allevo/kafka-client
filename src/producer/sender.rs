@@ -15,7 +15,9 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
 
-use crate::client::{CallOptions, Client, ClientResponseFuture, NodeTarget, PartitionId, find_partition};
+use crate::client::{
+    CallOptions, Client, ClientResponseFuture, NodeTarget, PartitionId, find_partition,
+};
 use crate::error::{Error, Result, RetryAction};
 use crate::producer::accumulator::{
     Accumulator, DrainOutcome, FreezeFailure, PendingBatch, ReadyBatch,
@@ -529,7 +531,9 @@ async fn send_to_leader_basic(
             let depth = max_in_flight.max(1);
             loop {
                 while in_flight.len() < depth {
-                    let Some(round) = rounds_iter.next() else { break };
+                    let Some(round) = rounds_iter.next() else {
+                        break;
+                    };
                     // `submit_round_with_ack` awaits the broker mpsc
                     // push but not the broker's response — the response
                     // future is pushed onto `in_flight` and raced.
@@ -2100,10 +2104,10 @@ mod tests {
             next_attempt_at: now,
         });
 
-        let mut config = ProducerConfig::default();
-        // High retries cap so the backed-off head isn't dropped for
-        // exceeding retries before the backoff check runs.
-        config.retries = 10;
+        let config = ProducerConfig::default()
+            // High retries cap so the backed-off head isn't dropped for
+            // exceeding retries before the backoff check runs.
+            .with_retries(20);
 
         let out = collect_dispatchable(&config, &idem, now);
         assert_eq!(out.len(), 1, "exactly one partition should dispatch");

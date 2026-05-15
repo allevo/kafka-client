@@ -487,16 +487,12 @@ impl Accumulator {
                     continue;
                 }
                 let deque = guard.batches.get_mut(&key).expect("key just observed");
-                loop {
+                while let Some(front) = deque.front() {
                     // Pop while the front is shippable. A non-full front
                     // can only be the tail (every predecessor is full by
                     // construction), so the linger check is tail-only.
-                    let ready = match deque.front() {
-                        Some(front) => {
-                            front.is_full() || (deque.len() == 1 && front.age(now) >= linger)
-                        }
-                        None => break,
-                    };
+                    let ready = front.is_full() || (deque.len() == 1 && front.age(now) >= linger);
+
                     if !ready {
                         break;
                     }

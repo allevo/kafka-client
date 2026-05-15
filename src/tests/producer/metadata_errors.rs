@@ -38,7 +38,10 @@ async fn cached_unknown_topic_refreshes_then_succeeds() {
 
     // Seed the cache with `Some(UnknownTopicOrPartition)`. Mirrors the
     // setup in `refresh_topics_surfaces_topic_level_errors`.
-    client.refresh_topics(&[topic.clone()]).await.unwrap();
+    client
+        .refresh_topics(std::slice::from_ref(&topic))
+        .await
+        .unwrap();
     let cached = client.topic_metadata(&topic).expect("errored entry cached");
     assert!(matches!(
         cached.error,

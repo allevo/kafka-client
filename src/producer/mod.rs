@@ -706,8 +706,11 @@ impl Producer {
 
             // Bound the refresh to whatever is left of the budget so a
             // hung broker can't extend the wait beyond `deadline`.
-            match tokio::time::timeout_at(deadline, self.client.refresh_topics(&[topic.clone()]))
-                .await
+            match tokio::time::timeout_at(
+                deadline,
+                self.client.refresh_topics(std::slice::from_ref(topic)),
+            )
+            .await
             {
                 Ok(Ok(())) => continue,
                 Ok(Err(e)) => return Err(e),

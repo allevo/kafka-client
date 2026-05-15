@@ -313,6 +313,11 @@ async fn handle_fetch_response(
     ProcessOutcome::Continue
 }
 
+/// Per-partition tuple staged for a Fetch round: `(partition,
+/// leader_epoch, fetch_offset)`. Folded into `FetchPartition` once
+/// the per-leader grouping is complete.
+type PartitionFetchEntry = (PartitionId, i32, i64);
+
 /// Group cursors by leader and spawn one Fetch task per leader. Each
 /// task resolves to `(leader_id, Result<FetchResponse>)` so the caller
 /// can route responses back to per-partition handling.
@@ -327,7 +332,7 @@ fn dispatch_round(
 ) {
     // Group by leader, then by topic, so each leader gets one
     // FetchRequest with one FetchTopic entry per topic.
-    let mut by_leader: HashMap<BrokerId, HashMap<TopicName, Vec<(PartitionId, i32, i64)>>> =
+    let mut by_leader: HashMap<BrokerId, HashMap<TopicName, Vec<PartitionFetchEntry>>> =
         HashMap::new();
     for (tp, cursor) in cursors {
         by_leader
@@ -615,7 +620,7 @@ async fn handle_partition_error(
             // Best-effort: even if the refresh RPC fails, we still bump
             // the attempt counter so a persistently failing topology
             // eventually drops the partition.
-            let _ = client.refresh_topics(&[tp.topic.clone()]).await;
+            let _ = client.refresh_topics(std::slice::from_ref(&tp.topic)).await;
             if let Some(cursor) = cursors.get_mut(tp) {
                 cursor.refresh_attempts = cursor.refresh_attempts.saturating_add(1);
                 if cursor.refresh_attempts >= MAX_REFRESH_ATTEMPTS {

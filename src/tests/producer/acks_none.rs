@@ -43,7 +43,7 @@ async fn acks_none_round_trip() {
     // reports `error_code == 0`: same `getPartitionOrException` path
     // Produce uses, so a green Fetch proves Produce will be accepted.
     client
-        .refresh_topics(&[topic.clone()])
+        .refresh_topics(std::slice::from_ref(&topic))
         .await
         .expect("topic metadata must refresh");
     let leader = leader_for(&client, &topic).await;
