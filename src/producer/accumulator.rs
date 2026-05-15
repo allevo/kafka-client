@@ -10,6 +10,8 @@ use tokio::sync::{Notify, mpsc, oneshot};
 use crate::client::PartitionId;
 use crate::error::{Error, Result};
 use crate::producer::RecordMetadata;
+use zeropool::BufferPool;
+
 use crate::producer::batch::{
     AppendOutcome, BatchProducerState, FreezeError, FrozenBatch, PartitionBatch, RecordPayload,
     estimate_record_size,
@@ -165,6 +167,17 @@ pub(crate) struct Accumulator {
     inner: Mutex<Inner>,
     ready_tx: mpsc::UnboundedSender<()>,
     config: Arc<ProducerConfig>,
+    /// Recycled `Vec<u8>` allocations for batch encoding. Backed by
+    /// [`zeropool::BufferPool`] (the same primitive the broker layer
+    /// uses for request buffers) with `min_buffer_size` tuned to the
+    /// per-batch cap so we don't over-reserve I/O-buffer-scale (1 MiB+)
+    /// allocations for 16 KiB batches. `Bytes::from_owner(PooledBuffer)`
+    /// in `PartitionBatch::freeze` keeps the buffer alive until the
+    /// last `Bytes` clone drops, after which `PooledBuffer::Drop`
+    /// returns it to the pool — works uniformly for the non-idempotent
+    /// path (refcount 1) and the idempotent in-flight queue (refcount
+    /// ≥ 2 while dispatched).
+    buffer_pool: BufferPool,
     /// Signalled whenever the in-use byte count drops (a drain or an
     /// explicit `release`) or the producer closes. Parked `reserve`
     /// callers wait on it. Not sticky — `reserve` subscribes *before*
@@ -181,6 +194,11 @@ pub(crate) struct Accumulator {
     /// there is no large-request starvation), but a fair, wake-one
     /// scheme is the intended future change.
     room_available: Notify,
+    /// Signalled whenever a drain pass empties the per-partition batch
+    /// map (or `mark_closed` is called). `Producer::flush` parks here
+    /// instead of polling `is_empty` on a sleep loop. Subscribed-before-
+    /// checked for lost-wakeup safety, same pattern as `room_available`.
+    empty_available: Notify,
     /// Set once by `mark_closed` on `Producer::close`/`Drop`. A parked
     /// `reserve` woken by the close-time `notify_waiters` observes this
     /// and returns promptly instead of waiting out `max_block` (N9).
@@ -200,6 +218,12 @@ pub(crate) struct Accumulator {
 impl Accumulator {
     pub(crate) fn new(config: Arc<ProducerConfig>) -> (Self, mpsc::UnboundedReceiver<()>) {
         let (ready_tx, ready_rx) = mpsc::unbounded_channel();
+        // Size the pool's per-buffer floor to the configured per-batch
+        // cap so a `pool.get(batch_size)` doesn't hand back zeropool's
+        // I/O-tuned 1 MiB default for a 16 KiB record-batch encode.
+        let buffer_pool = BufferPool::builder()
+            .min_buffer_size(config.batch_size_bytes.max(4096))
+            .build();
         let acc = Self {
             inner: Mutex::new(Inner {
                 batches: HashMap::new(),
@@ -207,7 +231,9 @@ impl Accumulator {
             }),
             ready_tx,
             config,
+            buffer_pool,
             room_available: Notify::new(),
+            empty_available: Notify::new(),
             closed: AtomicBool::new(false),
             idempotent: None,
         };
@@ -337,6 +363,12 @@ impl Accumulator {
     pub(crate) fn mark_closed(&self) {
         self.closed.store(true, Ordering::Release);
         self.room_available.notify_waiters();
+        // A `flush()` parked after close should also unblock — the next
+        // drain (run by the sender on its shutdown path) will empty the
+        // accumulator, but signalling here covers any race where a
+        // close-after-flush sequence sees an already-empty accumulator
+        // before the next drain runs.
+        self.empty_available.notify_waiters();
     }
 
     /// Wake every parked `reserve` caller so it re-checks the
@@ -445,7 +477,7 @@ impl Accumulator {
         // blocked set *before* taking the `inner` lock so the
         // idempotent-state lock is never nested under it.
         let blocked = self.drain_blocked_partitions();
-        let drained = {
+        let (drained, empty_after) = {
             let mut guard = self.inner.lock().unwrap();
             let linger = self.config.linger;
             let keys: Vec<(TopicName, PartitionId)> = guard.batches.keys().cloned().collect();
@@ -478,13 +510,19 @@ impl Accumulator {
             // A drained batch's records have left the buffer — hand
             // their reserved budget back under the same lock.
             release_drained(&mut guard, &drained);
-            drained
+            let empty = guard.batches.is_empty();
+            (drained, empty)
         };
         // One wakeup per drain pass, after the lock is dropped: cheap,
         // and idempotent when the pass drained nothing.
         // TODO(fairness): wakes *all* parked reservers, not just one —
         // see the `room_available` field doc.
         self.room_available.notify_waiters();
+        if empty_after {
+            // Edge-trigger `Producer::flush` — only fires on the
+            // non-empty → empty transition, not on every tick.
+            self.empty_available.notify_waiters();
+        }
         self.freeze_all(drained, state_for)
     }
 
@@ -504,9 +542,9 @@ impl Accumulator {
         // all recovery state first (`abort_all_recovery`), so it still
         // flushes everything.
         let blocked = self.drain_blocked_partitions();
-        let drained: Vec<((TopicName, PartitionId), PartitionBatch)> = {
+        let (drained, empty_after) = {
             let mut guard = self.inner.lock().unwrap();
-            let mut out = Vec::new();
+            let mut out: Vec<((TopicName, PartitionId), PartitionBatch)> = Vec::new();
             // `retain` keeps the drain-blocked deques in place and drains
             // every other key out. VecDeque iterates front-to-back, so a
             // key's batches stay FIFO and consecutive — `freeze_all`'s
@@ -523,12 +561,34 @@ impl Accumulator {
             });
             // Every drained batch left the buffer — release its budget.
             release_drained(&mut guard, &out);
-            out
+            let empty = guard.batches.is_empty();
+            (out, empty)
         };
         // TODO(fairness): wakes *all* parked reservers, not just one —
         // see the `room_available` field doc.
         self.room_available.notify_waiters();
+        if empty_after {
+            self.empty_available.notify_waiters();
+        }
         self.freeze_all(drained, state_for)
+    }
+
+    /// Block until the accumulator is observed empty. Drain paths fire
+    /// `empty_available` on the non-empty → empty transition; flush
+    /// parks here instead of sleep-polling.
+    pub(crate) async fn await_empty(&self) {
+        loop {
+            // Subscribe before the check — same lost-wakeup-safety
+            // pattern as `reserve` against `room_available`. If a drain
+            // signals between subscribe and re-check, the pending
+            // `notified.await` returns immediately.
+            let notified = self.empty_available.notified();
+            tokio::pin!(notified);
+            if self.is_empty() {
+                return;
+            }
+            notified.as_mut().await;
+        }
     }
 
     /// True iff there are zero buffered records. The sender uses this on
@@ -569,7 +629,12 @@ impl Accumulator {
         for ((topic, partition), batch) in drained {
             let record_count = batch.len();
             let state = state_for(&topic, partition, record_count);
-            match batch.freeze(state, self.config.compression, self.config.max_request_size) {
+            match batch.freeze(
+                state,
+                self.config.compression,
+                self.config.max_request_size,
+                &self.buffer_pool,
+            ) {
                 Ok(frozen) => ready.push(ReadyBatch {
                     topic,
                     partition,

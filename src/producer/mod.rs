@@ -723,9 +723,7 @@ impl Producer {
     /// Wait until every record currently in the accumulator has been
     /// drained.
     pub async fn flush(&self) -> Result<()> {
-        while !self.accumulator.is_empty() {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
+        self.accumulator.await_empty().await;
         Ok(())
     }
 

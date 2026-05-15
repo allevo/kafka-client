@@ -1,6 +1,6 @@
 use std::time::{Duration, Instant};
 
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
 use kafka_protocol::ResponseError;
 use kafka_protocol::indexmap::IndexMap;
 use kafka_protocol::protocol::StrBytes;
@@ -9,6 +9,7 @@ use kafka_protocol::records::{
     RecordEncodeOptions, TimestampType,
 };
 use tokio::sync::oneshot;
+use zeropool::BufferPool;
 
 use crate::error::{Error, Result};
 use crate::producer::RecordMetadata;
@@ -230,6 +231,7 @@ impl PartitionBatch {
         state: BatchProducerState,
         compression: Compression,
         max_request_size: usize,
+        pool: &BufferPool,
     ) -> std::result::Result<FrozenBatch, FreezeError> {
         // Force the v2-batch invariants uniformly across every record. The
         // per-record `sequence` runs `base_sequence + i`; the encoder reads
@@ -249,14 +251,21 @@ impl PartitionBatch {
             version: 2,
             compression,
         };
-        let mut buf = BytesMut::new();
-        if let Err(e) = RecordBatchEncoder::encode(&mut buf, self.records.iter(), &options) {
+        // Pool-backed buffer sized off the running uncompressed estimate
+        // (header overhead already included). `pool.get` returns a buffer
+        // whose `len()` is preset to the requested capacity — clear it
+        // so the `BufMut` encode appends from position 0. `Bytes::from_owner`
+        // keeps the `PooledBuffer` alive until the last `Bytes` clone
+        // drops, at which point zeropool reclaims the allocation.
+        let mut buf = pool.get(self.size_estimator.0);
+        buf.clear();
+        if let Err(e) = RecordBatchEncoder::encode(&mut *buf, self.records.iter(), &options) {
             return Err(FreezeError {
                 error: Error::Protocol(format!("record batch encode: {e}")),
                 waiters: self.waiters,
             });
         }
-        let encoded = buf.freeze();
+        let encoded = Bytes::from_owner(buf);
 
         // Post-encode guard: check the real (post-compression) frame, not
         // the uncompressed `append`-time estimate. An over-cap frame is
@@ -341,6 +350,10 @@ mod tests {
     use kafka_protocol::records::RecordBatchDecoder;
     use std::io::Cursor;
 
+    fn test_pool() -> BufferPool {
+        BufferPool::new()
+    }
+
     fn sample_payload(key: Option<&'static [u8]>, value: Option<&'static [u8]>) -> RecordPayload {
         RecordPayload {
             key: key.map(Bytes::from_static),
@@ -422,6 +435,7 @@ mod tests {
                 BatchProducerState::non_idempotent(),
                 Compression::None,
                 usize::MAX,
+                &test_pool(),
             )
             .expect("encode");
         assert_eq!(frozen.record_count, 3);
@@ -489,6 +503,7 @@ mod tests {
                 BatchProducerState::non_idempotent(),
                 Compression::None,
                 usize::MAX,
+                &test_pool(),
             )
             .expect("encode plain");
         let frozen_gz = gzipped
@@ -496,6 +511,7 @@ mod tests {
                 BatchProducerState::non_idempotent(),
                 Compression::Gzip,
                 usize::MAX,
+                &test_pool(),
             )
             .expect("encode gzip");
         assert_ne!(
@@ -529,6 +545,7 @@ mod tests {
             BatchProducerState::non_idempotent(),
             Compression::None,
             1024,
+            &test_pool(),
         ) {
             Err(FreezeError {
                 error: Error::Broker { error },
@@ -553,6 +570,7 @@ mod tests {
                 BatchProducerState::non_idempotent(),
                 Compression::Gzip,
                 1024,
+                &test_pool(),
             )
             .expect("gzip of a repetitive payload fits under the cap");
         assert!(
@@ -573,6 +591,7 @@ mod tests {
                 BatchProducerState::non_idempotent(),
                 Compression::None,
                 usize::MAX,
+                &test_pool(),
             )
             .expect("encode");
         assert_eq!(frozen.waiters.len(), 2);
@@ -607,6 +626,7 @@ mod tests {
                 BatchProducerState::idempotent(123, 7, 100),
                 Compression::None,
                 usize::MAX,
+                &test_pool(),
             )
             .expect("encode");
         assert_eq!(frozen.record_count, 3);
