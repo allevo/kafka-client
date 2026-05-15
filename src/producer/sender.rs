@@ -3,6 +3,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bytes::{Bytes, BytesMut};
+use futures_util::StreamExt;
+use futures_util::stream::FuturesUnordered;
 use kafka_protocol::ResponseError;
 use kafka_protocol::messages::produce_request::{PartitionProduceData, TopicProduceData};
 use kafka_protocol::messages::{ApiKey, BrokerId, ProduceRequest, ProduceResponse, TopicName};
@@ -13,7 +15,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
 
-use crate::client::{CallOptions, Client, NodeTarget, PartitionId, find_partition};
+use crate::client::{CallOptions, Client, ClientResponseFuture, NodeTarget, PartitionId, find_partition};
 use crate::error::{Error, Result, RetryAction};
 use crate::producer::accumulator::{
     Accumulator, DrainOutcome, FreezeFailure, PendingBatch, ReadyBatch,
@@ -139,7 +141,14 @@ async fn dispatch_non_idempotent(
     let by_leader = group_by_leader(client, ready);
 
     for (leader, batches) in by_leader {
-        send_to_leader_basic(client, leader, config.acks, batches).await;
+        send_to_leader_basic(
+            client,
+            leader,
+            config.acks,
+            config.max_in_flight_per_broker,
+            batches,
+        )
+        .await;
     }
 }
 
@@ -489,14 +498,49 @@ fn group_inflight_by_leader(
 /// `RecordAccumulator.drainBatchesForOneNode`, which polls a single
 /// `ProducerBatch` per partition per drain. No per-batch retry, no
 /// in-flight tracking.
+///
+/// Up to `max_in_flight` rounds are kept on the wire concurrently for
+/// the `acks > 0` paths so a single hot partition's rotated batches are
+/// pipelined instead of serialised one RTT at a time. The submission
+/// half runs strictly in round order on this task, so the
+/// per-partition wire order matches the per-partition drain order; only
+/// the response-await is raced.
 async fn send_to_leader_basic(
     client: &Client,
     leader: BrokerId,
     acks: Acks,
+    max_in_flight: usize,
     batches: Vec<ReadyBatch>,
 ) {
-    for round in rounds_by_partition(batches) {
-        send_one_round_basic(client, leader, acks, round).await;
+    let rounds = rounds_by_partition(batches);
+    match acks {
+        Acks::None => {
+            // No response to await; the only shared sync point is the
+            // socket flush in `BrokerClient::send_oneway`, which is
+            // already coalesced by the writer's batching. Keep this
+            // branch serial.
+            for round in rounds {
+                send_one_round_oneway(client, leader, round).await;
+            }
+        }
+        Acks::All | Acks::Leader => {
+            let mut in_flight: FuturesUnordered<_> = FuturesUnordered::new();
+            let mut rounds_iter = rounds.into_iter();
+            let depth = max_in_flight.max(1);
+            loop {
+                while in_flight.len() < depth {
+                    let Some(round) = rounds_iter.next() else { break };
+                    // `submit_round_with_ack` awaits the broker mpsc
+                    // push but not the broker's response — the response
+                    // future is pushed onto `in_flight` and raced.
+                    let submitted = submit_round_with_ack(client, leader, acks, round).await;
+                    in_flight.push(await_and_settle_basic(submitted));
+                }
+                if in_flight.next().await.is_none() {
+                    break;
+                }
+            }
+        }
     }
 }
 
@@ -530,15 +574,34 @@ fn rounds_by_partition(batches: Vec<ReadyBatch>) -> Vec<Vec<ReadyBatch>> {
     rounds
 }
 
-/// Ship one round — at most one batch per partition — as a single
-/// `ProduceRequest` and settle its waiters. `batches` must already be
-/// deduplicated to one entry per partition (see `rounds_by_partition`).
-async fn send_one_round_basic(
+/// In-flight handle for one pipelined round: the still-pending response
+/// future (or the submission error to surface) together with the half
+/// of each batch needed to settle its waiters when the response lands.
+struct SubmittedRound {
+    result: Result<ClientResponseFuture<ProduceResponse>>,
+    pending_batches: Vec<PendingBatch>,
+}
+
+/// Build one round's `ProduceRequest` for the `acks > 0` path and submit
+/// it via `Client::send_pipelined`. Awaits only the broker-mpsc push (so
+/// later rounds see this round's bytes on the wire first); the broker's
+/// response stays uncollected on the returned [`SubmittedRound`]. The
+/// caller is responsible for awaiting and settling via
+/// [`await_and_settle_basic`].
+async fn submit_round_with_ack(
     client: &Client,
     leader: BrokerId,
     acks: Acks,
     batches: Vec<ReadyBatch>,
-) {
+) -> SubmittedRound {
+    // Invariant: this path uses `send_pipelined` and awaits a real
+    // ProduceResponse. `Acks::None` produces no response and must go
+    // through `send_one_round_oneway` instead (see `send_to_leader_basic`).
+    debug_assert!(
+        matches!(acks, Acks::All | Acks::Leader),
+        "submit_round_with_ack requires acks > 0, got {acks:?}",
+    );
+
     // Split each batch up front: the encoded half is moved into the
     // outgoing `ProduceRequest` (no `Bytes::clone`), the pending half
     // stays here to settle waiters once the response lands.
@@ -563,75 +626,123 @@ async fn send_one_round_basic(
         })
         .collect();
 
-    // ProduceRequest v9: 0 = no ack, 1 = leader-only, -1 = full ISR.
+    // ProduceRequest v9: 1 = leader-only, -1 = full ISR.
     let request = ProduceRequest::default()
         .with_transactional_id(None)
         .with_acks(acks.as_i16())
         .with_timeout_ms(duration_to_ms(PRODUCE_REQUEST_TIMEOUT))
         .with_topic_data(topic_data);
 
-    match acks {
-        Acks::None => {
-            let result = client
-                .send_oneway(
-                    NodeTarget::Broker(leader),
-                    ApiKey::Produce,
-                    9,
-                    request,
-                    &CallOptions::new().with_timeout(PRODUCE_CALL_TIMEOUT),
-                )
-                .await;
+    // `send_pipelined`: no retry loop. A partial-success ProduceResponse
+    // (some partitions OK, some not) must not be retransmitted blindly —
+    // that would reorder/duplicate the OK partitions. Per-partition retry
+    // is the idempotent path's responsibility.
+    let result = client
+        .send_pipelined::<ProduceRequest, ProduceResponse>(
+            NodeTarget::Broker(leader),
+            ApiKey::Produce,
+            9,
+            request,
+            &CallOptions::new()
+                .with_retries(0)
+                .with_timeout(PRODUCE_CALL_TIMEOUT),
+        )
+        .await;
 
-            match result {
-                Ok(()) => {
-                    for pending in pending_batches {
-                        let topic = pending.topic;
-                        let partition = pending.partition;
-                        for tx in pending.waiters {
-                            let _ = tx.send(Ok(RecordMetadata {
-                                topic: topic.clone(),
-                                partition,
-                                // Fire-and-forget: the broker won't reply, so we can't learn the
-                                // assigned offset.
-                                offset: -1,
-                                timestamp: None,
-                            }));
-                        }
-                    }
+    SubmittedRound {
+        result,
+        pending_batches,
+    }
+}
+
+/// Await the broker's response for a submitted round and settle every
+/// batch's waiters. On a submission error or a transport-level read
+/// failure, every batch's waiters are notified with that error.
+async fn await_and_settle_basic(submitted: SubmittedRound) {
+    let SubmittedRound {
+        result,
+        pending_batches,
+    } = submitted;
+    match result {
+        Ok(fut) => match fut.await {
+            Ok(resp) => settle_response_basic(resp, pending_batches),
+            Err(e) => {
+                for pending in pending_batches {
+                    notify_waiters_the_failure(pending.waiters, || clone_error(&e));
                 }
-                Err(e) => {
-                    // The bytes never made it onto the wire; surface this as a
-                    // real failure rather than synthesising success.
-                    for pending in pending_batches {
-                        notify_waiters_the_failure(pending.waiters, || clone_error(&e));
-                    }
+            }
+        },
+        Err(e) => {
+            for pending in pending_batches {
+                notify_waiters_the_failure(pending.waiters, || clone_error(&e));
+            }
+        }
+    }
+}
+
+/// `acks=0` round: write the `ProduceRequest` and synthesise success.
+/// Kept serial — there is no response to overlap, and the writer's
+/// flush coalesces concurrent submissions anyway.
+async fn send_one_round_oneway(client: &Client, leader: BrokerId, batches: Vec<ReadyBatch>) {
+    let mut topic_groups: HashMap<TopicName, Vec<PartitionProduceData>> = HashMap::new();
+    let mut pending_batches: Vec<PendingBatch> = Vec::with_capacity(batches.len());
+    for batch in batches {
+        let (enc, pending) = batch.split();
+        topic_groups.entry(enc.topic).or_default().push(
+            PartitionProduceData::default()
+                .with_index(enc.partition.0)
+                .with_records(Some(enc.encoded)),
+        );
+        pending_batches.push(pending);
+    }
+
+    let topic_data: Vec<TopicProduceData> = topic_groups
+        .into_iter()
+        .map(|(topic, partition_data)| {
+            TopicProduceData::default()
+                .with_name(topic)
+                .with_partition_data(partition_data)
+        })
+        .collect();
+
+    let request = ProduceRequest::default()
+        .with_transactional_id(None)
+        .with_acks(Acks::None.as_i16())
+        .with_timeout_ms(duration_to_ms(PRODUCE_REQUEST_TIMEOUT))
+        .with_topic_data(topic_data);
+
+    let result = client
+        .send_oneway(
+            NodeTarget::Broker(leader),
+            ApiKey::Produce,
+            9,
+            request,
+            &CallOptions::new().with_timeout(PRODUCE_CALL_TIMEOUT),
+        )
+        .await;
+
+    match result {
+        Ok(()) => {
+            for pending in pending_batches {
+                let topic = pending.topic;
+                let partition = pending.partition;
+                for tx in pending.waiters {
+                    // Fire-and-forget: the broker won't reply, so we can't
+                    // learn the assigned offset.
+                    let _ = tx.send(Ok(RecordMetadata {
+                        topic: topic.clone(),
+                        partition,
+                        offset: -1,
+                        timestamp: None,
+                    }));
                 }
             }
         }
-        Acks::All | Acks::Leader => {
-            // `with_retries(0)`: a partial-success ProduceResponse (some
-            // partitions OK, some not) must not be retransmitted blindly by
-            // the client-level retry loop — that would reorder/duplicate the
-            // OK partitions. Per-partition retry is the slice-2 work item.
-            let result: Result<ProduceResponse> = client
-                .send(
-                    NodeTarget::Broker(leader),
-                    ApiKey::Produce,
-                    9,
-                    request,
-                    &CallOptions::new()
-                        .with_retries(0)
-                        .with_timeout(PRODUCE_CALL_TIMEOUT),
-                )
-                .await;
-
-            match result {
-                Ok(resp) => settle_response_basic(resp, pending_batches),
-                Err(e) => {
-                    for pending in pending_batches {
-                        notify_waiters_the_failure(pending.waiters, || clone_error(&e));
-                    }
-                }
+        Err(e) => {
+            // The bytes never made it onto the wire; surface this as a
+            // real failure rather than synthesising success.
+            for pending in pending_batches {
+                notify_waiters_the_failure(pending.waiters, || clone_error(&e));
             }
         }
     }
@@ -648,6 +759,18 @@ async fn send_to_leader_idempotent(
     leader: BrokerId,
     snapshots: Vec<InflightSnapshot>,
 ) {
+    // `ProducerConfig::resolved` coerces acks=All when
+    // enable_idempotence=true (see producer/mod.rs). The idempotent
+    // recovery state machine assumes every shipped batch is durably
+    // committed before its waiters are notified — acks<All breaks that
+    // invariant and would let a leader-only ack settle a write that the
+    // ISR has not yet accepted.
+    debug_assert!(
+        config.acks == Acks::All,
+        "idempotent path requires acks=All, got {:?}",
+        config.acks,
+    );
+
     let mut topic_groups: HashMap<TopicName, Vec<PartitionProduceData>> = HashMap::new();
     // Track the (topic, partition, base_sequence) tuples so settle
     // knows which in-flight head each per-partition response refers
@@ -671,8 +794,6 @@ async fn send_to_leader_idempotent(
         })
         .collect();
 
-    // Idempotence forces acks=All in Producer::new, but defer to the
-    // config to keep this function honest.
     let request = ProduceRequest::default()
         .with_transactional_id(None)
         .with_acks(config.acks.as_i16())

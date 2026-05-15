@@ -454,6 +454,73 @@ impl Client {
         }
     }
 
+    /// Submit a typed request and return its response handle without
+    /// awaiting it — the pipelining-friendly entry. Resolves the target,
+    /// negotiates the wire version, encodes, and pushes the request onto
+    /// the broker's send channel; the returned [`ClientResponseFuture`]
+    /// completes when the broker's response lands (or the deadline fires).
+    ///
+    /// Unlike [`Client::send`] there is no retry loop: a transport error
+    /// on submission surfaces immediately, and a slow response surfaces
+    /// via the `ClientResponseFuture`'s own timeout arm. The producer's
+    /// `with_retries(0)` callers expect exactly this behaviour and use
+    /// the returned future to overlap multiple in-flight produce requests
+    /// on the same connection.
+    pub async fn send_pipelined<Req, Resp>(
+        &self,
+        target: NodeTarget,
+        api_key: ApiKey,
+        max_version: i16,
+        request: Req,
+        opts: &CallOptions,
+    ) -> Result<ClientResponseFuture<Resp>>
+    where
+        Req: Encodable + HeaderVersion + Send + 'static,
+        Resp: Decodable + HeaderVersion,
+    {
+        let api_timeout = opts.timeout().unwrap_or(self.inner.api_timeout);
+        let deadline = tokio::time::Instant::now() + api_timeout;
+
+        let broker = match tokio::time::timeout_at(deadline, async {
+            match target {
+                NodeTarget::Controller => self.controller().await,
+                NodeTarget::AnyBroker => self.any_broker().await,
+                NodeTarget::Broker(id) => self.broker(id).await,
+            }
+        })
+        .await
+        {
+            Ok(r) => r?,
+            Err(_) => {
+                return Err(Error::RequestTimeout(
+                    "send_pipelined: broker acquisition exceeded api_timeout".into(),
+                ));
+            }
+        };
+
+        let version = broker.negotiate_version(api_key, max_version)?;
+
+        let response_fut = match tokio::time::timeout_at(
+            deadline,
+            broker.send_request(api_key, version, &request),
+        )
+        .await
+        {
+            Ok(r) => r?,
+            Err(_) => {
+                // Same retire-the-connection contract as `send_once`: a
+                // submission-stage timeout means the writer is wedged and
+                // any cached `Slot::Resolved` should be torn down.
+                broker.shutdown();
+                return Err(Error::RequestTimeout(
+                    "send_pipelined: submit exceeded api_timeout".into(),
+                ));
+            }
+        };
+
+        Ok(ClientResponseFuture::new(response_fut, deadline, broker))
+    }
+
     /// Single attempt of `send`.
     async fn send_once<Req, Resp>(
         &self,
